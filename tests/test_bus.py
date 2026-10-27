@@ -18,7 +18,7 @@ import paho.mqtt.client as mqtt
 import pytest
 from conftest import BIN
 
-from agent_bridge import config, presence
+from agent_bridge import config, presence, relay
 from agent_bridge.bus import Bus
 from agent_bridge.protocol import ORIGIN
 from agent_bridge.validation import BODY_MAX, BridgeError, is_ident
@@ -164,7 +164,7 @@ def test_rooms(s):
     run("join", r2, DEMO)
     assert bodies("recv", r1) == [], "joining again announces nothing"
     assert bodies("history", DEMO, "--last", "1") == ["hi r1"]
-    assert {"room": DEMO, "members": 3, "who": sorted([r1, r2, r3])} in lines("rooms")
+    assert {"room": DEMO, "members": 3, "who": sorted([r1, r2, r3]), "mode": "open", "moderators": []} in lines("rooms")
     assert set(agents("--room", DEMO)) == {r1, r2, r3}
     run("part", r3, DEMO)
     run("say", r1, DEMO, "after r3 left")
@@ -417,9 +417,9 @@ def test_presence_origin(s):
         start = int(f.read().rsplit(")", 1)[1].split()[19])
     meta = p.communicate()[0].strip()
     assert {k: agents()[meta].get(k) for k in ORIGIN} == {"session": sid, "pid": p.pid, "pid_start": start}
-    run("join", meta, DEMO, env_extra={"CLAUDE_CODE_SESSION_ID": "not-a-uuid"})
-    assert "session" not in agents()[meta] and agents()[meta].get("pid") != p.pid, (
-        "the latest process acting as it wins"
+    run("join", meta, DEMO, env_extra={"CLAUDE_CODE_SESSION_ID": str(uuid.uuid4())})
+    assert {k: agents()[meta].get(k) for k in ORIGIN} == {"session": sid, "pid": p.pid, "pid_start": start}, (
+        "origin is written once: another session acting as the agent changes nothing"
     )
     run("leave", meta)
     evil = raw_client()
@@ -447,6 +447,66 @@ def test_presence_origin(s):
         assert kept == ({"session": sid, "pid": 7, "pid_start": 9} if extra.get("session") == sid else {}), (addr, kept)
         raw_pub(evil, f"agents/{addr}", b"", retain=True)
     evil.loop_stop()
+
+
+def test_subagents_and_write_once_origin(s):
+    """A subagent's agent is marked as one and stays one; no later attach gives any agent a session it lacked."""
+    sid = str(uuid.uuid4())
+    in_session = {"CLAUDE_CODE_SESSION_ID": sid}
+    plain = run("register", "plain")
+    run("join", plain, DEMO, env_extra=in_session)
+    assert not {"session", "parent", "kind"} & set(agents()[plain]), "registered outside a session, stays outside"
+
+    fake = os.path.join(tempfile.mkdtemp(), "claude")
+    shutil.copy("/bin/sh", fake)
+    p = subprocess.Popen(
+        [fake, "-c", f'"{BRIDGE}" register helper --subagent; exit $?'],
+        env={**env(), **in_session},
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    with open(f"/proc/{p.pid}/stat") as f:
+        start = int(f.read().rsplit(")", 1)[1].split()[19])
+    sub = p.communicate()[0].strip()
+    want = {"kind": "subagent", "parent": sid, "pid": p.pid, "pid_start": start}
+    assert {k: agents()[sub].get(k) for k in ("session", *want)} == {"session": None, **want}
+    run("join", sub, DEMO, env_extra=in_session)
+    assert {k: agents()[sub].get(k) for k in ("session", "kind", "parent")} == {
+        "session": None,
+        "kind": "subagent",
+        "parent": sid,
+    }
+
+    main = run("register", "main", env_extra=in_session)
+    assert relay.session_agent(sid) == main, "the relay adopts the session's own agent"
+    run("leave", main)
+    assert relay.session_agent(sid) is None, "never a subagent's"
+    with pytest.raises(BridgeError):
+        Bus.register("admin", addr="admin", keep=True, admin=True, subagent=True)
+
+    evil = raw_client()
+    fresh_rec = {**s.good, "seen": time.time()}
+    cases = {
+        f"lineage{i}-{RUN}": (extra, kept)
+        for i, (extra, kept) in enumerate(
+            [
+                ({"kind": "bot", "session": sid}, {"session": sid}),
+                ({"kind": "subagent", "parent": "nope"}, {"kind": "subagent"}),
+                ({"kind": "subagent", "parent": sid, "session": sid}, {"kind": "subagent", "parent": sid}),
+                ({"kind": 5, "parent": sid}, {}),
+                ({"parent": sid}, {}),
+            ]
+        )
+    }
+    for addr, (extra, _) in cases.items():
+        raw_pub(evil, f"agents/{addr}", json.dumps({**fresh_rec, **extra}).encode(), retain=True)
+    listed = agents()
+    for addr, (_, kept) in cases.items():
+        assert {k: listed[addr][k] for k in ("session", "kind", "parent") if k in listed[addr]} == kept, addr
+        raw_pub(evil, f"agents/{addr}", b"", retain=True)
+    evil.loop_stop()
+    run("leave", plain)
+    run("leave", sub)
 
 
 def test_admin_is_reserved(s):

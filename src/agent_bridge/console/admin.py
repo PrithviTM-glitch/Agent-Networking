@@ -7,17 +7,18 @@ import uuid
 
 import paho.mqtt.client as mqtt
 
-from .. import config
+from .. import config, rooms
 from ..bus import Bus
 from ..history import parse_entry
 from ..ledger import client as ledger
 from ..protocol import parse_message, parse_presence
-from ..validation import ADMIN, BridgeError
+from ..validation import ADMIN, BridgeError, is_ident
 from . import events, sessions
 from .processes import Refused
 
 BACKLOG = 2000
 held = {"bus": None}
+settings = {}  # room -> its moderation record as rooms.view shows it, from the retained rooms/<room> topics
 
 
 def _on_connect(c, *_):
@@ -29,6 +30,11 @@ def _on_message(_c, _u, m):
     if m.topic.startswith("agents/"):
         sessions.set_presence(m.topic[7:], m.payload and parse_presence(m.payload))
         sessions.push_agents()
+    elif m.topic.startswith("rooms/"):
+        room = m.topic[6:]
+        if is_ident(room):
+            settings[room] = rooms.view(room, m.payload and rooms.parse_room(m.payload))
+            events.push({"kind": "room", "info": settings[room]})
     elif not m.topic.startswith("ledger/") and (msg := parse_message(m.topic, m.payload)):
         events.push({"kind": "msg", "msg": {"ts": time.time(), **msg}})
 

@@ -2,7 +2,7 @@
 // Every string from agents goes through textContent, never innerHTML.
 const ADMIN = "admin";
 const S = {token: null, agents: [], msgs: [], audit: [], jobs: {}, view: {type: "chan", id: "broadcast"}, unread: {},
-  extra: new Set(), drafts: {}, tab: "overview", profile: null, ledger: null, connected: false};
+  extra: new Set(), drafts: {}, atme: {}, atOnly: false, rooms: {}, tab: "overview", profile: null, ledger: null, connected: false};
 const $ = id => document.getElementById(id);
 
 function el(tag, cls, text) {
@@ -74,12 +74,15 @@ function channels() {
   const byLabel = (a, b) => label(a).localeCompare(label(b));
   return {rooms: [...rooms].sort(), dms: [...dms].sort(byLabel), topics: [...topics].sort()};
 }
-function viewKey(v) { return v.type === "chan" ? v.id : v.type === "agent" ? "agent:" + v.key : v.type; }
+function viewKey(v) {
+  return v.type === "chan" ? v.id : v.type === "agent" ? "agent:" + v.key : v.room ? "room:" + v.room : v.type;
+}
 function go(v) {
   S.view = v;
-  if (v.type === "chan") delete S.unread[v.id];
+  if (v.type === "chan") { delete S.unread[v.id]; delete S.atme[v.id]; }
   if (v.type === "agent") { S.tab = "overview"; S.profile = null; loadProfile(); }
   if (v.type === "ledger") { S.ledger = null; loadLedger(); }
+  if (v.type === "kill") { S.kill = {signal: "terminate", sessions: false, preview: null, results: null}; loadKillPreview(); }
   $("nav").classList.remove("open");
   render(true);
 }
@@ -91,7 +94,7 @@ function renderNav() {
   $("stat").textContent = bus + " on the bus · " + alive + " sessions alive · " + S.msgs.length + " messages";
   const nav = $("nav"), top = nav.scrollTop, cur = viewKey(S.view), ch = channels();
   // Rebuilding the sidebar under a pressed mouse button loses the click, so only rebuild when something shows.
-  const sig = JSON.stringify([cur, ch, S.unread, S.agents.map(a => [a.key, a.friendly, a.alive, a.rooms, a.status])]);
+  const sig = JSON.stringify([cur, ch, S.unread, S.atme, S.agents.map(a => [a.key, a.friendly, a.alive, a.rooms, a.status])]);
   if (sig === S.navSig) return;
   S.navSig = sig;
   nav.replaceChildren();
@@ -101,6 +104,7 @@ function renderNav() {
     const l = el("span", "lbl", text);
     if (sub) add(l, el("span", "sub", sub));
     add(d, extra, l);
+    if (S.atme[key]) add(d, el("span", "badge at", "@" + S.atme[key]));
     if (S.unread[key]) add(d, el("span", "badge", S.unread[key]));
     d.onclick = () => go(v);
     d.onkeydown = e => { if (e.key === "Enter") go(v); };
@@ -164,11 +168,33 @@ function msgNode(m, tag) {
   if (m.from && nameOf(m.from) !== m.from) add(h, el("span", "t mono", m.from));
   if (tag) add(h, el("span", "tag", label(chanOf(m))));
   if (m.ts) add(h, el("span", "t", clock(m.ts)));
-  return add(d, h, el("div", "b", m.body));
+  return add(d, h, bodyNode(m));
+}
+function mentioned(m, word) {
+  // Highlights only what the bus resolved: an address in m.mentions, the name of a mentioned agent, or @all.
+  if (word === "all") return m.topic.startsWith("room/");
+  const ms = m.mentions || [];
+  return ms.includes(word) || ms.some(a => (agentOf(a) || {}).name === word);
+}
+function bodyNode(m) {
+  const b = el("div", "b");
+  if (!m.topic.startsWith("room/") || !m.body.includes("@")) { b.textContent = m.body; return b; }
+  let last = 0;
+  for (const x of m.body.matchAll(/(^|\s)@([A-Za-z0-9_-]+)/g)) {
+    const at = x.index + x[1].length, word = x[2];
+    if (!mentioned(m, word)) continue;
+    b.append(document.createTextNode(m.body.slice(last, at)));
+    const me = word === ADMIN || ((m.mentions || []).includes(ADMIN) && agentOf(ADMIN)?.name === word);
+    b.append(el("span", "mention" + (me ? " me" : ""), "@" + word));
+    last = at + word.length + 1;
+  }
+  b.append(document.createTextNode(m.body.slice(last)));
+  return b;
 }
 function renderChannel(id, fresh) {
   const body = $("body"), stick = fresh || body.scrollTop + body.clientHeight >= body.scrollHeight - 40;
-  const list = S.msgs.filter(m => chanOf(m) === id);
+  const atOnly = S.atOnly && id.startsWith("room:");
+  const list = S.msgs.filter(m => chanOf(m) === id && (!atOnly || (m.mentions || []).includes(ADMIN)));
   let sub = "", note = "", can = true;
   if (id === "broadcast") {
     sub = "Every agent on the bus gets broadcasts. Sessions with the hook installed see them on their next prompt.";
@@ -186,9 +212,17 @@ function renderChannel(id, fresh) {
     sub = "Raw topic";
     note = "Publishing to " + id.slice(6) + " as admin.";
   }
-  setTitle(label(id), sub);
+  const room = id.startsWith("room:") && id.slice(5);
+  const filter = button(atOnly ? "Showing @admin only" : "Mentions of admin", () => { S.atOnly = !S.atOnly; renderChannel(id, true); });
+  if (atOnly) filter.className = "primary";
+  if (room) {
+    const r = roomInfo(room);
+    sub = (r.mode === "announce" ? "announce only · " : "") + (r.moderators.length ? "moderators " + r.moderators.join(", ") + " · " : "") + sub;
+  }
+  const tools = room ? [filter, button("Settings", () => go({type: "roomset", room})), button("Kill room…", () => go({type: "kill", room}), "danger")] : [];
+  setTitle(label(id), sub, tools);
   body.replaceChildren();
-  if (!list.length) body.append(el("div", "empty", "No messages yet."));
+  if (!list.length) body.append(el("div", "empty", atOnly ? "No messages mention admin." : "No messages yet."));
   for (const m of list.slice(-1500)) body.append(msgNode(m));
   if (stick) body.scrollTop = body.scrollHeight;
   $("compose").hidden = false;
@@ -211,6 +245,54 @@ async function sendCompose(e) {
     r = await act("/api/send", {kind: id.startsWith("room:") ? "room" : "topic", target: id.slice(id.indexOf(":") + 1), text});
   }
   if (r) $("text").value = "";
+}
+
+// @mentions in the compose box
+
+const M = {items: [], index: 0, start: 0};
+function mentionCandidates(prefix) {
+  if (S.view.type !== "chan" || !S.view.id.startsWith("room:")) return [];
+  const room = S.view.id.slice(5), p = prefix.toLowerCase();
+  const members = S.agents.filter(a => a.addr && a.addr !== ADMIN && a.rooms.includes(room));
+  const items = [{addr: "all", label: "everyone in # " + room}, ...members.map(a => ({addr: a.addr, label: a.friendly}))];
+  const starts = i => i.addr.toLowerCase().startsWith(p) || i.label.toLowerCase().split(/\s+/).some(w => w.startsWith(p));
+  return items.filter(starts).slice(0, 8);
+}
+function mentionSuggest() {
+  const t = $("text"), before = t.value.slice(0, t.selectionStart), m = before.match(/(^|\s)@([A-Za-z0-9_-]*)$/);
+  M.items = m ? mentionCandidates(m[2]) : [];
+  M.start = m ? before.length - m[2].length - 1 : 0;
+  M.index = 0;
+  renderMention();
+}
+function renderMention() {
+  const box = $("mention");
+  box.hidden = !M.items.length;
+  box.replaceChildren(...M.items.map((it, i) => {
+    const d = el("div", "opt" + (i === M.index ? " sel" : ""));
+    d.setAttribute("role", "option");
+    d.append(el("span", "mono", "@" + it.addr), el("span", "muted", it.label === it.addr ? "" : it.label));
+    d.onmousedown = e => { e.preventDefault(); M.index = i; mentionPick(); };
+    return d;
+  }));
+}
+function mentionPick() {
+  const t = $("text"), it = M.items[M.index], end = t.selectionStart;
+  t.value = t.value.slice(0, M.start) + "@" + it.addr + " " + t.value.slice(end);
+  t.selectionStart = t.selectionEnd = M.start + it.addr.length + 2;
+  mentionClose();
+  t.focus();
+}
+function mentionClose() { M.items = []; renderMention(); }
+function mentionKey(e) {
+  if (!M.items.length) return false;
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") M.index = (M.index + (e.key === "ArrowDown" ? 1 : M.items.length - 1)) % M.items.length;
+  else if (e.key === "Enter" || e.key === "Tab") mentionPick();
+  else if (e.key === "Escape") mentionClose();
+  else return false;
+  e.preventDefault();
+  renderMention();
+  return true;
 }
 
 // agent profile
@@ -408,6 +490,122 @@ function renderLedger() {
 
 // audit
 
+// room kill switch
+
+async function loadKillPreview() {
+  const k = S.kill, room = S.view.room;
+  const q = new URLSearchParams({room, signal: k.signal, kill_sessions: String(k.sessions)});
+  try { k.preview = await api("/api/room/kill?" + q); } catch (e) { k.preview = {error: e.message}; }
+  if (S.view.type === "kill" && S.view.room === room) renderKill();
+}
+function targetRows(targets, withResult) {
+  return targets.map(t => {
+    const who = el("div", null, t.friendly);
+    who.append(el("div", "muted mono", t.addr));
+    const act = el("div", null, t.action);
+    if (t.reason) act.append(el("div", "muted", "why: " + t.reason));
+    const row = [who, el("span", "nowrap", t.class), act];
+    if (withResult) row.push(t.result);
+    return row;
+  });
+}
+function renderKill() {
+  const room = S.view.room, k = S.kill, body = $("body");
+  $("compose").hidden = true;
+  setTitle("Kill # " + room, "Stops every agent in the room", [button("Back to room", () => go({type: "chan", id: "room:" + room}))]);
+  body.replaceChildren();
+  const card = add(el("div", "card"), el("h4", null, "How"));
+  card.append(el("div", "muted", "By default only subagents stop: each loses its own agent-bridge processes and " +
+    "its bus identity, and its parent session keeps running. Whole Claude sessions are killed only when you tick " +
+    "the box, and only through each session's own primary agent. Agents whose process cannot be verified are only " +
+    "wiped from the bus."));
+  const sel = el("select");
+  for (const [v, t] of [["terminate", "SIGTERM (terminate)"], ["kill", "SIGKILL (kill)"]]) {
+    const o = el("option", null, t); o.value = v; o.selected = k.signal === v; sel.append(o);
+  }
+  sel.onchange = () => { k.signal = sel.value; k.results = null; loadKillPreview(); };
+  const whole = el("input"); whole.type = "checkbox"; whole.checked = k.sessions;
+  whole.onchange = () => { k.sessions = whole.checked; k.results = null; loadKillPreview(); };
+  const lbl = add(el("label"), whole, el("span", null, " also kill whole sessions"));
+  card.append(add(el("div", "act"), sel, lbl));
+  body.append(card);
+  if (k.results) {
+    body.append(table("Results", ["Agent", "Class", "Action", "Result"], targetRows(k.results, true)));
+    return;
+  }
+  if (!k.preview) { body.append(el("div", "empty", "Loading…")); return; }
+  if (k.preview.error) { body.append(el("div", "empty", k.preview.error)); return; }
+  body.append(table("Preview: what will happen", ["Agent", "Class", "Action"], targetRows(k.preview.targets)));
+  if (!k.preview.targets.length) return;
+  const conf = add(el("div", "card"), el("h4", null, "Confirm"));
+  const input = el("input"); input.placeholder = "type " + room + " to confirm"; input.autocomplete = "off";
+  const kill = button("Kill room", async () => {
+    const r = await act("/api/room/kill", {room, confirm: input.value, signal: k.signal, kill_sessions: k.sessions}, "kill room");
+    if (r) { k.results = r.targets; renderKill(); }
+  }, "danger");
+  kill.disabled = true;
+  input.oninput = () => { kill.disabled = input.value !== room; };
+  conf.append(add(el("div", "row act"), input, kill));
+  body.append(conf);
+}
+
+// room settings
+
+function roomInfo(room) {
+  return S.rooms[room] || {room, mode: "open", moderators: [], rules: "", muted: [], banned: []};
+}
+function roomAct(path, body, what, ask) {
+  if (ask && !confirm(ask)) return;
+  act(path, {room: S.view.room, ...body}, what);
+}
+function renderRoomSettings() {
+  const room = S.view.room, r = roomInfo(room), body = $("body"), top = body.scrollTop;
+  $("compose").hidden = true;
+  setTitle("Settings # " + room, r.by ? "last changed by " + r.by + (r.ts ? " " + ago(r.ts) : "") : "open, no moderators set",
+    [button("Back to room", () => go({type: "chan", id: "room:" + room}))]);
+  body.replaceChildren();
+  const card = add(el("div", "card"), el("h4", null, "Mode and rules"));
+  const mode = el("select");
+  for (const [v, t] of [["open", "open: anyone may post"], ["announce", "announce: only moderators post"]]) {
+    const o = el("option", null, t); o.value = v; o.selected = r.mode === v; mode.append(o);
+  }
+  const rules = el("textarea"); rules.rows = 4; rules.maxLength = 2048; rules.value = S.drafts["rules:" + room] ?? r.rules;
+  rules.placeholder = "Room rules shown to members";
+  rules.oninput = () => { S.drafts["rules:" + room] = rules.value; };
+  const save = button("Save", async () => {
+    if (await act("/api/room/settings", {room, mode: mode.value, rules: rules.value}, "settings")) delete S.drafts["rules:" + room];
+  }, "primary");
+  card.append(add(el("div", "act"), mode), add(el("div", "act"), rules), add(el("div", "act"), save));
+  body.append(card);
+  const members = S.agents.filter(a => a.addr && a.rooms.includes(room));
+  const mods = r.moderators.map(a => [nameOf(a), a, button("Remove", () => roomAct("/api/room/moderator", {action: "remove", addr: a}, "moderator"))]);
+  const modCard = table("Moderators", ["Agent", "Address", ""], mods);
+  const pick = el("select");
+  for (const a of members.filter(a => !r.moderators.includes(a.addr) && a.addr !== ADMIN)) {
+    const o = el("option", null, a.friendly + " (" + a.addr + ")"); o.value = a.addr; pick.append(o);
+  }
+  if (pick.options.length) modCard.append(add(el("div", "act"), pick, button("Make moderator", () => roomAct("/api/room/moderator", {action: "add", addr: pick.value}, "moderator"))));
+  body.append(modCard);
+  const state = a => [r.moderators.includes(a) && "moderator", r.muted.includes(a) && "muted", r.banned.includes(a) && "banned"].filter(Boolean).join(", ") || "member";
+  const actions = a => {
+    const box = el("div", "act");
+    const muted = r.muted.includes(a), banned = r.banned.includes(a);
+    box.append(button(muted ? "Unmute" : "Mute", () => roomAct("/api/room/member", {action: muted ? "unmute" : "mute", addr: a}, muted ? "unmute" : "mute")));
+    box.append(button(banned ? "Unban" : "Ban", () => roomAct("/api/room/member", {action: banned ? "unban" : "ban", addr: a}, banned ? "unban" : "ban",
+      banned ? null : "Ban " + a + " from # " + room + "? It can no longer post or join."), banned ? null : "danger"));
+    if (!banned) box.append(button("Kick", () => roomAct("/api/room/member", {action: "kick", addr: a}, "kick",
+      "Kick " + a + " from # " + room + "? This bans it and drops its subscription; its session reconnects in about a second."), "danger"));
+    return box;
+  };
+  body.append(table("Members", ["Agent", "State", ""], members.filter(a => a.addr !== ADMIN).map(a => {
+    const who = el("div", null, a.friendly); who.append(el("div", "muted mono", a.addr));
+    return [who, state(a.addr), actions(a.addr)];
+  })));
+  const listed = [...new Set([...r.muted, ...r.banned])].filter(a => !members.some(m => m.addr === a));
+  if (listed.length) body.append(table("Muted or banned, not in the room", ["Address", "State", ""], listed.map(a => [a, state(a), actions(a)])));
+  body.scrollTop = top;
+}
+
 function renderAudit() {
   $("compose").hidden = true;
   setTitle("Audit log", "Every admin action, newest first (admin-audit.jsonl in the state directory)");
@@ -421,6 +619,8 @@ function renderPane(fresh) {
   if (v.type === "chan") renderChannel(v.id, fresh);
   else if (v.type === "agent") renderAgent();
   else if (v.type === "ledger") renderLedger();
+  else if (v.type === "kill") renderKill();
+  else if (v.type === "roomset") renderRoomSettings();
   else renderAudit();
 }
 function render(fresh) {
@@ -434,6 +634,8 @@ function onEvent(ev) {
   if (ev.kind === "agents") {
     const before = new Map(S.agents.map(a => [a.key, a.alive]));
     const was = S.view.type === "agent" && JSON.stringify(byKey(S.view.key));
+    const roomSig = () => JSON.stringify(S.agents.filter(a => a.rooms.includes(S.view.room)).map(a => [a.addr, a.friendly]));
+    const roomMembers = S.view.type === "roomset" && roomSig();
     S.agents = ev.agents;
     for (const a of S.agents) {
       if (before.get(a.key) === true && a.alive === false) toast(a.friendly + " died");
@@ -441,6 +643,7 @@ function onEvent(ev) {
     }
     renderNav();
     if (S.view.type === "agent" && was !== JSON.stringify(byKey(S.view.key))) renderAgent();
+    else if (S.view.type === "roomset" && roomMembers !== roomSig()) renderRoomSettings();
     else if (S.view.type === "chan") renderChannel(S.view.id);
   } else if (ev.kind === "msg") {
     const m = ev.msg, c = chanOf(m);
@@ -448,9 +651,14 @@ function onEvent(ev) {
     if (S.msgs.length > 5000) S.msgs.shift();
     const looking = S.view.type === "chan" && S.view.id === c && !document.hidden;
     if (!looking && m.from !== ADMIN) S.unread[c] = (S.unread[c] || 0) + 1;
+    if (!looking && (m.mentions || []).includes(ADMIN)) S.atme[c] = (S.atme[c] || 0) + 1;
     renderNav();
     if (S.view.type === "chan" && S.view.id === c) renderChannel(c);
     if (S.view.type === "agent" && S.tab === "dms" && m.topic.startsWith("inbox/")) loadProfile();
+  } else if (ev.kind === "room") {
+    S.rooms[ev.info.room] = ev.info;
+    if (S.view.room === ev.info.room && S.view.type === "roomset") renderRoomSettings();
+    if (S.view.type === "chan" && S.view.id === "room:" + ev.info.room) renderChannel(S.view.id);
   } else if (ev.kind === "audit") {
     S.audit.push(ev.entry);
     if (S.view.type === "audit") renderAudit();
@@ -466,7 +674,7 @@ function onEvent(ev) {
 function setConn(on) { S.connected = on; $("dot").classList.toggle("on", on); }
 async function loadState() {
   const st = await api("/api/state");
-  S.agents = st.agents; S.msgs = st.messages; S.audit = st.audit;
+  S.agents = st.agents; S.msgs = st.messages; S.audit = st.audit; S.rooms = st.rooms || {};
   S.jobs = Object.fromEntries(st.jobs.map(j => [j.id, j]));
   render(true);
 }
@@ -525,7 +733,12 @@ function boot() {
   $("menu").onclick = () => $("nav").classList.toggle("open");
   $("bcast").onclick = () => { go({type: "chan", id: "broadcast"}); $("text").focus(); };
   $("compose").onsubmit = sendCompose;
-  $("text").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) sendCompose(e); };
+  $("text").onkeydown = e => {
+    if (mentionKey(e)) return;
+    if (e.key === "Enter" && !e.shiftKey) sendCompose(e);
+  };
+  $("text").oninput = mentionSuggest;
+  $("text").onblur = () => setTimeout(mentionClose, 150);
   $("loginf").onsubmit = e => {
     e.preventDefault();
     S.token = $("tok").value.trim();
@@ -534,7 +747,7 @@ function boot() {
     stream();
   };
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && S.view.type === "chan") { delete S.unread[S.view.id]; renderNav(); }
+    if (!document.hidden && S.view.type === "chan") { delete S.unread[S.view.id]; delete S.atme[S.view.id]; renderNav(); }
   });
   setInterval(() => {
     if (S.view.type === "agent") loadProfile();

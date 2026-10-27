@@ -19,7 +19,7 @@ import uuid
 import pytest
 from conftest import BIN, free_port
 
-from agent_bridge import config
+from agent_bridge import config, relay
 from agent_bridge.ledger import client as ledger
 
 HOOK = str(BIN / "agent-bridge-broadcast-hook")
@@ -601,6 +601,224 @@ def test_registry():
     assert "second notice" in hook(session=S4)
     assert wait_for(lambda: session(S4)["relay"] is False)
     print("registry ok")
+
+
+def dead(pid):
+    """True once pid is gone or a zombie, for processes this test did not start itself."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    except OSError:
+        return True
+
+
+def children(pid):
+    """argv of each live child of pid, by child pid."""
+    out = {}
+    for name in os.listdir("/proc"):
+        try:
+            with open(f"/proc/{name}/stat") as f:
+                if int(f.read().rsplit(")", 1)[1].split()[1]) != pid or dead(int(name)):
+                    continue
+            with open(f"/proc/{name}/cmdline", "rb") as f:
+                out[int(name)] = [a.decode() for a in f.read().split(b"\0")[:-1]]
+        except (OSError, ValueError, IndexError):
+            pass
+    return out
+
+
+def test_room_kill():
+    sk, sk2 = str(uuid.uuid4()), str(uuid.uuid4())
+    kbin = os.path.join(TMP, "kbin")
+    os.makedirs(os.path.join(kbin, "shell"))
+    ab = os.path.join(kbin, "agent-bridge")
+    with open(ab, "w") as f:
+        f.write("#!/usr/bin/env python3\nimport time\ntime.sleep(600)\n")
+    os.chmod(ab, 0o755)
+    shclaude = os.path.join(kbin, "shell", "claude")
+    shutil.copy("/bin/sh", shclaude)
+    # One fake claude session whose bus commands run as several agents, plus two decoys that must survive.
+    agents = ("sub-k", "mark-k", "twin-k", "sub-2", "other-x")
+    script = " ".join(f"{ab} recv {a} --wait 600 &" for a in agents)
+    claude = subprocess.Popen([shclaude, "-c", f"{script} {ab} dm other-x sub-k hi & while :; do sleep 1; done"])
+    procs.append(claude)
+    with open(f"/proc/{claude.pid}/stat") as f:
+        start = int(f.read().rsplit(")", 1)[1].split()[19])
+    kids = wait_for(lambda: len(c := children(claude.pid)) >= 6 and c)
+    by = {argv[3]: pid for pid, argv in kids.items() if len(argv) > 3 and argv[2] == "recv"}
+    dm_pid = next(pid for pid, argv in kids.items() if argv[2:3] == ["dm"])
+    registry_file(claude.pid, sessionId=sk, pid=claude.pid, procStart=str(start), name="Kill target")
+    origin = {"pid": claude.pid, "pid_start": start}
+    # The live case: sess-k and twin-k carry the same session and pid; only sess-k is held by the session's relay.
+    presence("sess-k", session=sk, topics=["room/red"], **origin)
+    presence("twin-k", session=sk, topics=["room/red"], **origin)
+    presence("sub-k", topics=["room/red"], **origin)
+    presence("mark-k", kind="subagent", parent=sk, topics=["room/red"], **origin)
+    presence("ghost-k", pid=4194300, pid_start=5, topics=["room/red"])
+    presence("claim-k", session=sk2, pid=4194300, pid_start=5, topics=["room/red"])
+    presence("sub-2", topics=["room/red2"], **origin)
+    presence("bystander-1", topics=["room/elsewhere"], **origin)
+    for a in ("sess-k", "twin-k", "sub-k", "mark-k", "ghost-k", "claim-k", "sub-2", "bystander-1"):
+        assert wait_for(lambda a=a: agent(a)), a
+    os.makedirs(os.path.dirname(lock_path := relay.lock_path(sk)), exist_ok=True)
+    lock = open(lock_path, "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    lock.write(f"{os.getpid()}\nsess-k\n")
+    lock.flush()
+
+    def preview(room, **q):
+        code, j = req("GET", f"/api/room/kill?room={room}&" + "&".join(f"{k}={v}" for k, v in q.items()))
+        assert code == 200, j
+        return {t["addr"]: t for t in j["targets"]}
+
+    others = "bystander-1, mark-k, sub-2, sub-k, twin-k"
+    plain = preview("red")
+    assert sorted(plain) == ["claim-k", "ghost-k", "mark-k", "sess-k", "sub-k", "twin-k"], plain
+    assert plain["sess-k"]["class"] == "session" and plain["sess-k"]["reason"] == f"the primary agent of session {sk}"
+    assert plain["sess-k"]["action"] == (
+        f"skip: would end the WHOLE session {sk}; this also ends {others} (tick kill whole sessions)"
+    )
+    assert plain["twin-k"]["reason"] == f"shares session {sk} with its own agent sess-k", plain["twin-k"]
+    assert plain["mark-k"]["reason"] == "marked as a subagent" and plain["sub-k"]["reason"] == "no session"
+    for a in ("sub-k", "mark-k", "twin-k"):
+        assert plain[a]["class"] == "subagent" and [p["pid"] for p in plain[a]["procs"]] == [by[a]], plain[a]
+        assert plain[a]["action"] == (
+            f"SIGTERM its bus processes {by[a]}, then wipe the agent; parent claude pid {claude.pid} keeps running"
+        )
+    assert plain["ghost-k"]["class"] == "unverifiable" and plain["ghost-k"]["action"].startswith("wipe the agent only")
+    assert plain["claim-k"]["action"].startswith("skip: claims a whole session")
+    whole = preview("red", kill_sessions="true")
+    assert (
+        whole["sess-k"]["action"]
+        == f"SIGTERM claude pid {claude.pid}, ending the WHOLE session {sk}; this also ends {others}"
+    )
+    assert whole["claim-k"]["action"].startswith("wipe the agent only")
+    assert preview("red", kill_sessions="true", signal="kill")["sess-k"]["action"].startswith("SIGKILL claude pid")
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    nobody = preview("red", kill_sessions="true")
+    assert nobody["sess-k"]["class"] == "subagent" and "none primary" in nobody["sess-k"]["reason"], nobody["sess-k"]
+    assert not any("ending the WHOLE session" in t["action"] for t in nobody.values()), (
+        "without a known primary agent no whole session may be killed"
+    )
+    fcntl.flock(lock, fcntl.LOCK_EX)
+
+    assert req("GET", "/api/room/kill?room=red", token=None)[0] == 401
+    assert req("GET", "/api/room/kill?room=bad%20room")[0] == 400
+    assert req("GET", "/api/room/kill?room=red&signal=hup")[0] == 400
+    body = {"room": "red", "confirm": "red"}
+    assert post("/api/room/kill", body, origin=None)[0] == 403
+    assert post("/api/room/kill", body, origin="http://evil.example")[0] == 403
+    assert post("/api/room/kill", body, token="wrong")[0] == 401
+    refused("/api/room/kill", {**body, "confirm": "RED"}, "type the room name")
+    refused("/api/room/kill", {**body, "kill_sessions": "yes"}, "true or false")
+    time.sleep(0.2)
+    assert claude.poll() is None and not any(map(dead, kids)), "a refused kill touched a process"
+
+    j = ok("/api/room/kill", body)
+    got = {t["addr"]: t for t in j["targets"]}
+    assert {a: (t["class"], t["action"]) for a, t in got.items()} == {
+        a: (t["class"], t["action"]) for a, t in plain.items()
+    }, "the kill must do what the preview showed"
+    assert got["twin-k"]["result"] == f"subagent stopped: signalled {by['twin-k']}; wiped the agent", got
+    assert got["ghost-k"]["result"] == "unverifiable: wiped the agent", got
+    assert got["sess-k"]["result"].startswith("session: skip: would end the WHOLE session"), got
+    assert wait_for(lambda: all(dead(by[a]) for a in ("sub-k", "mark-k", "twin-k")))
+    time.sleep(0.3)
+    assert claude.poll() is None, "killing the room's subagents must leave the session's claude running"
+    assert not dead(by["sub-2"]) and not dead(by["other-x"]) and not dead(dm_pid), "only the room's agents stop"
+    assert wait_for(lambda: not any(agent(a) for a in ("sub-k", "mark-k", "twin-k", "ghost-k")))
+    assert agent("sess-k") and agent("claim-k") and agent("bystander-1")
+
+    j = ok("/api/room/kill", {"room": "red2", "confirm": "red2"})
+    assert j["targets"][0]["result"].startswith("subagent stopped: signalled"), j
+    assert wait_for(lambda: dead(by["sub-2"]))
+    time.sleep(0.3)
+    assert claude.poll() is None, "killing a room with only a subagent leaves its parent claude running"
+
+    j = ok("/api/room/kill", {"room": "red", "confirm": "red", "signal": "kill", "kill_sessions": True})
+    assert {t["addr"]: t["result"] for t in j["targets"]} == {
+        "claim-k": "unverifiable: wiped the agent",
+        "sess-k": f"session killed: sent SIGKILL to claude pid {claude.pid}",
+    }, j
+    assert claude.wait(5) == -signal.SIGKILL
+    lock.close()
+    assert ok("/api/room/kill", {"room": "nobody-here", "confirm": "nobody-here"})["result"] == "terminate: no members"
+
+    log = [json.loads(x) for x in open(os.path.join(DATA, "admin-audit.jsonl"))]
+    kills = [(e["target"], e["result"]) for e in log if e["action"] == "room/kill"]
+    for target, result in [
+        ("red:sub-k", "subagent stopped: signalled"),
+        ("red:mark-k", "subagent stopped: signalled"),
+        ("red:twin-k", "subagent stopped: signalled"),
+        ("red:ghost-k", "unverifiable: wiped the agent"),
+        ("red:sess-k", "session: skip: would end the WHOLE session"),
+        ("red:sess-k", "session killed: sent SIGKILL"),
+        ("red2:sub-2", "subagent stopped"),
+        ("room:red", "terminate: 1 session, 3 subagent, 2 unverifiable"),
+        ("room:red", "kill, whole sessions too: 1 session, 1 unverifiable"),
+        ("red", "refused: type the room name"),
+        (None, "refused: bad Origin"),
+    ]:
+        assert any(t == target and r.startswith(result) for t, r in kills), (target, result, kills)
+
+
+def test_admin_mentions():
+    seen = []
+    w = ledger.connect()
+    w.on_message = lambda _c, _u, m: seen.append(json.loads(m.payload))
+    w.subscribe("room/men", qos=1)
+    presence("men-a1b2c3", topics=["room/men"])
+    presence("other-d4e5f6", topics=["room/men"])
+    assert wait_for(lambda: agent("men-a1b2c3") and agent("other-d4e5f6"))
+    time.sleep(0.3)
+    ok("/api/send", {"kind": "room", "target": "men", "text": "@men-a1b2c3 please look"})
+    got = wait_for(lambda: [m for m in seen if m["body"] == "@men-a1b2c3 please look"])
+    assert got and got[0]["from"] == "admin" and got[0]["mentions"] == ["men-a1b2c3"], got
+    code, j = post("/api/send", {"kind": "room", "target": "men", "text": "@nobody-zzz9 hello"})
+    assert code == 400, j
+    shown = [m for m in req("GET", "/api/state")[1]["messages"] if m["body"] == "@men-a1b2c3 please look"]
+    assert shown and shown[0]["mentions"] == ["men-a1b2c3"], shown
+    w.disconnect()
+    w.loop_stop()
+
+
+def test_room_settings():
+    presence("mod-a1b2c3", topics=["room/set"])
+    presence("loud-a1b2c3", topics=["room/set"])
+    assert wait_for(lambda: agent("mod-a1b2c3") and agent("loud-a1b2c3"))
+    ev = Events()
+    ok("/api/room/settings", {"room": "set", "mode": "announce", "rules": "be brief\nno spam"})
+    ok("/api/room/moderator", {"room": "set", "action": "add", "addr": "mod-a1b2c3"})
+    ok("/api/room/member", {"room": "set", "action": "mute", "addr": "loud-a1b2c3"})
+    ok("/api/room/member", {"room": "set", "action": "kick", "addr": "loud-a1b2c3"})
+    info = req("GET", "/api/room?room=set")[1]
+    assert info["mode"] == "announce" and info["rules"] == "be brief\nno spam", info
+    assert (
+        info["moderators"] == ["mod-a1b2c3"] and info["muted"] == ["loud-a1b2c3"] and info["banned"] == ["loud-a1b2c3"]
+    )
+    assert ev.find(lambda e: e["kind"] == "room" and e["info"]["banned"] == ["loud-a1b2c3"])
+    assert req("GET", "/api/state")[1]["rooms"]["set"]["moderators"] == ["mod-a1b2c3"]
+    assert not any(m["topic"].startswith("rooms/") for m in req("GET", "/api/state")[1]["messages"])
+    ok("/api/room/member", {"room": "set", "action": "unban", "addr": "loud-a1b2c3"})
+    ok("/api/room/moderator", {"room": "set", "action": "remove", "addr": "mod-a1b2c3"})
+    info = req("GET", "/api/room?room=set")[1]
+    assert info["banned"] == [] and info["moderators"] == [], info
+    refused("/api/room/member", {"room": "set", "action": "nuke", "addr": "loud-a1b2c3"}, "action must be")
+    refused("/api/room/member", {"room": "set", "action": "ban", "addr": "admin"}, "admin")
+    refused("/api/room/settings", {"room": "set", "mode": "silent"}, "mode must be")
+    refused("/api/room/settings", {"room": "bad room", "mode": "open"}, "bad room")
+    assert post("/api/room/member", {"room": "set", "action": "mute", "addr": "x"}, origin=None)[0] == 403
+    assert req("GET", "/api/room?room=set", token=None)[0] == 401
+    log = [json.loads(x) for x in open(os.path.join(DATA, "admin-audit.jsonl"))]
+    done = {(e["action"], e["target"], e["result"]) for e in log}
+    for want in [
+        ("room/settings", "room:set", "mode announce, rules 16 chars"),
+        ("room/moderator", "set:mod-a1b2c3", "moderator add"),
+        ("room/member", "set:loud-a1b2c3", "muted"),
+        ("room/member", "set:loud-a1b2c3", "kicked"),
+        ("room/member", "set:loud-a1b2c3", "unbanned"),
+    ]:
+        assert want in done, (want, sorted(done))
 
 
 def test_audits():

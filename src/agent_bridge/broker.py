@@ -2,6 +2,7 @@
 
 import socket
 import threading
+import time
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.packettypes import PacketTypes
@@ -12,6 +13,8 @@ from . import config
 from .validation import BridgeError
 
 TIMEOUT = 5
+# A fixed wait for retained messages; use a marker publish instead if a slow broker ever misses some.
+WINDOW = 0.3
 RECEIVE_MAX = 100
 SUB = SubscribeOptions(qos=1, noLocal=True)
 
@@ -49,6 +52,23 @@ def one_shot(client_id="", clean=True, on_message=None):
     c.on_connect = lambda _c, _u, _f, rc, _p: rc.is_failure or up.set()
     connect(c, clean, 0, up)
     return c
+
+
+def retained(patterns, first=False):
+    """Topic -> payload of the retained messages matching patterns, through a short-lived client; first=True returns
+    at the first one instead of waiting out WINDOW."""
+    found = {}
+    got = threading.Event()
+
+    def on_message(_c, _u, m):
+        found[m.topic] = m.payload
+        got.set()
+
+    c = one_shot(on_message=on_message)
+    c.subscribe([(p, 1) for p in patterns])
+    got.wait(WINDOW) if first else time.sleep(WINDOW)
+    close(c)
+    return found
 
 
 def close(c):

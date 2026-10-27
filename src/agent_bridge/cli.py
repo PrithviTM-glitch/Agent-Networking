@@ -4,10 +4,11 @@ stderr with a non-zero exit.
 Names, addresses, rooms and caps: 1-64 ASCII letters, digits, _ or - (names at most 57, leaving room for the address
 suffix), at most 32 caps. TEXT: at most 64 KiB of UTF-8; tab, newline and CR are kept, any other control character
 (C0, DEL, C1) is refused. Raw topics: at most 256 bytes of UTF-8, no control characters, never starting with $ or the
-reserved levels agents, inbox, ledger and broadcast (only the dedicated commands touch those). + and # work only in
-sub, as whole levels, # only last, and not as the first level. Incoming messages that are over 256 KiB, not UTF-8, or
-break these rules are dropped; plain text on a raw topic arrives with "from": null. "from" is checked for shape only:
-any local process can claim any address.
+reserved levels agents, inbox, ledger, broadcast and rooms (only the dedicated commands touch those). + and # work
+only in sub, as whole levels, # only last, and not as the first level. Incoming messages that are over 256 KiB, not
+UTF-8, or break these rules are dropped; plain text on a raw topic arrives with "from": null. "from" is checked for
+shape only: any local process can claim any address. Room moderation (mode, moderators, mute, ban) is advisory for
+the same reason.
 """
 
 import argparse
@@ -18,10 +19,10 @@ import os
 import sys
 import zlib
 
-from . import config, history, presence, relay
+from . import config, history, presence, relay, rooms
+from .broker import WINDOW
 from .bus import Bus
 from .ledger import client as ledger
-from .presence import WINDOW
 from .validation import WAIT_MAX, BridgeError, check_ident, check_session, check_wait, not_admin
 
 QUIET = 0.2
@@ -58,7 +59,7 @@ def _attached(addr, fn, turn=True):
 
 def _register(a):
     with _turn(a.addr) if a.addr is not None else contextlib.nullcontext():
-        bus = Bus.register(a.name, [x for x in a.caps.split(",") if x], a.keep, a.addr)
+        bus = Bus.register(a.name, [x for x in a.caps.split(",") if x], a.keep, a.addr, subagent=a.subagent)
         bus.close()
     print(bus.addr)
 
@@ -112,6 +113,9 @@ def _parser():
     def on(method, *fields):
         return lambda a: _attached(a.addr, lambda b: getattr(b, method)(*(getattr(a, f) for f in fields)))
 
+    def shown(method, *fields):
+        return lambda a: _attached(a.addr, lambda b: _show_all([getattr(b, method)(*(getattr(a, f) for f in fields))]))
+
     me = (["addr"], {"metavar": "MY_ADDR"})
     room = (["room"], {})
     text = (["text"], {})
@@ -124,6 +128,7 @@ def _parser():
         (["--caps"], {"default": "", "help": "comma-separated things you can do for others"}),
         (["--keep"], {"action": "store_true", "help": f"exempt from expiry after {config.STALE_S / 86400:g}d idle"}),
         (["--addr"], {"help": "reattach to this address if it is live (name, caps, keep unchanged), else create it"}),
+        (["--subagent"], {"action": "store_true", "help": "a subagent's own agent: recorded under its parent session"}),
     )
     cmd(
         "leave",
@@ -144,10 +149,39 @@ def _parser():
         "every agent with caps and topics, one JSON per line",
         (["--room"], {}),
     )
-    cmd("rooms", lambda a: _show_all(presence.rooms()), "every chat room with its members")
+    cmd("rooms", lambda a: _show_all(rooms.listing()), "every chat room with its members, mode and moderators")
     cmd("join", on("join", "room"), "join a chat room", me, room)
     cmd("part", on("part", "room"), "leave a chat room", me, room)
-    cmd("say", on("say", "room", "text"), "post to a chat room", me, room, text)
+    cmd("say", on("say", "room", "text"), "post to a chat room; @name, @address and @all mention", me, room, text)
+    r = s.add_parser("room", help="a room's settings: info ROOM, or set MY_ADDR ROOM --mode/--rules")
+    rs = r.add_subparsers(dest="action", required=True, metavar="ACTION")
+    info = rs.add_parser("info", help="mode, moderators, rules, muted and banned; open defaults without settings")
+    info.add_argument("room")
+    info.set_defaults(fn=lambda a: _show_all([rooms.info(a.room)]))
+    settings = rs.add_parser("set", help="change mode or rules (admin or a moderator), the room is told")
+    settings.add_argument("addr", metavar="MY_ADDR")
+    settings.add_argument("room")
+    settings.add_argument("--mode", choices=rooms.MODES, help="open: anyone posts; announce: only moderators")
+    settings.add_argument("--rules", help=f"short text, at most {rooms.RULES_MAX} bytes")
+    settings.set_defaults(fn=shown("room_set", "room", "mode", "rules"))
+    target = (["target"], {"metavar": "ADDR"})
+    cmd(
+        "mod",
+        shown("mod", "room", "change", "target"),
+        "add or remove a moderator of a room (admin or a moderator)",
+        me,
+        room,
+        (["change"], {"choices": ["add", "remove"]}),
+        target,
+    )
+    for verb, help in (
+        ("mute", "stop ADDR posting in a room"),
+        ("unmute", "let ADDR post in a room again"),
+        ("ban", "stop ADDR posting in or joining a room"),
+        ("unban", "lift a ban"),
+        ("kick", "ban ADDR and drop it from the room (briefly takes its session over, its relay reconnects)"),
+    ):
+        cmd(verb, shown(verb, "room", "target"), f"{help} (admin or a moderator)", me, room, target)
     cmd(
         "history",
         lambda a: _show_all(history.history(a.room, a.last)),

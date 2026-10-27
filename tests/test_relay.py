@@ -18,12 +18,13 @@ import uuid
 from types import SimpleNamespace
 
 import anyio
+import paho.mqtt.client as mqtt
 import pytest
 from conftest import BIN
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from agent_bridge import identity, presence, relay
+from agent_bridge import config, identity, presence, relay
 from agent_bridge.bus import Bus
 
 BRIDGE, HOOK, SERVER = (str(BIN / name) for name in ("agent-bridge", "agent-bridge-relay-hook", "agent-bridge-mcp"))
@@ -65,7 +66,11 @@ def session_env(ledgerd):
 @pytest.fixture(scope="module")
 def s(session_env):
     """The inbox, a sender and the console, shared by both tests and cleaned up after them."""
+    # The sender is not part of the session: with its id, the session's relay would adopt it as the session's agent.
+    os.environ.pop("CLAUDE_CODE_SESSION_ID")
+    identity.origin.cache_clear()
     s = SimpleNamespace(inbox=Inbox(), sender=Bus.register("sender"), room=f"r{RUN}")
+    os.environ["CLAUDE_CODE_SESSION_ID"] = SESSION
     s.console = Bus.register("admin", addr="admin", keep=True, admin=True)
     yield s
     s.console.leave()
@@ -145,7 +150,7 @@ def end(claude):
 
 def relay_pid():
     with open(relay.lock_path(SESSION)) as f:
-        return int(f.read())
+        return int(f.readline())
 
 
 def test_relay(s):
@@ -307,5 +312,55 @@ def test_adopts_cli_agent(s):
         end(claude)
         until(lambda: not relay.live(other), timeout=5, what="relay exit")
         cli("leave", cli_addr)
+    finally:
+        os.environ["CLAUDE_CODE_SESSION_ID"] = SESSION
+
+
+def test_mentions_wake_only_the_mentioned(s):
+    """A room message mentioning others stays quiet; the next post that wakes this session carries it, capped."""
+    room, session = f"at{RUN}", str(uuid.uuid4())
+    os.environ["CLAUDE_CODE_SESSION_ID"] = session  # its own session, so the relay's agent is not one of ours
+    try:
+        claude = session_claude(session)
+        me = identity.session_address(session)
+        until(lambda: relay.held(session) == me, what="the relay's agent")  # it takes the lock before registering
+        cli("join", me, room)
+        other = Bus.register("other")
+        other.join(room)
+        s.sender.join(room)
+        time.sleep(1.5)  # the CLI took the relay's session over; let it reconnect
+        before = len(s.inbox.posts)
+        s.sender.say(room, f"@{other.addr} just for other")
+        time.sleep(2.5)
+        assert len(s.inbox.posts) == before, "a mention of someone else does not wake this session"
+        s.sender.say(room, f"@{me} for you")
+        until(lambda: len(s.inbox.posts) > before, what="the mention's post")
+        lines = s.inbox.posts[-1][1]["message"]["content"].split("\n")
+        assert lines[0] == f"[agent-bridge] 1 message (#{room} from {s.sender.addr} (mentions you))"
+        assert json.loads(lines[2])["body"] == f"@{me} for you" and json.loads(lines[2])["for_me"] is True
+        assert lines[3] == "[agent-bridge] while you were away: 1 quiet room message"
+        assert [json.loads(x)["body"] for x in lines[4:]] == [f"@{other.addr} just for other"]
+
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv5)
+        c.connect(config.HOST, config.PORT)
+        c.loop_start()
+        for i in range(relay.BACKLOG + 5):
+            quiet = {"from": s.sender.addr, "body": f"quiet {i}", "ts": time.time(), "mentions": [other.addr]}
+            c.publish(f"room/{room}", json.dumps(quiet), qos=1).wait_for_publish(5)
+        c.disconnect()
+        c.loop_stop()
+        time.sleep(3)
+        before = len(s.inbox.posts)
+        s.sender.dm(me, "wake up")
+        until(lambda: len(s.inbox.posts) > before, what="the DM's post")
+        lines = s.inbox.posts[-1][1]["message"]["content"].split("\n")
+        assert lines[0] == f"[agent-bridge] 1 message (DM from {s.sender.addr})"
+        assert lines[3] == f"[agent-bridge] while you were away: {relay.BACKLOG} quiet room messages"
+        assert [json.loads(x)["body"] for x in lines[4:]] == [f"quiet {i}" for i in range(5, relay.BACKLOG + 5)]
+        end(claude)
+        until(lambda: not relay.live(session), timeout=5, what="relay exit")
+        assert relay.held(session) is None
+        other.leave()
+        cli("leave", me)
     finally:
         os.environ["CLAUDE_CODE_SESSION_ID"] = SESSION

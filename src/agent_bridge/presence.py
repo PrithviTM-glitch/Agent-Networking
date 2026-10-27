@@ -1,34 +1,26 @@
 """The directory of agents: retained presence records under agents/<addr>, read through short-lived clients."""
 
-import threading
 import time
 
 import paho.mqtt.client as mqtt
 
 from . import broker, config
-from .protocol import NEVER, ORIGIN, parse_presence
+from .protocol import LINEAGE, NEVER, ORIGIN, parse_presence
 from .validation import BridgeError, check_ident, is_ident
 
-# A fixed wait for retained messages; use a marker publish instead if a slow broker ever misses some.
-WINDOW = 0.3
+
+def parse_all(retained):
+    """Address -> presence record of every well-formed record among retained topic -> payload."""
+    return {
+        t[7:]: rec
+        for t, payload in retained.items()
+        if t.startswith("agents/") and is_ident(t[7:]) and (rec := parse_presence(payload))
+    }
 
 
 def presences(pattern="agents/+", first=False):
     """Address -> presence record of every well-formed record matching pattern."""
-    found = {}
-    got = threading.Event()
-
-    def on_message(_c, _u, m):
-        addr = m.topic.removeprefix("agents/")
-        if is_ident(addr) and (rec := parse_presence(m.payload)):
-            found[addr] = rec
-            got.set()
-
-    c = broker.one_shot(on_message=on_message)
-    c.subscribe(pattern, qos=1)
-    got.wait(WINDOW) if first else time.sleep(WINDOW)
-    broker.close(c)
-    return found
+    return parse_all(broker.retained([pattern], first))
 
 
 def find(addr):
@@ -62,21 +54,11 @@ def agents(room=None):
             "topics": rec["topics"],
             "keep": rec["keep"],
             "idle_s": round(now - rec["seen"]),
-            **{k: rec[k] for k in ORIGIN if k in rec},
+            **{k: rec[k] for k in (*ORIGIN, *LINEAGE) if k in rec},
         }
         for addr, rec in sorted(presences().items(), key=lambda kv: -kv[1]["seen"])
         if not room or any(mqtt.topic_matches_sub(t, room) for t in rec["topics"])
     ]
-
-
-def rooms():
-    """Every chat room with its members."""
-    members = {}
-    for addr, rec in presences().items():
-        for t in rec["topics"]:
-            if t.startswith("room/") and is_ident(t[5:]):
-                members.setdefault(t[5:], []).append(addr)
-    return [{"room": name, "members": len(who), "who": sorted(who)} for name, who in sorted(members.items())]
 
 
 def expiry(rec):

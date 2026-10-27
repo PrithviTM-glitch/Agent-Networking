@@ -9,7 +9,7 @@ import time
 
 from .. import config
 from ..validation import check_text
-from . import admin, events, processes, sessions
+from . import admin, events, kill, processes, sessions
 from .processes import Refused
 
 AUDIT = os.path.join(os.path.dirname(os.path.abspath(config.LOG)), "admin-audit.jsonl")
@@ -27,7 +27,7 @@ def _name(v):
     return v["addr"] or v["session"]
 
 
-def send(b):
+def send(b, _peer=None):
     console, kind, target = admin.need_bus(), b.get("kind"), b.get("target")
     if kind not in ("room", "dm", "topic"):
         raise Refused("kind must be room, dm or topic")
@@ -35,12 +35,12 @@ def send(b):
     return f"{kind}:{target}", "sent"
 
 
-def broadcast(b):
+def broadcast(b, _peer=None):
     admin.need_bus().broadcast(b.get("text"))
     return "broadcast", "sent"
 
 
-def signal(b):
+def signal(b, _peer=None):
     v = sessions.find(b)
     if not v["alive"]:
         raise Refused(f"{_name(v)} is {'dead' if v['alive'] is False else 'not a claude session'}")
@@ -59,12 +59,12 @@ def _restartable(b):
     return v
 
 
-def terminal(b):
+def terminal(b, _peer=None):
     v = _restartable(b)
     return _name(v), processes.open_terminal(v["session"], v["cwd"])
 
 
-def resume(b):
+def resume(b, _peer=None):
     v = _restartable(b)
     text = check_text(b.get("text"))
     if not text.strip():
@@ -72,7 +72,7 @@ def resume(b):
     return _name(v), processes.resume(v["key"], v["session"], v["cwd"], text)
 
 
-def release(b):
+def release(b, _peer=None):
     lid = _id16(b, "lease_id")
     d = admin.dump()
     lease = next((x for x in d["leases"] if x["lease_id"] == lid), None)
@@ -83,13 +83,61 @@ def release(b):
     return f"{lease['resource']} lease {lid} of {lease['holder']}", f"released as {owner}"
 
 
-def revoke(b):
+def revoke(b, _peer=None):
     rid = _id16(b, "request_id")
     row = next((r for r in admin.dump()["requests"] if r["id"] == rid), None)
     if not row:
         raise Refused(f"no such request: {rid}")
     admin.ledger_call("deny", row["owner"], request_id=rid)
     return f"{row['resource']} {row['level']} for {row['holder']}", f"denied as {row['owner']} (was {row['status']})"
+
+
+def kill_room(b, peer=None):
+    """Kill every agent in a room as the preview showed; the confirmation must repeat the room name. Whole sessions
+    are spared unless kill_sessions is true."""
+    room = b.get("room")
+    if not isinstance(room, str) or b.get("confirm") != room:
+        raise Refused("type the room name to confirm")
+    if not isinstance(kill_sessions := b.get("kill_sessions", False), bool):
+        raise Refused("kill_sessions must be true or false")
+    signal_name = b.get("signal", "terminate")
+    # Subagents first: a session killed before them would take their processes down unreported.
+    targets = sorted(kill.plan(room, signal_name, kill_sessions), key=lambda t: t["class"] != "subagent")
+    results = []
+    for t in targets:
+        try:
+            result = kill.execute(t, signal_name)
+        except Refused as e:
+            result = f"refused: {e}"
+        audit("admin", peer, "room/kill", f"{room}:{t['addr']}", result)
+        results.append({**kill.public(t), "result": result})
+    counts = collections.Counter(t["class"] for t in targets)
+    summary = ", ".join(f"{n} {c}" for c, n in sorted(counts.items())) or "no members"
+    mode = f"{signal_name}, whole sessions too" if kill_sessions else signal_name
+    return f"room:{room}", f"{mode}: {summary}", {"targets": results}
+
+
+def room_settings(b, _peer=None):
+    room, mode, rules = b.get("room"), b.get("mode"), b.get("rules")
+    info = admin.need_bus().room_set(room, mode=mode, rules=rules)
+    return f"room:{room}", f"mode {info['mode']}, rules {len(info['rules'])} chars"
+
+
+def room_moderator(b, _peer=None):
+    room, action, addr = b.get("room"), b.get("action"), b.get("addr")
+    admin.need_bus().mod(room, action, addr)
+    return f"{room}:{addr}", f"moderator {action}"
+
+
+MODERATION = {"mute": "muted", "unmute": "unmuted", "ban": "banned", "unban": "unbanned", "kick": "kicked"}
+
+
+def room_member(b, _peer=None):
+    room, action, addr = b.get("room"), b.get("action"), b.get("addr")
+    if action not in MODERATION:
+        raise Refused(f"action must be one of {', '.join(MODERATION)}")
+    getattr(admin.need_bus(), action)(room, addr)
+    return f"{room}:{addr}", MODERATION[action]
 
 
 ROUTES = {
@@ -100,6 +148,10 @@ ROUTES = {
     "/api/restart/resume": resume,
     "/api/ledger/release": release,
     "/api/ledger/revoke": revoke,
+    "/api/room/kill": kill_room,
+    "/api/room/settings": room_settings,
+    "/api/room/moderator": room_moderator,
+    "/api/room/member": room_member,
 }
 
 

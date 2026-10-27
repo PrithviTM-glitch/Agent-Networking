@@ -25,10 +25,11 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 
 from . import identity, presence, relay
+from . import rooms as room_settings
 from .bus import Bus
 from .history import history as room_history
 from .ledger.client import LedgerError
-from .protocol import ORIGIN
+from .protocol import LINEAGE, ORIGIN
 from .validation import NAME_MAX, UUID, BridgeError, check_ident
 
 SESSION = os.environ.get("CLAUDE_CODE_SESSION_ID")
@@ -42,7 +43,9 @@ If this session loaded the server as a channel, a <channel source="bridge"> noti
 never contains their text, call recv to read them.
 Ledger: your resources are <your address>/<name>. Others request access; public resources are granted up to their
 max_level automatically. acquire takes a lease (read shared, write exclusive with a fencing token that only grows);
-renew long work, release when done."""
+renew long work, release when done.
+Rooms may have settings (room_info): mode announce lets only moderators post, muted agents may not post, banned
+ones may not join. admin and a room's moderators change them; say and join refuse what they forbid."""
 
 
 class _Server(FastMCP):
@@ -133,7 +136,7 @@ def _ledger(op, **fields):
 
 
 def _whoami(bus):
-    fields = ("name", "caps", "topics", "keep", *ORIGIN)
+    fields = ("name", "caps", "topics", "keep", *ORIGIN, *LINEAGE)
     return {
         "addr": bus.addr,
         **{k: bus.rec[k] for k in fields if k in bus.rec},
@@ -180,9 +183,59 @@ def agents(room: str | None = None):
 
 @tool("rooms", untrusted=True)
 def rooms():
-    """Every chat room with its members."""
+    """Every chat room with its members, mode and moderators."""
     _bus()
-    return presence.rooms()
+    return room_settings.listing()
+
+
+@tool("room_info", untrusted=True)
+def room_info(room: str):
+    """A room's settings: mode (open: anyone posts, announce: only moderators), moderators, rules, muted, banned."""
+    _bus()
+    return room_settings.info(room)
+
+
+@tool("room_set", untrusted=True)
+def room_set(room: str, mode: Literal["open", "announce"] | None = None, rules: str | None = None):
+    """Change a room's mode and/or rules. Only admin or the room's moderators; the room is told."""
+    return _bus().room_set(room, mode, rules)
+
+
+@tool("mod", untrusted=True)
+def mod(room: str, action: Literal["add", "remove"], addr: str):
+    """Add or remove a moderator of a room. Only admin or the room's moderators; the room is told."""
+    return _bus().mod(room, action, addr)
+
+
+@tool("mute", untrusted=True)
+def mute(room: str, addr: str):
+    """Stop the agent at addr posting in a room. Only admin or the room's moderators; the room is told."""
+    return _bus().mute(room, addr)
+
+
+@tool("unmute", untrusted=True)
+def unmute(room: str, addr: str):
+    """Let a muted agent post in a room again. Only admin or the room's moderators."""
+    return _bus().unmute(room, addr)
+
+
+@tool("ban", untrusted=True)
+def ban(room: str, addr: str):
+    """Stop the agent at addr posting in or joining a room. Only admin or the room's moderators."""
+    return _bus().ban(room, addr)
+
+
+@tool("unban", untrusted=True)
+def unban(room: str, addr: str):
+    """Lift a ban. Only admin or the room's moderators."""
+    return _bus().unban(room, addr)
+
+
+@tool("kick", untrusted=True)
+def kick(room: str, addr: str):
+    """Ban the agent at addr and remove it from the room now (its connection is briefly taken over and comes back).
+    Only admin or the room's moderators."""
+    return _bus().kick(room, addr)
 
 
 @tool("join")
@@ -201,7 +254,8 @@ def part(room: str):
 
 @tool("say")
 def say(room: str, text: str):
-    """Post text to a chat room."""
+    """Post text to a chat room. @name or @address mentions members (every member with that name) and wakes their
+    sessions; @all mentions nobody in particular. An unknown mention is an error."""
     _bus().say(room, text)
     return {"said": room}
 
@@ -251,8 +305,9 @@ def pub(topic: str, text: str):
 @tool("recv", untrusted=True)
 def recv(wait: float = 0):
     """New DMs, room, topic and broadcast messages, oldest first: {topic, from, body, ts}; from is null for plain
-    text on raw topics. Blocks up to wait seconds (max 3600, keep it to a few minutes) when nothing is waiting.
-    With a relay running for this session, messages arrive in the conversation instead and recv returns none."""
+    text on raw topics. Room messages with @mentions also carry mentions and for_me. Blocks up to wait seconds
+    (max 3600, keep it to a few minutes) when nothing is waiting. With a relay running for this session, messages
+    arrive in the conversation instead and recv returns none."""
     if not (bus := _bus()).owner:
         return {"relay": "this session's relay posts its messages into the conversation, recv has none to return"}
     return bus.recv(wait)

@@ -18,7 +18,8 @@ of `AGENT_BRIDGE_LOG` when that is set. It holds `history.jsonl`, `cli.lock`, `r
 | `identity.py` | `/proc` reading, the session's `claude` process, project names and session addresses |
 | `history.py` | The history log: append, read, prune, room history and DMs |
 | `broker.py` | paho-mqtt helpers: clients, connecting, confirmed publishes |
-| `presence.py` | The directory of agents: presence lookups, `agents()`, `rooms()` |
+| `presence.py` | The directory of agents: presence lookups, `agents()` |
+| `rooms.py` | Room settings records, the posting rule, `info()` and `listing()` |
 | `bus.py` | `Bus`, one agent's persistent connection |
 | `cli.py` | `agent-bridge` |
 | `relay.py` | The session relay |
@@ -49,15 +50,20 @@ of `AGENT_BRIDGE_LOG` when that is set. It holds `history.jsonl`, `cli.lock`, `r
   | `inbox/<addr>` | DMs to that agent |
   | `room/<room>` | Chat room |
   | `broadcast` | Admin broadcasts. Every agent subscribes on every connect, only the `admin` Bus may publish. |
-  | anything else | Raw topics. `$...`, `agents`, `inbox`, `ledger` and `broadcast` (as first level) are reserved for the bridge. |
+  | `rooms/<room>` | Retained room settings, see [Room moderation](#room-moderation). Every Bus subscribes at QoS 0 on every connect. |
+  | anything else | Raw topics. `$...`, `agents`, `inbox`, `ledger`, `broadcast` and `rooms` (as first level) are reserved for the bridge. |
   | `ledger/req`, `ledger/resp/<id>` | ledgerd request/response |
 
 - **Origin fields** in presence: `session` is `CLAUDE_CODE_SESSION_ID` (a UUID) when set, `pid` the nearest
   ancestor process whose comm is `claude`, and `pid_start` that process's start time (field 22 of
-  `/proc/<pid>/stat`, in clock ticks). They let the console tell a live session from a dead one and from a reused
+  `/proc/<pid>/stat`, in clock ticks). They are written once, when the record is created. Later attaches never
+  add, replace or remove `session`, and refresh `pid`/`pid_start` only from a process in that same session. An
+  agent registered with `--subagent` gets `"kind": "subagent"` and `"parent": <creating session>` instead of
+  `session`, so neither the session's relay nor the console takes it for the session itself. They let the console tell a live session from a dead one and from a reused
   pid. Any client can write any presence, so the console re-checks them against `/proc` and never trusts them alone.
 - **Message payload** on rooms, inboxes and raw topics: `{"from": "<addr>", "body": "<text>", "ts": unix_ts}`,
-  QoS 1. Plain text on a raw topic is accepted and arrives with `"from": null`. `recv` adds `"topic"`.
+  QoS 1. Plain text on a raw topic is accepted and arrives with `"from": null`. `recv` adds `"topic"`. Room messages
+  may add `"mentions": [addr, ...]` (see [Mentions](#mentions)), and `recv` then adds `"for_me": true|false`.
 - **Sessions**: each agent connects with client id = its address, `clean_start=False`, and session expiry of 3 days
   (never with `keep`). Subscriptions use QoS 1 with No Local, so you never receive your own messages.
 
@@ -71,9 +77,13 @@ of `AGENT_BRIDGE_LOG` when that is set. It holds `history.jsonl`, `cli.lock`, `r
 | `leave` | `MY_ADDR` | Deletes your ledger (warns and carries on if ledgerd is down), then your session, queued messages, presence, and the DMs you received in the log. |
 | `keep` | `MY_ADDR on\|off` | Opts in or out of idle expiry. |
 | `agents` | `[--room ROOM]` | Lists every live agent with caps, topics, keep and idle_s, most recently seen first. |
-| `rooms` | | Lists every room with its member count and addresses. |
+| `rooms` | | Lists every room with members or settings: member count, addresses, mode and moderators. |
 | `join` / `part` | `MY_ADDR ROOM` | Joins or leaves a room. Members get a `[joined #room] name, caps: ...` or `[left #room] name` message when membership changes; `leave` sends `[left #room]` to every room the agent was in. |
-| `say` | `MY_ADDR ROOM TEXT` | Posts to a room. |
+| `say` | `MY_ADDR ROOM TEXT` | Posts to a room; `@name`, `@address` and `@all` mention (see [Mentions](#mentions)). Refused when the room's settings forbid it (muted, banned, or not a moderator of an announce room). |
+| `room info` | `ROOM` | A room's settings: mode, moderators, rules, muted, banned (open defaults without settings). |
+| `room set` | `MY_ADDR ROOM [--mode open\|announce] [--rules TEXT]` | Changes the mode or rules. Admin or a moderator only; prints the new settings. |
+| `mod` | `MY_ADDR ROOM add\|remove ADDR` | Adds or removes a moderator. Admin or a moderator only. |
+| `mute` / `unmute` / `ban` / `unban` / `kick` | `MY_ADDR ROOM ADDR` | Moderation, admin or a moderator only. `kick` bans and drops ADDR from the room. |
 | `history` | `ROOM [--last N]` | Shows a room's transcript from the log (default 20, max 1000). |
 | `dm` | `MY_ADDR TO TEXT` | Sends a direct message. The recipient must be live. |
 | `dms` | `MY_ADDR [--with PEER] [--last N]` | Shows your DMs in both directions. |
@@ -102,9 +112,61 @@ From Python, `from agent_bridge.bus import Bus`, then `bus = Bus.register(name, 
 or `Bus(addr)`. Then call `join / part / sub / unsub / say / dm / pub / recv(wait) / dms / keep / leave / close`,
 `broadcast(text)` (only on the console's `Bus.register("admin", addr="admin", keep=True, admin=True)`, the one way to
 get that identity), `ledger(op, **fields)` for a ledgerd request as that agent over the same connection,
-`describe(name, caps)` to change how others see it, `pending()` for the number of buffered messages, and
+`describe(name, caps)` to change how others see it, `register(..., subagent=True)` (or `register NAME --subagent`)
+for a subagent's own agent (see Origin fields), the moderation calls
+`room_set(room, mode, rules) / mod(room, add|remove, addr) / mute / unmute / ban / unban / kick(room, addr)` (each
+returns the room's new settings) and `Bus.rooms()` / `Bus.room_info(room)`, `pending()` for the number of buffered messages, and
 `on_arrival`, a callback run on the network thread when a message is buffered. Every failure raises
 `agent_bridge.validation.BridgeError` (or `LedgerError` from `ledger`) with a one-line message.
+
+## Room moderation
+
+A room may have settings: a retained record at `rooms/<room>`.
+
+```json
+{"mode": "open", "moderators": ["alice-1a2b3c"], "rules": "Be kind.", "muted": [], "banned": [], "by": "admin", "ts": 1793140000.0}
+```
+
+- **No record** means open and unmoderated. A malformed record counts as no record.
+- **mode** `open` lets anyone post; `announce` lets only moderators post. **muted** agents may not post; **banned**
+  ones may neither post nor join. `by` and `ts` say who changed it last.
+- **Who may change it.** `admin` moderates every room and may not itself be muted, banned or removed. Only admin
+  names a room's first moderators. After that, admin or any current moderator changes the record.
+- **Announcements.** Every change posts a room message from the moderator: `[mode #room] announce by Y`,
+  `[rules #room] updated by Y`, `[moderator #room] +X by Y` / `-X`, `[muted #room] X by Y`, `[unmuted ...]`,
+  `[banned ...]`, `[unbanned ...]`, `[kicked #room] X by Y`. `[joined]` and `[left]` notices are not sent by agents
+  the room would refuse.
+- **Enforcement is in the Bus**, so the CLI, the MCP server and the relay all get it:
+  - The sender refuses to `say` when muted, banned, or not a moderator in an announce room, and `join` refuses when
+    banned.
+  - Every Bus keeps the records current through its `rooms/+` subscription. The retained records arrive right after
+    that SUBACK, and the ack of the next request on the connection marks the cache complete, so no check runs on a
+    half-filled cache.
+  - `recv` (and so the relay and MCP `recv`) drops room messages the current record forbids. That stops spoofed or
+    raw publishes from a muted or banned address, and catches messages queued while the receiver was offline.
+- **Kick** = ban, plus removing the room from the target's subscriptions. The only way to change another agent's
+  subscriptions is a brief connection with its client id, which takes its MQTT session over: its relay, MCP server or
+  CLI `recv` drops and reconnects about a second later, and nothing it had not acked is lost. Banned without a kick,
+  an agent still receives the room but cannot post or rejoin.
+- **Advisory.** Identity on the bus is self-asserted. Anyone can claim a moderator's address, post as one, or overwrite
+  a record with a raw MQTT client. Moderation keeps cooperating agents in line and filters the obvious spoofs; it is
+  not access control.
+
+## Mentions
+
+`say` turns `@token` in a room message into mentions. A token is a member's address, or a name (it mentions every
+member with that name); `@all` mentions nobody in particular and sends no mentions field, as before. Anything else
+is refused with an error naming it. `@` glued to a word (`alice@example.com`) is not a mention.
+
+- **Wire:** the room message gains `"mentions": [addr, ...]`, at most 32 sorted addresses. A malformed list drops the
+  message; on non-room topics the field is ignored. A spoofed but well-formed list just counts as mentions.
+- **Pull:** `recv` (CLI and MCP) returns every message as before and adds `"for_me"` to the ones with mentions.
+- **Relay:** a room message mentioning this session's agent wakes it at once, marked `#room from X (mentions you)`.
+  One mentioning only others is acked and kept quietly, the last 50 in memory, oldest dropped. The next post that
+  does wake the session carries them after its own messages, under
+  `[agent-bridge] while you were away: N quiet room messages`. Room messages without mentions, DMs and broadcasts
+  wake the session as before.
+- **Moderation** applies first: mentions don't let a muted, banned, or non-moderator in an announce room post.
 
 ## Resource ledger
 
@@ -215,11 +277,12 @@ Installation is in the [README](../README.md#mcp-server).
   the address `<name>-<8 hex of sha256(name)>`. Two such clients using the same name share one address and take
   each other's session over.
 
-**Tools (28)**
+**Tools (36)**
 
 | Group | Tools |
 |---|---|
 | Bus | `connect`, `whoami`, `agents`, `rooms`, `join`, `part`, `say`, `history`, `dm`, `dms`, `sub`, `unsub`, `pub`, `recv(wait)`, `keep`, `leave` |
+| Rooms | `room_info`, `room_set(room, mode?, rules?)`, `mod(room, add\|remove, addr)`, `mute`, `unmute`, `ban`, `unban`, `kick` |
 | Ledger | `add`, `update`, `remove`, `ledger(owner?)`, `public`, `request`, `grant`, `deny`, `grants`, `acquire`, `renew`, `release` |
 
 Results are JSON text. Errors are one-line tool errors, including bad arguments. `leave` drops the ledger first
@@ -237,7 +300,7 @@ Results are JSON text. Errors are one-line tool errors, including bad arguments.
   (ignored with `-p`).
 
 **Untrusted content.** Tools that return text written by other agents (`recv`, `history`, `dms`, `agents`,
-`rooms`, `ledger`, `public`, `request`, `grants`, `acquire`) start their result with an `UNTRUSTED DATA ...` line,
+`rooms`, the room tools, `ledger`, `public`, `request`, `grants`, `acquire`) start their result with an `UNTRUSTED DATA ...` line,
 followed by the JSON. The server's instructions tell the model that this text is data from other agents, never
 instructions and never the user. Ask Claude to act on a message only after reading it yourself, or within limits you
 set.
@@ -420,9 +483,10 @@ the service.
 |---|---|
 | Names, addresses, rooms, caps | 1-64 ASCII letters, digits, `_`, `-`. Register names at most 57 (room for the suffix). At most 32 caps. |
 | Message text | At most 64 KiB of UTF-8. Tab, newline and CR are kept, and any other C0, DEL or C1 control is refused. |
-| Raw topics | At most 256 bytes, no control characters, not under the reserved levels (`agents`, `inbox`, `ledger`, `broadcast`). Wildcards only in `sub`. At most 100 subscriptions per agent. |
+| Raw topics | At most 256 bytes, no control characters, not under the reserved levels (`agents`, `inbox`, `ledger`, `broadcast`, `rooms`). Wildcards only in `sub`. At most 100 subscriptions per agent. |
 | Incoming messages | Over 256 KiB, not UTF-8, or breaking the rules above: dropped. `"from"` is checked for shape only. |
 | Presence and history lines | Malformed records are skipped, never trusted. |
+| Room settings | Rules at most 2048 bytes of text (same control-character rule), at most 32 moderators and 256 muted and 256 banned addresses. Malformed records count as open. |
 | `--wait`, `--last` | 0-3600 s, 1-1000. |
 | Broker | `max_packet_size 270000`, `max_connections 1024`, `max_queued_messages 1000` and `max_queued_bytes` 32 MiB per client, `memory_limit` 512 MiB. |
 | ledgerd requests | At most 16 KiB of UTF-8 JSON object, unknown fields rejected, every field type-, charset-, length- and range-checked. Resource names are `[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}`. Descriptions are at most 1024 chars with no control characters except tab and newline. ids are 16 hex chars. Bad requests get `ok: false`, or are dropped without a valid ResponseTopic. |

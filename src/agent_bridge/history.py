@@ -9,7 +9,7 @@ import json
 import time
 
 from . import config
-from .validation import TOPIC_MAX, BridgeError, check_ident, check_last, check_text, check_ts
+from .validation import TOPIC_MAX, BridgeError, check_ident, check_last, check_mentions, check_text, check_ts
 
 
 def parse_entry(line):
@@ -17,12 +17,15 @@ def parse_entry(line):
     try:
         d = json.loads(line)
         if isinstance(d["topic"], str) and len(d["topic"]) <= TOPIC_MAX:
-            return {
+            entry = {
                 "topic": d["topic"],
                 "from": check_ident(d["from"]),
                 "body": check_text(d["body"]),
                 "ts": check_ts(d["ts"]),
             }
+            if "mentions" in d:
+                entry["mentions"] = check_mentions(d["mentions"])
+            return entry
     except (ValueError, RecursionError, BridgeError, KeyError, TypeError):
         pass
     return None

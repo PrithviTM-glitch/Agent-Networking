@@ -7,10 +7,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from .. import config
+from .. import config, rooms
 from ..history import dms
 from ..validation import BridgeError
-from . import actions, admin, auth, events, processes, sessions
+from . import actions, admin, auth, events, kill, processes, sessions
 from .processes import Refused
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -63,10 +63,18 @@ class Handler(BaseHTTPRequestHandler):
                         "audit": actions.audit_tail(),
                         "jobs": processes.job_list(),
                         "connected": admin.held["bus"] is not None,
+                        "rooms": admin.settings,
                     },
                 )
             if url.path == "/api/agent":
                 return self.json(200, agent_detail(query))
+            if url.path == "/api/room":
+                return self.json(200, rooms.info(query.get("room")))
+            if url.path == "/api/room/kill":
+                targets = kill.plan(
+                    query.get("room"), query.get("signal", "terminate"), query.get("kill_sessions") == "true"
+                )
+                return self.json(200, {"room": query["room"], "targets": [kill.public(t) for t in targets]})
             if url.path == "/api/ledger":
                 return self.json(200, admin.dump())
             if url.path == "/api/stream":
@@ -96,10 +104,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
         except (ValueError, RecursionError):
             return self.json(400, {"error": f"send a JSON object of at most {REQUEST_MAX} bytes"})
-        target = next((body[k] for k in ("addr", "session", "target", "lease_id", "request_id") if k in body), None)
+        keys = ("addr", "session", "target", "room", "lease_id", "request_id")
+        target = next((body[k] for k in keys if k in body), None)
         target = target[:200] if isinstance(target, str) else None
         try:
-            target, result = actions.ROUTES[self.path](body)
+            target, result, *extra = actions.ROUTES[self.path](body, peer)
         except (Refused, BridgeError) as e:
             actions.audit("admin", peer, action, target, f"refused: {e}")
             return self.json(400, {"error": str(e)})
@@ -107,7 +116,7 @@ class Handler(BaseHTTPRequestHandler):
             actions.audit("admin", peer, action, target, f"error: {type(e).__name__}: {e}")
             return self.json(500, {"error": f"{type(e).__name__}: {e}"})
         actions.audit("admin", peer, action, target, result)
-        self.json(200, {"ok": True, "result": result})
+        self.json(200, {"ok": True, "result": result, **(extra[0] if extra else {})})
 
     def do_OPTIONS(self):
         self.send_error(405)

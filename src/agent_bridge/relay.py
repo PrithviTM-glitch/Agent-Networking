@@ -10,6 +10,7 @@ The hooks and the console import this module for live(), so it imports nothing b
 """
 
 import argparse
+import collections
 import contextlib
 import fcntl
 import json
@@ -28,6 +29,7 @@ from .validation import UUID, BridgeError, check_session, is_ident
 SOCKET, TOKEN = "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"
 COALESCE = 1.0  # messages arriving within this window go out as one inbox post
 BATCH = 20
+BACKLOG = 50  # quiet room messages kept for the next post that wakes the session
 SHOW_MAX = 16 * 1024
 RETRY = 2.0
 NOTE = (
@@ -52,12 +54,26 @@ def live(session):
     return False
 
 
+def _lock_lines(session):
+    """The lock file's lines: the relay's pid, then the address it holds once registered."""
+    try:
+        with open(lock_path(session)) as f:
+            return f.read().split("\n")
+    except OSError:
+        return []
+
+
+def held(session):
+    """The address the live relay of session holds, or None."""
+    lines = _lock_lines(session)
+    return lines[1] if len(lines) > 1 and is_ident(lines[1]) and live(session) else None
+
+
 def stop(session, timeout=5):
     """SIGTERM session's relay and wait for its lock to free; False if it outlived timeout."""
     try:
-        with open(lock_path(session)) as f:
-            pid = int(f.read().strip() or 0)
-    except (FileNotFoundError, ValueError):
+        pid = int((_lock_lines(session) or ["0"])[0] or 0)
+    except ValueError:
         return True
     deadline = time.monotonic() + timeout
     if pid > 0 and live(session):
@@ -75,19 +91,27 @@ def _kind(m):
         return f"DM from {who}"
     if topic.startswith("room/"):
         room = topic[5:]
-        return f"#{room if is_ident(room) else 'room'} from {who}"
+        return f"#{room if is_ident(room) else 'room'} from {who}" + (" (mentions you)" if m.get("for_me") else "")
     return f"broadcast from {who}" if topic == BROADCAST else f"topic message from {who}"
 
 
-def frame(msgs):
-    """One inbox post: a summary line, the warning, then each message as one JSON line (escaping keeps it one line)."""
-    kinds = dict.fromkeys(map(_kind, msgs))
-    head = f"[agent-bridge] {len(msgs)} message{'s' if len(msgs) > 1 else ''} ({', '.join(kinds)})"
-    shown = [
-        {**m, "body": m["body"][:SHOW_MAX], "truncated_from": len(m["body"])} if len(m["body"]) > SHOW_MAX else m
+def _lines(msgs):
+    """Each message as one JSON line (escaping keeps it one line), long bodies cut."""
+    return [
+        json.dumps(
+            {**m, "body": m["body"][:SHOW_MAX], "truncated_from": len(m["body"])} if len(m["body"]) > SHOW_MAX else m
+        )
         for m in msgs
     ]
-    return "\n".join([head, NOTE, *map(json.dumps, shown)])
+
+
+def frame(msgs, quiet=()):
+    """One inbox post: a summary line, the warning, the messages, then the quiet room messages that mentioned
+    others since the last post, under their own line."""
+    kinds = dict.fromkeys(map(_kind, msgs))
+    head = f"[agent-bridge] {len(msgs)} message{'s' if len(msgs) > 1 else ''} ({', '.join(kinds)})"
+    away = [f"[agent-bridge] while you were away: {len(quiet)} quiet room message{'s' if len(quiet) > 1 else ''}"]
+    return "\n".join([head, NOTE, *_lines(msgs), *(away + _lines(quiet) if quiet else [])])
 
 
 def post(text):
@@ -104,10 +128,18 @@ def post(text):
 
 
 def session_agent(session):
-    """The most recently seen live agent registered from this session (e.g. through the CLI), or None."""
+    """The most recently seen live agent registered from this session (e.g. through the CLI), or None. Never a
+    subagent's agent: that one belongs to the subagent, not to the session."""
     from . import presence
 
-    return next((a["addr"] for a in presence.agents() if a.get("session", "").lower() == session.lower()), None)
+    return next(
+        (
+            a["addr"]
+            for a in presence.agents()
+            if a.get("session", "").lower() == session.lower() and "parent" not in a and a.get("kind") != "subagent"
+        ),
+        None,
+    )
 
 
 def log(*parts):
@@ -135,12 +167,21 @@ def run(claude_pid, claude_start):
         signal.signal(signal.SIGTERM, lambda *_: done.set())
         bus = Bus.register(identity.project_name(), addr=session_agent(session) or identity.session_address(session))
         bus.on_arrival = arrived.set
+        lock.write(f"{bus.addr}\n")
+        lock.flush()
         log(f"relaying {bus.addr} for claude pid {claude_pid}")
+
+        backlog = collections.deque(maxlen=BACKLOG)
 
         def deliver(msgs):
             # Another connection acting as this agent (the MCP server's publisher) is not covered by no-local.
-            if mine := [m for m in msgs if m["from"] != bus.addr]:
-                post(frame(mine))
+            mine = [m for m in msgs if m["from"] != bus.addr]
+            quiet = [m for m in mine if m.get("for_me") is False]
+            if wake := [m for m in mine if m.get("for_me") is not False]:
+                post(frame(wake, [*backlog, *quiet][-BACKLOG:]))
+                backlog.clear()
+            else:
+                backlog.extend(quiet)  # acked once this returns: from here on they live only in the backlog
 
         try:
             while not done.is_set() and (identity.read_proc(claude_pid) or {}).get("start") == claude_start:

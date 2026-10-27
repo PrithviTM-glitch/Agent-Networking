@@ -3,17 +3,17 @@
 Names, addresses, rooms and caps: 1-64 ASCII letters, digits, _ or - (names at most 57, leaving room for the address
 suffix), at most 32 caps. Text: at most 64 KiB of UTF-8; tab, newline and CR are kept, any other control character
 (C0, DEL, C1) is refused. Raw topics: at most 256 bytes of UTF-8, no control characters, never starting with $ or the
-reserved levels agents, inbox, ledger and broadcast. + and # work only in subscription filters, as whole levels, # only
-last, and not as the first level.
+reserved levels agents, inbox, ledger, broadcast and rooms. + and # work only in subscription filters, as whole
+levels, # only last, and not as the first level.
 """
 
 import re
 
 ID_MAX, NAME_MAX = 64, 57
-CAPS_MAX, TOPICS_MAX, TOPIC_MAX = 32, 100, 256
+CAPS_MAX, TOPICS_MAX, TOPIC_MAX, MENTIONS_MAX = 32, 100, 256, 32
 BODY_MAX = 64 * 1024
 WAIT_MAX, LAST_MAX = 3600, 1000
-RESERVED = ("agents", "inbox", "ledger", "broadcast")
+RESERVED = ("agents", "inbox", "ledger", "broadcast", "rooms")
 ADMIN = "admin"
 IDENT = re.compile(r"[A-Za-z0-9_-]+")
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -64,9 +64,9 @@ def _utf8_len(value, what):
         raise BridgeError(f"{what} is not valid UTF-8") from None
 
 
-def check_text(value, what="text"):
-    if (size := _utf8_len(value, what)) > BODY_MAX:
-        raise BridgeError(f"{what} is {size} bytes, the limit is {BODY_MAX}")
+def check_text(value, what="text", cap=BODY_MAX):
+    if (size := _utf8_len(value, what)) > cap:
+        raise BridgeError(f"{what} is {size} bytes, the limit is {cap}")
     if BODY_CTRL.search(value):
         raise BridgeError(f"{what} contains a control character other than tab, newline or CR")
     return value
@@ -98,6 +98,12 @@ def check_caps(values):
     if not isinstance(values, (list, tuple)) or len(values) > CAPS_MAX:
         raise BridgeError(f"caps must be a list of at most {CAPS_MAX}")
     return [check_ident(c, "cap") for c in values]
+
+
+def check_mentions(values):
+    if not isinstance(values, list) or not values or len(values) > MENTIONS_MAX:
+        raise BridgeError(f"mentions must be a list of 1-{MENTIONS_MAX} addresses")
+    return sorted({check_ident(v, "address") for v in values})
 
 
 def check_wait(value):

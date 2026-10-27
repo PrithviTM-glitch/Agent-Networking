@@ -12,9 +12,9 @@ import threading
 import time
 import uuid
 
-from . import broker, config, history, identity, presence
+from . import broker, config, history, identity, presence, rooms
 from .ledger import client as ledger
-from .protocol import BROADCAST, ORIGIN, parse_message
+from .protocol import BROADCAST, parse_message
 from .validation import (
     ADMIN,
     ID_MAX,
@@ -26,6 +26,7 @@ from .validation import (
     check_text,
     check_topic,
     check_wait,
+    is_ident,
     not_admin,
 )
 
@@ -37,7 +38,8 @@ class Bus:
     """One agent on the bus. Bus(addr) attaches to a live address; Bus.register joins the bus."""
 
     agents = staticmethod(presence.agents)
-    rooms = staticmethod(presence.rooms)
+    room_info = staticmethod(rooms.info)  # before the next line, whose attribute shadows the rooms module here
+    rooms = staticmethod(rooms.listing)
     history = staticmethod(history.history)
 
     def __init__(self, addr, rec=None, owner=True):
@@ -45,6 +47,9 @@ class Bus:
         of its own, leaving the agent's session (subscriptions, queued messages) to the process that owns it."""
         self.addr = check_ident(addr, "address")
         self.owner = owner
+        self._rooms = {}  # room -> record, kept current by the rooms/+ subscription
+        self._synced = threading.Event()  # set once the retained room records of this connection are all in
+        self._barrier = None
         self.rec = rec or presence.need(addr)
         self._buf = collections.deque()  # (mid to ack or None, message)
         self._acks = {}
@@ -54,14 +59,16 @@ class Bus:
         self.on_arrival = None  # called from the network thread after each buffered message
         self._admin = False
         self._open()
-        if rec is None and {k: self.rec[k] for k in ORIGIN if k in self.rec} != identity.origin():
+        if rec is None and any(self.rec.get(k) != v for k, v in self._fresh_pid().items()):
             self._touch(refresh=False)
 
     @classmethod
-    def register(cls, name, caps=(), keep=False, addr=None, admin=False, owner=True):
+    def register(cls, name, caps=(), keep=False, addr=None, admin=False, owner=True, subagent=False):
         """Join the bus. With addr, reattach to it if it is live (its record stays as is), else create it.
-        admin=True is only for the console: Bus.register("admin", addr="admin", keep=True, admin=True)."""
-        if admin and (name, addr) != (ADMIN, ADMIN):
+        admin=True is only for the console: Bus.register("admin", addr="admin", keep=True, admin=True).
+        subagent=True marks a subagent's own agent: "kind": "subagent" and the creating session as "parent" instead
+        of "session", so neither the session's relay nor the console mistakes it for the session itself."""
+        if admin and ((name, addr) != (ADMIN, ADMIN) or subagent):
             raise BridgeError("admin=True is only for name and address admin")
         if not admin:
             not_admin(name, "name")
@@ -72,6 +79,12 @@ class Bus:
             "topics": [],
             "keep": bool(keep),
         }
+        # Origin fields are written here, once; later attaches only refresh pid and pid_start (see _fresh_pid).
+        here = {} if admin else identity.origin()
+        if subagent:
+            rec |= {"kind": "subagent", **({"parent": here["session"]} if "session" in here else {})}
+            here = {k: v for k, v in here.items() if k != "session"}
+        rec |= here
         if addr is not None and (live := presence.find(addr)):
             rec = live
         elif addr is not None:
@@ -87,7 +100,7 @@ class Bus:
     def _open(self):
         c = self._c = broker.new_client(self.addr if self.owner else "", self._on_message, manual_ack=True)
         c.on_connect = self._on_connect
-        c.on_disconnect = lambda *_: self._up.clear()
+        c.on_disconnect = lambda *_: (self._up.clear(), self._synced.clear())
         c.on_subscribe = c.on_unsubscribe = self._on_ack
         # mosquitto only writes a session to disk if its latest connect had clean_start=False, even under MQTT 5.
         broker.connect(c, not self.owner, presence.expiry(self.rec) if self.owner else 0, self._up)
@@ -95,21 +108,36 @@ class Bus:
     def _on_connect(self, c, _u, flags, rc, _p):
         if rc.is_failure:
             return
-        if not self.owner:
-            return self._up.set()
-        with self._cv:
-            # A surviving session resends everything not yet acked; a lost one never will, so keep those unacked.
-            self._buf = collections.deque((None, m) for mid, m in self._buf if mid is None or not flags.session_present)
-        # broadcast on every connect, so agents whose sessions predate it pick it up on their next attach.
-        fresh = () if flags.session_present else (f"inbox/{self.addr}", *self.rec["topics"])
-        c.subscribe([(t, broker.SUB) for t in (BROADCAST, *fresh)])
+        # The retained room records follow this SUBACK on the wire, and the ack of the next request follows them:
+        # once that ack is back the room cache is complete.
+        c.subscribe(rooms.TOPICS, options=rooms.SUB)
+        if self.owner:
+            with self._cv:
+                # A surviving session resends everything not yet acked; a lost one never will, so keep those unacked.
+                self._buf = collections.deque(
+                    (None, m) for mid, m in self._buf if mid is None or not flags.session_present
+                )
+            # broadcast on every connect, so agents whose sessions predate it pick it up on their next attach.
+            fresh = () if flags.session_present else (f"inbox/{self.addr}", *self.rec["topics"])
+            _, self._barrier = c.subscribe([(t, broker.SUB) for t in (BROADCAST, *fresh)])
+        else:
+            _, self._barrier = c.unsubscribe(f"inbox/{self.addr}")  # never subscribed here: only the barrier
         self._up.set()
 
     def _on_message(self, c, _u, m):
         try:
-            msg = parse_message(m.topic, m.payload)
+            topic = m.topic
         except ValueError:
-            msg = None
+            return c.ack(m.mid, m.qos)
+        if topic.startswith("rooms/"):
+            if is_ident(room := topic[6:]):
+                with self._cv:
+                    if rec := rooms.parse_room(m.payload):
+                        self._rooms[room] = rec
+                    else:
+                        self._rooms.pop(room, None)
+            return c.ack(m.mid, m.qos)
+        msg = parse_message(topic, m.payload)
         with self._cv:
             # Unacked QoS 1 messages are already capped by ReceiveMaximum, only QoS 0 floods need BUFFER_MAX.
             if msg and (m.qos or len(self._buf) < BUFFER_MAX):
@@ -124,16 +152,17 @@ class Bus:
         with self._cv:
             self._acks[mid] = not any(r.is_failure for r in codes)
             self._cv.notify_all()
+        if mid == self._barrier:
+            self._synced.set()
 
     def _ready(self):
-        if not self._up.wait(broker.TIMEOUT):
+        if not (self._up.wait(broker.TIMEOUT) and self._synced.wait(broker.TIMEOUT)):
             raise BridgeError("not connected to the broker")
 
     def _touch(self, refresh=True):
         if refresh:
             self.rec = presence.find(self.addr) or self.rec
-        # The console's own presence must not borrow whichever Claude session happened to launch it.
-        self.rec = {k: v for k, v in self.rec.items() if k not in ORIGIN} | ({} if self._admin else identity.origin())
+        self.rec |= self._fresh_pid()
         self.rec["seen"] = time.time()
         self._ready()
         broker.publish(
@@ -144,6 +173,16 @@ class Bus:
             expire=None if self.rec["keep"] else config.STALE_S,
         )
         self._touched = time.monotonic()
+
+    def _fresh_pid(self):
+        """pid and pid_start of this process's claude, when it runs in the very session the record names (its
+        session, or a subagent's parent); else nothing. Any other process acting as the agent, a moderator's kick
+        among them, must not rewrite who the agent belongs to."""
+        here = identity.origin()
+        owner = self.rec.get("session") or self.rec.get("parent")
+        if self._admin or not owner or "pid" not in here or here.get("session", "").lower() != owner.lower():
+            return {}
+        return {"pid": here["pid"], "pid_start": here["pid_start"]}
 
     def _owner_does(self, method, *args):
         """Subscriptions and session expiry live in the agent's session: change them through a brief owner
@@ -173,13 +212,17 @@ class Bus:
         return (topic in topics) != on
 
     def _announce(self, room, verb):
+        if rooms.refusal(self._rooms.get(room), self.addr):
+            return
         caps = self.rec["caps"]
         self._send(
             f"room/{room}", f"[{verb} #{room}] {self.rec['name']}" + (f", caps: {', '.join(caps)}" if caps else "")
         )
 
-    def _send(self, topic, body):
+    def _send(self, topic, body, mentions=None):
         entry = {"from": self.addr, "body": check_text(body), "ts": time.time()}
+        if mentions:
+            entry["mentions"] = mentions
         self._ready()
         broker.publish(self._c, topic, json.dumps(entry))
         history.append(topic, entry)
@@ -223,7 +266,10 @@ class Bus:
 
     def join(self, room):
         """Join a room; its members get a "[joined #room]" message unless this agent was already in it."""
-        if self._subscribe(f"room/{check_ident(room, 'room')}", True):
+        self._ready()
+        if self.addr in self._rooms.get(check_ident(room, "room"), rooms.OPEN)["banned"]:
+            raise BridgeError(f"you are banned from #{room}")
+        if self._subscribe(f"room/{room}", True):
             self._announce(room, "joined")
 
     def part(self, room):
@@ -244,7 +290,13 @@ class Bus:
         self._send(BROADCAST, body)
 
     def say(self, room, body):
-        self._send(f"room/{check_ident(room, 'room')}", body)
+        """Post to a room. @address or @name (every member with that name) mentions members: their relays wake for
+        it, other relays keep it quiet. @all mentions nobody in particular, like no mention."""
+        self._ready()
+        if why := rooms.refusal(self._rooms.get(check_ident(room, "room")), self.addr):
+            raise BridgeError(f"you may not post in #{room}: {why}")
+        tagged = rooms.MENTION.search(check_text(body))
+        self._send(f"room/{room}", body, tagged and rooms.mentions(room, body, presence.agents(room)))
 
     def dm(self, to, body):
         check_text(body)
@@ -273,7 +325,9 @@ class Bus:
         with self._cv:
             self._cv.wait_for(lambda: self._buf, wait)
             got = [self._buf.popleft() for _ in range(min(len(self._buf), limit or len(self._buf)))]
-        msgs = [m for _, m in got]
+        msgs = [
+            {**m, "for_me": self.addr in m["mentions"]} if "mentions" in m else m for _, m in got if self._allowed(m)
+        ]
         if deliver and msgs:
             try:
                 deliver(msgs)
@@ -285,6 +339,89 @@ class Bus:
             if mid is not None:
                 self._c.ack(mid, 1)
         return msgs
+
+    def _allowed(self, m):
+        """False for a room message its room's record forbids: from a banned or muted address, or a non-moderator in
+        an announce room. Spoofed or raw publishes are dropped too, unless they claim a moderator's address."""
+        return not m["topic"].startswith("room/") or not rooms.refusal(self._rooms.get(m["topic"][5:]), m["from"])
+
+    def _moderate(self, room, change):
+        """Apply change(record) -> (fields, notes) to room's record as this agent, if it may, then post each note to
+        the room as "<note> by <this address>". Returns the room's new settings."""
+        room = check_ident(room, "room")
+        self._ready()
+        current = self._rooms.get(room)
+        if not rooms.is_moderator(current, self.addr):
+            raise BridgeError(
+                f"only admin or a moderator of #{room} may change it" + ("" if current else ", admin names the first")
+            )
+        fields, notes = change({**rooms.OPEN, **(current or {})})
+        rec = rooms.check_record({**rooms.OPEN, **(current or {}), **fields, "by": self.addr, "ts": time.time()})
+        broker.publish(self._c, f"rooms/{room}", json.dumps(rec), retain=True)
+        with self._cv:
+            self._rooms[room] = rec
+        for note in notes:
+            self._send(f"room/{room}", f"{note} by {self.addr}")
+        return rooms.view(room, rec)
+
+    def room_set(self, room, mode=None, rules=None):
+        """Change a room's mode ("open" or "announce") and/or its rules text; admin or a moderator only."""
+        if mode is None and rules is None:
+            raise BridgeError("nothing to change: give mode or rules")
+
+        def change(rec):
+            fields, notes = {}, []
+            if mode is not None:
+                fields["mode"] = rooms.check_mode(mode)
+                notes.append(f"[mode #{room}] {mode}")
+            if rules is not None:
+                fields["rules"] = rooms.check_rules(rules)
+                notes.append(f"[rules #{room}] updated")
+            return fields, notes
+
+        return self._moderate(room, change)
+
+    def mod(self, room, action, addr):
+        """action "add" or "remove" addr as a moderator of room."""
+        if action not in ("add", "remove"):
+            raise BridgeError("action must be add or remove")
+        return self._listed(room, addr, "moderators", action == "add", "moderator", "+" if action == "add" else "-")
+
+    def mute(self, room, addr):
+        return self._listed(room, addr, "muted", True, "muted")
+
+    def unmute(self, room, addr):
+        return self._listed(room, addr, "muted", False, "unmuted")
+
+    def ban(self, room, addr):
+        return self._listed(room, addr, "banned", True, "banned")
+
+    def unban(self, room, addr):
+        return self._listed(room, addr, "banned", False, "unbanned")
+
+    def kick(self, room, addr):
+        """Ban addr from room and drop its subscription. That takes a brief connection with addr's client id, which
+        takes its session over: its relay or MCP server reconnects about a second later."""
+        settings = self._listed(room, addr, "banned", True, "kicked")
+        if presence.find(addr):
+            target = Bus(addr)
+            try:
+                target._subscribe(f"room/{room}", False)
+            finally:
+                target.close()
+        return settings
+
+    def _listed(self, room, addr, field, on, verb, sign=""):
+        target = check_ident(addr, "address")
+        if target.lower() == ADMIN:
+            raise BridgeError("admin moderates every room and cannot be moderated")
+
+        def change(rec):
+            return {field: sorted(set(rec[field]) | {target} if on else set(rec[field]) - {target})}, [
+                f"[{verb} #{room}] {sign}{target}"
+            ]
+
+        return self._moderate(room, change)
 
     def close(self):
         """Disconnect; the session and anything not yet received stay with the broker."""

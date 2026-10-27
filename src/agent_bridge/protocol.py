@@ -12,6 +12,7 @@ from .validation import (
     BridgeError,
     check_caps,
     check_ident,
+    check_mentions,
     check_text,
     check_topic,
     check_ts,
@@ -23,6 +24,7 @@ PAYLOAD_MAX = 256 * 1024
 BROADCAST = "broadcast"
 NEVER = 0xFFFFFFFF  # MQTT 5 session expiry value meaning the broker keeps the session forever
 ORIGIN = ("session", "pid", "pid_start")
+LINEAGE = ("kind", "parent")  # a subagent's agent: kind "subagent" and the creating session, never its own session
 PID_MAX, TICKS_MAX = 4194304, 2**53
 
 
@@ -50,7 +52,11 @@ def parse_presence(payload):
         }
     except (BridgeError, KeyError, TypeError):
         return None
-    if isinstance(session := d.get("session"), str) and UUID.fullmatch(session):
+    if d.get("kind") == "subagent":
+        rec["kind"] = "subagent"
+        if isinstance(parent := d.get("parent"), str) and UUID.fullmatch(parent):
+            rec["parent"] = parent
+    elif isinstance(session := d.get("session"), str) and UUID.fullmatch(session):
         rec["session"] = session
     if is_count(d.get("pid"), PID_MAX) and is_count(d.get("pid_start"), TICKS_MAX):
         rec.update(pid=d["pid"], pid_start=d["pid_start"])
@@ -62,12 +68,15 @@ def parse_message(topic, payload):
     d = parse_json(payload, PAYLOAD_MAX)
     try:
         if isinstance(d, dict) and "from" in d:
-            return {
+            msg = {
                 "topic": topic,
                 "from": check_ident(d["from"], "address"),
                 "body": check_text(d["body"]),
                 "ts": check_ts(d["ts"]),
             }
+            if topic.startswith("room/") and "mentions" in d:
+                msg["mentions"] = check_mentions(d["mentions"])
+            return msg
         if topic.startswith(("room/", "inbox/")) or topic == BROADCAST or len(payload) > PAYLOAD_MAX:
             return None
         return {"topic": topic, "from": None, "body": check_text(payload.decode())}

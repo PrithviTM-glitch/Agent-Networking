@@ -21,20 +21,28 @@ class Refused(Exception):
     """An admin action that is not allowed; the message is shown to the admin."""
 
 
-def proc(pid):
-    """(comm, start time in ticks, uid, argv[0]) of a process, or None once it is gone or a zombie."""
+def info(pid):
+    """comm, ppid, start time in ticks, uid and argv of a process, or None once it is gone or a zombie."""
     try:
         with open(f"/proc/{pid}/stat", "rb") as f:
             stat = f.read()
         uid = os.stat(f"/proc/{pid}").st_uid
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            argv0 = f.read().split(b"\0")[0].decode(errors="replace")
+            argv = [a.decode(errors="replace") for a in f.read().split(b"\0")[:-1]]
         head, _, rest = stat.rpartition(b")")
-        if rest.split()[0] in (b"Z", b"X"):
+        fields = rest.split()
+        if fields[0] in (b"Z", b"X"):
             return None
-        return head.partition(b"(")[2].decode(errors="replace"), int(rest.split()[19]), uid, argv0
+        comm = head.partition(b"(")[2].decode(errors="replace")
+        return {"comm": comm, "ppid": int(fields[1]), "start": int(fields[19]), "uid": uid, "argv": argv}
     except (OSError, ValueError, IndexError):
         return None
+
+
+def proc(pid):
+    """(comm, start time in ticks, uid, argv[0]) of a process, or None once it is gone or a zombie."""
+    i = info(pid)
+    return i and (i["comm"], i["start"], i["uid"], i["argv"][0] if i["argv"] else "")
 
 
 def verified(pid, start):
@@ -43,20 +51,56 @@ def verified(pid, start):
     return p if p and p[0] == "claude" and p[1] == start and p[2] == os.getuid() else None
 
 
-def send_signal(pid, start, name):
-    if name not in SIGNALS:
-        raise Refused(f"signal must be one of {', '.join(SIGNALS)}")
+def table():
+    """pid -> info of every process this user can read."""
+    out = {}
+    for name in os.listdir("/proc"):
+        if name.isdigit() and (i := info(int(name))):
+            out[int(name)] = i
+    return out
+
+
+def descendants(root, procs):
+    """pids below root in procs, nearest first."""
+    children = {}
+    for pid, i in procs.items():
+        children.setdefault(i["ppid"], []).append(pid)
+    out, todo = [], list(children.get(root, ()))
+    while todo:
+        pid = todo.pop(0)
+        out.append(pid)
+        todo.extend(children.get(pid, ()))
+    return out
+
+
+def lineage(pid=None):
+    """pid (default: this process) and all its ancestors."""
+    out, pid = set(), pid or os.getpid()
+    while pid > 1 and pid not in out and (i := info(pid)):
+        out.add(pid)
+        pid = i["ppid"]
+    return out
+
+
+def pidfd_signal(pid, still_same, sig, what):
+    """Signal pid only if still_same(pid) holds after a pidfd pins it, so a reused pid is never signalled."""
     try:
         fd = os.pidfd_open(pid)
     except OSError:
         raise Refused(f"process {pid} is gone") from None
     try:
         # Checked after pidfd_open: if the pid was reused since, the check fails; if it passes, the fd is that process.
-        if not verified(pid, start):
-            raise Refused(f"process {pid} is no longer that claude session, nothing was signalled")
-        signal.pidfd_send_signal(fd, SIGNALS[name])
+        if not still_same(pid):
+            raise Refused(f"process {pid} is no longer {what}, nothing was signalled")
+        signal.pidfd_send_signal(fd, sig)
     finally:
         os.close(fd)
+
+
+def send_signal(pid, start, name):
+    if name not in SIGNALS:
+        raise Refused(f"signal must be one of {', '.join(SIGNALS)}")
+    pidfd_signal(pid, lambda p: verified(p, start), SIGNALS[name], "that claude session")
     return f"sent SIG{SIGNALS[name].name[3:]} to pid {pid}"
 
 

@@ -124,7 +124,9 @@ async def sessions():
             await call(b, "say", room=room, text="hi room")
             assert await bodies(b) == [(addr_a, "hi bob")]
             assert await bodies(a) == [(addr_b, f"[joined #{room}] bob"), (addr_b, "hi room")]
-            assert {"room": room, "members": 2, "who": sorted([addr_a, addr_b])} in await call(b, "rooms")
+            assert {"room": room, "members": 2, "who": sorted([addr_a, addr_b]), "mode": "open", "moderators": []} in (
+                await call(b, "rooms")
+            )
             assert [m["body"] for m in await call(b, "history", room=room, last=1)] == ["hi room"]
             assert [m["body"] for m in await call(b, "dms", peer=addr_a)] == ["hi bob"]
 
