@@ -12,7 +12,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/<owner>/agent-bridge"
+Repository = "https://github.com/PrithviTM-glitch/Agent-Networking"
+Issues = "https://github.com/PrithviTM-glitch/Agent-Networking/issues"
 
 [project.scripts]
 agent-bridge = "agent_bridge.cli:main"
