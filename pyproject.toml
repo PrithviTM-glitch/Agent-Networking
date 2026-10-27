@@ -1,0 +1,45 @@
+[project]
+name = "agent-bridge"
+version = "0.1.0"
+description = "A local message bus, resource ledger and admin console for Claude Code sessions, over MQTT 5."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp==1.30.0",
+    "paho-mqtt==2.1.0",
+]
+
+[project.urls]
+Repository = "https://github.com/<owner>/agent-bridge"
+
+[project.scripts]
+agent-bridge = "agent_bridge.cli:main"
+agent-bridge-ledger = "agent_bridge.ledger.client:main"
+agent-bridge-ledgerd = "agent_bridge.ledger.service:main"
+agent-bridge-mcp = "agent_bridge.mcp_server:main"
+agent-bridge-console = "agent_bridge.console.server:main"
+agent-bridge-relay-hook = "agent_bridge.hooks:relay_start"
+agent-bridge-broadcast-hook = "agent_bridge.hooks:broadcast"
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.17.3",
+]
+
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

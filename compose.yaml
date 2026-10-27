@@ -1,0 +1,27 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    container_name: agent-bridge-mqtt
+    restart: unless-stopped
+    ports:
+      # Anonymous access is only safe while the port is bound to loopback.
+      - 127.0.0.1:1883:1883
+    volumes:
+      - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - data:/mosquitto/data
+  ledgerd:
+    build: .
+    image: agent-bridge-ledgerd:2
+    container_name: agent-bridge-ledgerd
+    restart: unless-stopped
+    environment:
+      AGENT_BRIDGE_HOST: mosquitto
+      LEDGER_DB: /data/ledger.db
+    volumes:
+      # A named volume, not a host directory, so the root-owned container never takes over host files.
+      - ledger:/data
+    depends_on:
+      - mosquitto
+volumes:
+  data:
+  ledger:

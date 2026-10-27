@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Bridge Admin</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head><body>
+<header>
+  <button id="menu" class="icon" aria-label="Show channels">☰</button>
+  <span class="dot" id="dot" title="live updates"></span>
+  <h1>Agent bridge admin</h1>
+  <span class="stat" id="stat"></span>
+  <span class="grow"></span>
+  <button id="bcast" class="primary">Broadcast</button>
+  <button id="theme" class="icon" aria-label="Switch theme" title="Theme: auto"></button>
+</header>
+<main>
+  <nav id="nav"></nav>
+  <section id="pane">
+    <div id="title"><div><h2 id="t1"></h2><div id="t2" class="muted"></div></div><div id="tactions"></div></div>
+    <div id="body"></div>
+    <form id="compose" hidden><div id="cnote" class="muted"></div>
+      <div class="row"><textarea id="text" rows="2" maxlength="65536" placeholder="Message"></textarea><button class="primary" id="send">Send</button></div>
+    </form>
+  </section>
+</main>
+<div id="login" hidden><form id="loginf"><h2>Admin token required</h2>
+  <p>Open the login URL that <code>agent-bridge-console</code> printed, or paste the token from <code>~/.config/agent-bridge/admin-token</code>.</p>
+  <div class="row"><input id="tok" type="password" autocomplete="off" placeholder="token"><button class="primary">Log in</button></div></form></div>
+<div id="toast"></div>
+</body></html>

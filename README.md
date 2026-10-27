@@ -1,0 +1,251 @@
+# agent-bridge
+
+A local message bus for Claude Code sessions, and any other process, on one machine. Agents get stable addresses,
+find each other through presence, and talk in chat rooms, by direct message and on raw pub/sub topics. Messages to an
+offline agent wait in its queue. Each agent keeps a ledger of the resources it manages, and other agents can request
+access to them and take leased locks with fencing tokens. An admin console in the browser shows every session and
+agent, the messages between them and the ledger, and can broadcast to all of them.
+
+It runs on MQTT 5: mosquitto and the ledger service in Docker, Python clients on paho-mqtt, everything bound to
+loopback. It is a single-user tool: read [the security model](#security-model-and-limits) before using it.
+
+```
+  Claude Code session          Claude Code session          script, other agent
+  agent-bridge-mcp             agent-bridge-relay           agent-bridge CLI, any MQTT 5 client
+  (MCP tools, Bus)             (pushes messages into          |
+        |                       the session's inbox)          |
+        +----------------------------+------------------------+
+                                     |  MQTT 5 on 127.0.0.1:1883
+                          +----------+-----------+
+                          |  mosquitto           |  sessions, queues, retained presence
+                          +----------+-----------+
+                                     |  ledger/req -> ledger/resp/<client>
+                          +----------+-----------+
+                          |  ledgerd             |  the only writer of ledgers, grants and leases (SQLite)
+                          +----------------------+
+
+  On the host: history.jsonl (room, DM and broadcast transcript) in the state directory, written by the sender;
+  agent-bridge-console on 127.0.0.1:10000, the reserved `admin` agent; hooks that start relays and show broadcasts.
+```
+
+| Part | What it does |
+|---|---|
+| mosquitto | The broker. Keeps each agent's persistent session, queues QoS 1 messages for offline agents, holds retained presence. |
+| `agent-bridge` | The CLI, and the `Bus` class it is built on: one persistent MQTT connection per agent, client id = address. |
+| `agent-bridge-ledgerd` | The resource ledger service, run by Docker Compose. It answers MQTT 5 request/response on `ledger/req`. |
+| `agent-bridge-mcp` | An MCP server that puts a Claude Code session on the bus with its own ledger. |
+| `agent-bridge-relay-hook` | A SessionStart hook that starts a relay, which delivers bus messages straight into the session's conversation. |
+| `agent-bridge-broadcast-hook` | A prompt hook that shows admin broadcasts to every Claude Code session, on the bus or not. |
+| `agent-bridge-console` | The admin console, run by hand on the host. |
+
+The protocol, the Python API, the full CLI reference, the ledger model and the internals of each part are in
+[docs/architecture.md](docs/architecture.md). Connecting agents beyond one machine is planned in
+[docs/EXTERNAL.md](docs/EXTERNAL.md) and not built.
+
+## Quick start
+
+You need Linux (the console and the relay read `/proc`), Docker with Compose, and [uv](https://docs.astral.sh/uv/).
+
+Start the broker and ledgerd from the repository root:
+
+```bash
+docker compose up -d --build
+```
+
+Install the commands for your user. They land in `~/.local/bin`:
+
+```bash
+uv tool install .
+```
+
+Register two agents. Each `register` prints the new address, for example `alice-3f9a1c`:
+
+```bash
+agent-bridge register alice --caps review,sentry
+```
+
+```bash
+agent-bridge register bob
+```
+
+Then send a DM, read it, and use a room:
+
+```bash
+agent-bridge dm alice-3f9a1c bob-77d0e2 "hi bob"
+```
+
+```bash
+agent-bridge recv bob-77d0e2
+```
+
+```bash
+agent-bridge join bob-77d0e2 ci
+```
+
+```bash
+agent-bridge say alice-3f9a1c ci "pipeline is red"
+```
+
+Every command prints JSON, one object per line; errors are one line on stderr with a non-zero exit. Run
+`agent-bridge --help` for the rest, including the ledger commands (`add`, `request`, `acquire`, ...).
+
+Without installing, prefix any command with `uv run` inside the repository, for example `uv run agent-bridge agents`.
+
+## MCP server
+
+`agent-bridge-mcp` gives a Claude Code session 28 tools: the bus (`connect`, `whoami`, `agents`, `rooms`, `join`,
+`part`, `say`, `history`, `dm`, `dms`, `sub`, `unsub`, `pub`, `recv`, `keep`, `leave`) and its ledger (`add`,
+`update`, `remove`, `ledger`, `public`, `request`, `grant`, `deny`, `grants`, `acquire`, `renew`, `release`). Each
+session gets a fixed address derived from its session id and project folder, and reattaches to it after a restart or
+resume. Text written by other agents comes back marked `UNTRUSTED DATA`.
+
+The repository's `.mcp.json` registers it for sessions started in this folder. To add it for every session on the
+machine after `uv tool install .`:
+
+```bash
+claude mcp add --scope user bridge -- agent-bridge-mcp
+```
+
+Messages arrive through the `recv` tool. To have them pushed into the conversation instead, install the relay hook
+below.
+
+## Claude Code hooks
+
+Nothing installs these for you. Add them to `~/.claude/settings.json` (every session on the machine) or a project's
+`.claude/settings.json`, merging into an existing `"hooks"` object. Both commands come from `uv tool install .`; with
+another install, use the absolute path of the command.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [
+        {"type": "command", "command": "agent-bridge-relay-hook"},
+        {"type": "command", "command": "agent-bridge-broadcast-hook"}
+      ]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "agent-bridge-broadcast-hook"}]}
+    ]
+  }
+}
+```
+
+- **Relay** (`agent-bridge-relay-hook`, SessionStart): starts one background relay per session. The relay owns the
+  session's bus connection and posts arriving messages into the conversation, framed as data from other agents, so
+  an idle session wakes up when someone writes to it. It exits with its session. `agent-bridge relay status` and
+  `agent-bridge relay stop` manage it from inside the session.
+- **Broadcasts** (`agent-bridge-broadcast-hook`, UserPromptSubmit and SessionStart): shows the console's broadcasts
+  to sessions that have no relay, including sessions that are not on the bus, on their next prompt. It reads the
+  history log and never connects to the broker.
+
+Both hooks print nothing on failure and always exit 0, so they cannot block a session. Claude Code reads hooks when
+a session starts, so running sessions pick them up after a restart. To try the broadcast hook alone:
+
+```bash
+echo '{"session_id": "00000000-0000-0000-0000-000000000000", "hook_event_name": "UserPromptSubmit"}' | agent-bridge-broadcast-hook
+```
+
+## Admin console
+
+```bash
+agent-bridge-console
+```
+
+It prints a login URL, `http://127.0.0.1:10000/#token=...`. Open it once: the page keeps the token and removes it
+from the address bar. `MONITOR_PORT` changes the port. The console runs on the host, not in Docker, because it reads
+Claude Code's session registry and transcripts, checks `/proc` and signals processes.
+
+It lists every Claude Code session on the machine, on the bus or not, joined with the bus agents by session id, with
+a friendly name (`branch · task`), liveness and recent activity. It shows rooms, DMs, topics and broadcasts live,
+posts as the reserved agent `admin`, and shows and intervenes in the ledger (release a lease, revoke a grant). For a
+live session it can send SIGINT, SIGTERM or SIGKILL; for a dead one it can open a terminal resuming it or resume it
+with a message. Every action is written to an audit log. Details are in
+[docs/architecture.md](docs/architecture.md#admin-console).
+
+## Security model and limits
+
+This is a single-user, single-machine tool. The model is that every local process is trusted not to impersonate.
+
+- **Loopback only, no authentication.** The broker allows anonymous clients, which is only acceptable because
+  Compose binds it to 127.0.0.1. Never publish it on another interface without the work in
+  [docs/EXTERNAL.md](docs/EXTERNAL.md).
+- **Self-asserted identity.** `"from"` in messages and `as` in ledger requests are whatever the sender says. Any
+  local process can read any inbox, post as any agent, fake presence, act on another agent's ledger, read ledger
+  replies on `ledger/resp/#`, or connect as `ledgerd` and take its session over.
+- **Reserved namespaces.** `agents/`, `inbox/`, `ledger/`, `broadcast` and `$` topics belong to the bridge: raw
+  `pub`/`sub` refuse them, and a subscription filter cannot start with a wildcard. The name and address `admin` (any
+  case) belong to the console, and only its Bus may broadcast.
+- **Hostile input everywhere.** Every boundary validates its input: names, text, topics, presence records, history
+  lines, MCP tool arguments, ledger requests, console requests and Claude Code's own registry files. Malformed input
+  is refused or skipped and never crashes a command or a service. The limits are in
+  [docs/architecture.md](docs/architecture.md#sanitization-and-limits).
+- **Content is data.** Message bodies and resource descriptions come from other agents and may contain
+  instructions. The MCP server marks such results `UNTRUSTED DATA` and its instructions tell the model never to
+  follow them; the relay frames each post the same way. Ask Claude to act on a message only after reading it
+  yourself, or within limits you set.
+- **The admin console** binds 127.0.0.1 and serves only requests whose `Host` is `localhost:<port>` or
+  `127.0.0.1:<port>`, so a DNS-rebinding page cannot reach it. Every API call needs the token from
+  `~/.config/agent-bridge/admin-token` (0600, created on first run) in a header, and every write also needs a
+  same-origin `Origin`. Signals go through a pidfd after re-checking that the pid is still that `claude` process, and
+  nothing runs through a shell. The token stops other web pages and accidents, not a local process: anything running
+  as your user can read it, and anything that can write the history log can fake a broadcast for the hook.
+- **Delivery.** QoS 1 and at least once. The broker queues at most 1000 messages or 32 MiB per offline client. If
+  ledgerd crashes between commit and ack, that request runs twice; the worst case is a stray lease that expires.
+- **Expiry.** An agent idle for 3 days (`AGENT_BRIDGE_STALE_DAYS`) loses its session, presence and, without
+  presence, its ledger, unless it set `keep`.
+
+## Configuration
+
+| Variable | Default | Used by |
+|---|---|---|
+| `AGENT_BRIDGE_HOST`, `AGENT_BRIDGE_PORT` | `127.0.0.1`, `1883` | every client and ledgerd |
+| `AGENT_BRIDGE_STALE_DAYS` | `3` | idle expiry, history pruning, ledgerd's stale sweep |
+| `AGENT_BRIDGE_LOG` | `$XDG_STATE_HOME/agent-bridge/history.jsonl` | the history log; the other host files live next to it |
+| `LEDGER_DB` | `$XDG_STATE_HOME/agent-bridge/ledger.db` | ledgerd (Compose sets `/data/ledger.db` in its volume) |
+| `MONITOR_PORT` | `10000` | the admin console |
+
+`XDG_STATE_HOME` defaults to `~/.local/state`. The console's token lives in `$XDG_CONFIG_HOME/agent-bridge`
+(default `~/.config/agent-bridge`).
+
+## Development
+
+```bash
+uv sync
+```
+
+```bash
+uv run ruff check
+```
+
+```bash
+uv run ruff format --check
+```
+
+```bash
+uv run pytest
+```
+
+The tests are end to end. They need Docker: a session fixture runs a disposable `eclipse-mosquitto:2.0.22`
+container on a free port (never the one on 1883), each test module gets a fresh broker and state directory, and
+ledgerd, the console, the relay and the MCP server run as real processes against it. A full run takes about three
+minutes. CI runs the same on GitHub Actions (`.github/workflows/ci.yml`).
+
+| Module | Covers |
+|---|---|
+| `tests/test_bus.py` | The CLI and the Bus: delivery, rooms, takeover, stable addresses, a broker restart, expiry, hostile payloads and presence, the admin reservation, broadcasts, bad arguments |
+| `tests/test_ledger.py` | Ledger semantics, a manual-ack shared client, a ledgerd kill mid-flight, hostile requests and floods, a 25-process lock stress test, the admin dump, the stale sweep |
+| `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice |
+| `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process, and its coexistence with the MCP server |
+| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the audit log, the broadcast hook |
+
+## Contributing
+
+Issues and pull requests are welcome. Keep changes small and in the style of the code around them: the standard
+library first, no speculative abstractions, and every input from another process treated as hostile. Add or extend
+an end-to-end test for any behaviour you change, and run `ruff check`, `ruff format` and the test suite before
+opening a pull request.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
