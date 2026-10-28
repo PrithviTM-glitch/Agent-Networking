@@ -327,7 +327,70 @@ the wheel, installs it into a clean environment and checks every command, import
 | `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, adopting a CLI-registered agent, mentions waking only the mentioned agent |
 | `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, audit filters, the broadcast hook |
 
-<!-- Rust implementation: section to come from the Rust port. -->
+## Rust implementation
+
+`rust/` is a Cargo workspace with a Rust port of the parts that run most often: the `agent-bridge` CLI, the session
+relay and ledgerd. It speaks the same wire protocol, writes the same history log, lock files and SQLite schema, and
+gives the same output and errors, so Python and Rust agents share one broker and either ledgerd opens the other's
+`ledger.db`. The test suite runs against it unchanged. The MCP server, the console, `agent-bridge-ledger` and the
+broadcast hook stay Python.
+
+| Crate | Builds |
+|---|---|
+| `crates/core` | The library: validation, protocol, identity, history log, an MQTT 5 session layer on rumqttc's codec, presence, rooms, the Bus, the ledger client |
+| `crates/cli` | `agent-bridge`: every CLI command, including `relay start\|stop\|status\|run` |
+| `crates/ledgerd` | `agent-bridge-ledgerd` |
+
+Build with a Rust toolchain of 1.85 or newer (edition 2024):
+
+```bash
+cargo build --release --manifest-path rust/Cargo.toml
+```
+
+Install the CLI to `~/.cargo/bin`. It replaces the Python `agent-bridge` wherever it comes first on your PATH:
+
+```bash
+cargo install --locked --path rust/crates/cli
+```
+
+The relay hook is then the CLI itself, `{"type": "command", "command": "agent-bridge relay start"}` in place of
+`agent-bridge-relay-hook`. Relays of both kinds use the same lock, so a session never gets two.
+
+ledgerd as a 4.7 MB image, a static binary on `scratch`:
+
+```bash
+docker build -t agent-bridge-ledgerd:rust rust
+```
+
+To run it, point the `ledgerd` service in `compose.yaml` at `build: rust` and `image: agent-bridge-ledgerd:rust`; the
+volume and environment stay as they are.
+
+Run the Python suite against the Rust binaries with `AGENT_BRIDGE_BIN` (a directory holding the Rust `agent-bridge`
+and the Python `agent-bridge-mcp`, `agent-bridge-console`, `agent-bridge-broadcast-hook` and a relay hook that runs
+`agent-bridge relay start`) and `AGENT_BRIDGE_LEDGERD` (the ledgerd command). The Rust tests:
+
+```bash
+cargo test --manifest-path rust/Cargo.toml
+```
+
+```bash
+cargo test --manifest-path rust/Cargo.toml -p agent-bridge -- --ignored
+```
+
+The second one needs Docker and `uv sync`: a Python and a Rust agent exchange DMs, room messages and mentions on one
+broker, and both CLIs must print the same lines and the same errors.
+
+Measured on one machine (median of 20 calls, the Python CLI from its virtualenv):
+
+| | Python | Rust |
+|---|---|---|
+| `agents`, `dm`, `recv` on an empty queue | 68-69 ms | 2 ms |
+| relay memory (RSS) | 23 MB | 4 MB |
+| ledgerd memory (RSS) | 26 MB | 5 MB |
+| ledgerd image | 91 MB | 4.7 MB |
+
+Known differences: argument errors are worded by clap instead of argparse (still one line and exit 1), and JSON
+nested deeper than 128 levels is refused where Python accepts a few thousand (it only matters in fields nobody reads).
 
 ## Contributing
 

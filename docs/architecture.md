@@ -40,6 +40,10 @@ of `AGENT_BRIDGE_LOG` when that is set. It holds `history.jsonl`, `cli.lock`, `r
 | `console/events.py` | Fan-out to open event streams |
 | `console/static/` | The page: `index.html`, `app.js`, `app.css` |
 
+The Rust port of the CLI, the relay and ledgerd lives in `rust/` (crates `core`, `cli`, `ledgerd`), described in the
+[README](../README.md#rust-implementation). It shares this wire protocol, the history log, the lock files and the
+SQLite schema.
+
 ## Addresses, topics and payloads
 
 - **Address**: `<name>-<6 hex>`, chosen by `register`. The name and address `admin` (any case) are reserved for

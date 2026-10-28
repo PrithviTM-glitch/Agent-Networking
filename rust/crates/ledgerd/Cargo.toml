@@ -1,0 +1,15 @@
+[package]
+name = "agent-bridge-ledgerd"
+description = "The agent-bridge resource ledger service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agent-bridge-core.workspace = true
+getrandom.workspace = true
+rusqlite.workspace = true
+rumqttc.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
