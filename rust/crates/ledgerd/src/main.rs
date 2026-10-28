@@ -5,6 +5,7 @@
 //! expiry and presence update is handled in order by the main thread, one at a time, each in its own SQLite
 //! transaction.
 
+mod args;
 mod request;
 mod store;
 
@@ -65,6 +66,23 @@ impl Handler for Service {
 }
 
 fn main() {
+    let argv: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    match args::mode(&argv) {
+        args::Mode::Serve => {}
+        args::Mode::Health => {
+            config::get();
+            std::process::exit(args::health());
+        }
+        args::Mode::Help => {
+            print!("{}", args::USAGE);
+            return;
+        }
+        args::Mode::Bad(message) => {
+            eprint!("{}", args::USAGE);
+            eprintln!("agent-bridge-ledgerd: {message}");
+            std::process::exit(1);
+        }
+    }
     let cfg = config::get();
     let db = std::env::var_os("LEDGER_DB")
         .filter(|v| !v.is_empty())

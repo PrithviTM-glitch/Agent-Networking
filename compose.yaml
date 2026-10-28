@@ -10,8 +10,9 @@ services:
       - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - data:/mosquitto/data
   ledgerd:
-    build: .
-    image: agent-bridge-ledgerd:2
+    # The Rust ledgerd (rust/Dockerfile); agent-bridge-ledgerd:2 is the Python one, built from the root Dockerfile.
+    build: rust
+    image: agent-bridge-ledgerd:rust
     container_name: agent-bridge-ledgerd
     restart: unless-stopped
     environment:
@@ -22,7 +23,7 @@ services:
       - ledger:/data
     healthcheck:
       # A round trip through the broker, so it fails when ledgerd is disconnected or wedged, not just when it exits.
-      test: ["CMD", "agent-bridge-ledger", "dump", "--as", "health-0", "--timeout", "5"]
+      test: ["CMD", "/agent-bridge-ledgerd", "--health"]
       interval: 30s
       timeout: 10s
       retries: 3

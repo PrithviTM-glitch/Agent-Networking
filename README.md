@@ -362,8 +362,11 @@ ledgerd as a 4.7 MB image, a static binary on `scratch`:
 docker build -t agent-bridge-ledgerd:rust rust
 ```
 
-To run it, point the `ledgerd` service in `compose.yaml` at `build: rust` and `image: agent-bridge-ledgerd:rust`; the
-volume and environment stay as they are.
+`compose.yaml` runs this image. Its healthcheck is `agent-bridge-ledgerd --health`, a `dump` round trip through the
+broker that exits 0 on an answer within 5 s; any other argument prints usage, and only no arguments starts the
+service. To roll back to the Python ledgerd, set the service to `build: .` and `image: agent-bridge-ledgerd:2` with the
+healthcheck `["CMD", "agent-bridge-ledger", "dump", "--as", "health-0", "--timeout", "5"]`, then run
+`docker compose up -d ledgerd`. Both open the same `ledger.db` in the same volume.
 
 Run the Python suite against the Rust binaries with `AGENT_BRIDGE_BIN` (a directory holding the Rust `agent-bridge`
 and the Python `agent-bridge-mcp`, `agent-bridge-console`, `agent-bridge-broadcast-hook` and a relay hook that runs
