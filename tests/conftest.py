@@ -1,7 +1,15 @@
-"""Shared fixtures: a disposable mosquitto in Docker on a free port, a state directory per module, and ledgerd."""
+"""Shared fixtures: a disposable mosquitto in Docker on a free port, a state directory per module, and ledgerd.
 
+One test run at a time per user: a run waits for the lock of any other run on this machine. Test containers carry
+the user's uid as a label; every run removes them on exit, and the next run also removes any a killed run left.
+"""
+
+import atexit
+import fcntl
 import os
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -15,7 +23,13 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 CONF = ROOT / "config" / "mosquitto.conf"
 IMAGE = "eclipse-mosquitto:2.0.22"
-BIN = Path(sys.executable).parent
+# Overrides for running the suite against another implementation, such as the Rust binaries.
+BIN = Path(os.environ.get("AGENT_BRIDGE_BIN") or Path(sys.executable).parent)
+LEDGERD = shlex.split(os.environ.get("AGENT_BRIDGE_LEDGERD", "")) or [
+    sys.executable,
+    "-m",
+    "agent_bridge.ledger.service",
+]
 
 
 def free_port():
@@ -34,9 +48,54 @@ def wait_for(pred, timeout=10, interval=0.05):
     return None
 
 
+LABEL = f"agent-bridge-test.uid={os.getuid()}"
+
+
+def _containers():
+    found = subprocess.run(["docker", "ps", "-aq", "--filter", f"label={LABEL}"], capture_output=True, text=True)
+    return found.stdout.split()
+
+
+def _remove_containers():
+    if shutil.which("docker") and (ids := _containers()):
+        subprocess.run(["docker", "rm", "-f", *ids], capture_output=True)
+
+
+def _one_run_at_a_time(config):
+    """Hold this user's test lock for the life of the process, waiting while another run holds it."""
+    path = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), f"agent-bridge-tests-{os.getuid()}.lock"
+    )
+    lock = open(path, "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.seek(0)
+        print(
+            f"waiting for another agent-bridge test run (pid {lock.read().strip() or '?'}) to finish", file=sys.stderr
+        )
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    lock.truncate(0)
+    lock.write(str(os.getpid()))
+    lock.flush()
+    config.agent_bridge_lock = lock
+
+
+def _interrupted(signum, _frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
 def pytest_configure(config):
+    _one_run_at_a_time(config)
+    # Holding the lock, any container with our label is left over from a run that was killed.
+    _remove_containers()
+    atexit.register(_remove_containers)
+    # pytest tears fixtures down on KeyboardInterrupt but not on these, so they become one.
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, _interrupted)
     # agent_bridge reads its settings at import, so they are fixed here, before any test module imports it.
     tmp = tempfile.mkdtemp(prefix="agent-bridge-test-")
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     for name in (
         "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_PROJECT_DIR",
@@ -64,8 +123,8 @@ class Broker:
     def start(self, conf=CONF):
         self.remove()
         subprocess.run(
-            ["docker", "run", "-d", "--name", self.name, "-p", f"127.0.0.1:{self.port}:1883", "-v",
-             f"{conf}:/mosquitto/config/mosquitto.conf:ro", IMAGE],
+            ["docker", "run", "-d", "--name", self.name, "--label", LABEL, "-p", f"127.0.0.1:{self.port}:1883",
+             "-v", f"{conf}:/mosquitto/config/mosquitto.conf:ro", IMAGE],
             check=True,
             capture_output=True,
         )  # fmt: skip
@@ -122,7 +181,7 @@ def start_ledgerd(db, log, **env):
 
     with open(log, "a") as err:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "agent_bridge.ledger.service"],
+            LEDGERD,
             stderr=err,
             env={**os.environ, "LEDGER_DB": db, **env},
         )

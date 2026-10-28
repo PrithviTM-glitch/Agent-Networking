@@ -14,7 +14,7 @@ import uuid
 
 from . import broker, config, history, identity, presence, rooms
 from .ledger import client as ledger
-from .protocol import BROADCAST, parse_message
+from .protocol import BROADCAST, parse_message, parse_presence
 from .validation import (
     ADMIN,
     ID_MAX,
@@ -48,7 +48,8 @@ class Bus:
         self.addr = check_ident(addr, "address")
         self.owner = owner
         self._rooms = {}  # room -> record, kept current by the rooms/+ subscription
-        self._synced = threading.Event()  # set once the retained room records of this connection are all in
+        self._agents = {}  # address -> presence record, kept current by the agents/+ subscription
+        self._synced = threading.Event()  # set once both caches hold every retained record of this connection
         self._barrier = None
         self.rec = rec or presence.need(addr)
         self._buf = collections.deque()  # (mid to ack or None, message)
@@ -108,9 +109,11 @@ class Bus:
     def _on_connect(self, c, _u, flags, rc, _p):
         if rc.is_failure:
             return
-        # The retained room records follow this SUBACK on the wire, and the ack of the next request follows them:
-        # once that ack is back the room cache is complete.
-        c.subscribe(rooms.TOPICS, options=rooms.SUB)
+        # The ack of the next request (the barrier) arrives after every retained record, filling both caches afresh.
+        with self._cv:
+            self._rooms.clear()
+            self._agents.clear()
+        c.subscribe([(rooms.TOPICS, broker.RETAINED), (presence.TOPICS, broker.RETAINED)])
         if self.owner:
             with self._cv:
                 # A surviving session resends everything not yet acked; a lost one never will, so keep those unacked.
@@ -129,14 +132,18 @@ class Bus:
             topic = m.topic
         except ValueError:
             return c.ack(m.mid, m.qos)
-        if topic.startswith("rooms/"):
-            if is_ident(room := topic[6:]):
-                with self._cv:
-                    if rec := rooms.parse_room(m.payload):
-                        self._rooms[room] = rec
-                    else:
-                        self._rooms.pop(room, None)
-            return c.ack(m.mid, m.qos)
+        for prefix, cache, parse in (
+            ("rooms/", self._rooms, rooms.parse_room),
+            ("agents/", self._agents, parse_presence),
+        ):
+            if topic.startswith(prefix):
+                if is_ident(key := topic[len(prefix) :]):
+                    with self._cv:
+                        if rec := parse(m.payload):
+                            cache[key] = rec
+                        else:
+                            cache.pop(key, None)
+                return c.ack(m.mid, m.qos)
         msg = parse_message(topic, m.payload)
         with self._cv:
             # Unacked QoS 1 messages are already capped by ReceiveMaximum, only QoS 0 floods need BUFFER_MAX.
@@ -159,9 +166,15 @@ class Bus:
         if not (self._up.wait(broker.TIMEOUT) and self._synced.wait(broker.TIMEOUT)):
             raise BridgeError("not connected to the broker")
 
+    def _seen(self, addr):
+        """addr's presence record, from this connection's cache: complete once connected, then kept current."""
+        self._ready()
+        with self._cv:
+            return self._agents.get(addr)
+
     def _touch(self, refresh=True):
         if refresh:
-            self.rec = presence.find(self.addr) or self.rec
+            self.rec = self._seen(self.addr) or self.rec
         self.rec |= self._fresh_pid()
         self.rec["seen"] = time.time()
         self._ready()
@@ -172,6 +185,9 @@ class Bus:
             retain=True,
             expire=None if self.rec["keep"] else config.STALE_S,
         )
+        # The broker echoes this publish before confirming it, so no older echo can overwrite the entry afterwards.
+        with self._cv:
+            self._agents[self.addr] = dict(self.rec)
         self._touched = time.monotonic()
 
     def _fresh_pid(self):
@@ -199,7 +215,8 @@ class Bus:
         """Subscribe or unsubscribe; True if that changed the agent's topics."""
         if not self.owner:
             return self._owner_does("_subscribe", topic, on)
-        topics = set((presence.find(self.addr) or self.rec)["topics"])
+        self.rec = self._seen(self.addr) or self.rec  # the whole record: another process may have changed any of it
+        topics = set(self.rec["topics"])
         if on and topic not in topics and len(topics) >= TOPICS_MAX:
             raise BridgeError(f"at most {TOPICS_MAX} subscriptions")
         self._ready()
@@ -236,7 +253,7 @@ class Bus:
         get a "[left #room]" message.
         Returns a warning if ledgerd could not drop the ledger; the agent leaves the bus regardless."""
         warning = _drop_ledger(lambda: self.ledger("drop", timeout=3))
-        for topic in (presence.find(self.addr) or self.rec)["topics"]:
+        for topic in (self._seen(self.addr) or self.rec)["topics"]:
             if topic.startswith("room/"):
                 with contextlib.suppress(BridgeError):
                     self._announce(topic[5:], "left")
@@ -249,7 +266,7 @@ class Bus:
         """Change how other agents see this one; the address stays."""
         if self.addr != ADMIN:
             not_admin(name, "name")
-        self.rec = presence.find(self.addr) or self.rec
+        self.rec = self._seen(self.addr) or self.rec
         self.rec["name"] = self.rec["name"] if name is None else check_ident(name, "name")
         self.rec["caps"] = self.rec["caps"] if caps is None else check_caps(caps)
         self._touch(refresh=False)
@@ -258,7 +275,7 @@ class Bus:
         """on=True exempts the agent from idle expiry, False opts back in."""
         if not self.owner:
             return self._owner_does("keep", on)
-        self.rec = presence.find(self.addr) or self.rec
+        self.rec = self._seen(self.addr) or self.rec
         self.rec["keep"] = bool(on)
         self._touch(refresh=False)
         self.close()
@@ -296,11 +313,15 @@ class Bus:
         if why := rooms.refusal(self._rooms.get(check_ident(room, "room")), self.addr):
             raise BridgeError(f"you may not post in #{room}: {why}")
         tagged = rooms.MENTION.search(check_text(body))
-        self._send(f"room/{room}", body, tagged and rooms.mentions(room, body, presence.agents(room)))
+        if tagged:
+            with self._cv:
+                members = [{"addr": a, **r} for a, r in self._agents.items() if presence.in_room(r, room)]
+        self._send(f"room/{room}", body, tagged and rooms.mentions(room, body, members))
 
     def dm(self, to, body):
         check_text(body)
-        presence.need(to)
+        if not self._seen(check_ident(to, "address")):
+            raise BridgeError(f"unknown address: {to}")
         self._send(f"inbox/{to}", body)
 
     def pub(self, topic, body):
@@ -403,7 +424,7 @@ class Bus:
         """Ban addr from room and drop its subscription. That takes a brief connection with addr's client id, which
         takes its session over: its relay or MCP server reconnects about a second later."""
         settings = self._listed(room, addr, "banned", True, "kicked")
-        if presence.find(addr):
+        if self._seen(addr):
             target = Bus(addr)
             try:
                 target._subscribe(f"room/{room}", False)

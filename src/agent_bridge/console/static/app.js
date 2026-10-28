@@ -2,7 +2,7 @@
 // Every string from agents goes through textContent, never innerHTML.
 const ADMIN = "admin";
 const S = {token: null, agents: [], msgs: [], audit: [], jobs: {}, view: {type: "chan", id: "broadcast"}, unread: {},
-  extra: new Set(), drafts: {}, atme: {}, atOnly: false, rooms: {}, tab: "overview", profile: null, ledger: null, connected: false};
+  extra: new Set(), drafts: {}, atme: {}, atOnly: false, rooms: {}, auditQ: {action: "", target: "", range: "all"}, tab: "overview", profile: null, ledger: null, connected: false};
 const $ = id => document.getElementById(id);
 
 function el(tag, cls, text) {
@@ -75,14 +75,22 @@ function channels() {
   return {rooms: [...rooms].sort(), dms: [...dms].sort(byLabel), topics: [...topics].sort()};
 }
 function viewKey(v) {
-  return v.type === "chan" ? v.id : v.type === "agent" ? "agent:" + v.key : v.room ? "room:" + v.room : v.type;
+  if (v.type === "chan") return v.id;
+  if (v.type === "agent" || v.type === "stop") return "agent:" + v.key;
+  return v.room ? "room:" + v.room : v.type;
 }
 function go(v) {
   S.view = v;
   if (v.type === "chan") { delete S.unread[v.id]; delete S.atme[v.id]; }
-  if (v.type === "agent") { S.tab = "overview"; S.profile = null; loadProfile(); }
+  if (v.type === "agent") { S.tab = "overview"; S.profile = null; loadProfile(); loadCapacity(); }
   if (v.type === "ledger") { S.ledger = null; loadLedger(); }
-  if (v.type === "kill") { S.kill = {signal: "terminate", sessions: false, preview: null, results: null}; loadKillPreview(); }
+  if (v.type === "kill" || v.type === "stop") {
+    S.kill = {signal: "terminate", sessions: false, preview: null, results: null, selected: new Set()};
+    loadKillPreview();
+  }
+  if (v.type === "capacity") loadCapacity();
+  if (v.type === "leaks") { S.leaks = null; loadLeaks(); }
+  if (v.type === "audit") loadAudit();
   $("nav").classList.remove("open");
   render(true);
 }
@@ -141,6 +149,8 @@ function renderNav() {
   head("Other sessions (" + off.length + ")");
   off.forEach(entity);
   head("Admin");
+  item("capacity", {type: "capacity"}, "Capacity");
+  item("leaks", {type: "leaks"}, "Leftovers");
   item("ledger", {type: "ledger"}, "Ledger");
   item("audit", {type: "audit"}, "Audit log");
   nav.scrollTop = top;
@@ -323,7 +333,9 @@ function renderAgent() {
   $("compose").hidden = true;
   if (!a) { setTitle(S.view.key, "gone"); body.replaceChildren(el("div", "empty", "This agent or session is no longer listed.")); return; }
   const dmId = a.addr && "dm:" + [a.addr, ADMIN].sort().join("|");
-  setTitle(a.friendly, a.addr || "session " + a.session, a.addr ? [button("Message", () => go({type: "chan", id: dmId}))] : []);
+  const tools = a.addr ? [button("Message", () => go({type: "chan", id: dmId})),
+    button("Stop agent…", () => go({type: "stop", key: a.key, addr: a.addr}), "danger")] : [];
+  setTitle(a.friendly, a.addr || "session " + a.session, tools);
   body.replaceChildren();
   const tabs = el("div", "tabs");
   const names = a.addr ? [["overview", "Overview"], ["dms", "DMs"], ["ledger", "Ledger"], ["activity", "Activity"]]
@@ -372,7 +384,7 @@ function renderOverview(body, a) {
     field(dl, "Rooms", a.rooms.join(", "));
     field(dl, "Topics", a.topics.join(", "), true);
   }
-  body.append(add(card, dl), controls(a));
+  body.append(add(card, dl), resourcesCard(a), controls(a));
 }
 function controls(a) {
   const card = add(el("div", "card"), el("h4", null, "Process control"));
@@ -490,15 +502,20 @@ function renderLedger() {
 
 // audit
 
-// room kill switch
+// kill switch: a whole room, or one agent ("stop")
 
-async function loadKillPreview() {
-  const k = S.kill, room = S.view.room;
-  const q = new URLSearchParams({room, signal: k.signal, kill_sessions: String(k.sessions)});
-  try { k.preview = await api("/api/room/kill?" + q); } catch (e) { k.preview = {error: e.message}; }
-  if (S.view.type === "kill" && S.view.room === room) renderKill();
+function killScope() {
+  const v = S.view;
+  return v.type === "kill" ? {room: v.room, name: v.room, path: "/api/room/kill"} : {addr: v.addr, name: v.addr, path: "/api/agent/stop"};
 }
-function targetRows(targets, withResult) {
+async function loadKillPreview() {
+  const k = S.kill, sc = killScope(), here = viewKey(S.view);
+  const q = new URLSearchParams({...(sc.room ? {room: sc.room} : {addr: sc.addr}), signal: k.signal, kill_sessions: String(k.sessions)});
+  try { k.preview = await api(sc.path + "?" + q); } catch (e) { k.preview = {error: e.message}; }
+  if (k.preview.targets) k.selected = new Set(k.preview.targets.filter(t => !t.action.startsWith("skip")).map(t => t.addr));
+  if (viewKey(S.view) === here) renderKill();
+}
+function targetRows(targets, withResult, selected) {
   return targets.map(t => {
     const who = el("div", null, t.friendly);
     who.append(el("div", "muted mono", t.addr));
@@ -506,13 +523,21 @@ function targetRows(targets, withResult) {
     if (t.reason) act.append(el("div", "muted", "why: " + t.reason));
     const row = [who, el("span", "nowrap", t.class), act];
     if (withResult) row.push(t.result);
+    if (selected) {
+      const box = el("input"); box.type = "checkbox"; box.checked = selected.has(t.addr);
+      box.disabled = t.action.startsWith("skip");
+      box.onchange = () => { box.checked ? selected.add(t.addr) : selected.delete(t.addr); renderKill(); };
+      row.unshift(box);
+    }
     return row;
   });
 }
 function renderKill() {
-  const room = S.view.room, k = S.kill, body = $("body");
+  const sc = killScope(), k = S.kill, body = $("body"), room = sc.room;
   $("compose").hidden = true;
-  setTitle("Kill # " + room, "Stops every agent in the room", [button("Back to room", () => go({type: "chan", id: "room:" + room}))]);
+  const back = room ? button("Back to room", () => go({type: "chan", id: "room:" + room}))
+    : button("Back to agent", () => go({type: "agent", key: S.view.key}));
+  setTitle(room ? "Kill # " + room : "Stop " + sc.addr, room ? "Stops the agents of the room" : "Stops this one agent", [back]);
   body.replaceChildren();
   const card = add(el("div", "card"), el("h4", null, "How"));
   card.append(el("div", "muted", "By default only subagents stop: each loses its own agent-bridge processes and " +
@@ -535,18 +560,116 @@ function renderKill() {
   }
   if (!k.preview) { body.append(el("div", "empty", "Loading…")); return; }
   if (k.preview.error) { body.append(el("div", "empty", k.preview.error)); return; }
-  body.append(table("Preview: what will happen", ["Agent", "Class", "Action"], targetRows(k.preview.targets)));
-  if (!k.preview.targets.length) return;
+  const targets = k.preview.targets;
+  body.append(room ? table("Preview: what will happen (untick to leave a member alone)", ["", "Agent", "Class", "Action"], targetRows(targets, false, k.selected))
+    : table("Preview: what will happen", ["Agent", "Class", "Action"], targetRows(targets)));
+  if (!targets.length || (room && !k.selected.size)) return;
   const conf = add(el("div", "card"), el("h4", null, "Confirm"));
-  const input = el("input"); input.placeholder = "type " + room + " to confirm"; input.autocomplete = "off";
-  const kill = button("Kill room", async () => {
-    const r = await act("/api/room/kill", {room, confirm: input.value, signal: k.signal, kill_sessions: k.sessions}, "kill room");
+  const input = el("input"); input.placeholder = "type " + sc.name + " to confirm"; input.autocomplete = "off";
+  const all = !room || targets.filter(t => !t.action.startsWith("skip")).every(t => k.selected.has(t.addr));
+  const go_ = button(room ? (all ? "Kill room" : "Kill " + k.selected.size + " selected") : "Stop agent", async () => {
+    const body = {...(room ? {room} : {addr: sc.addr}), confirm: input.value, signal: k.signal, kill_sessions: k.sessions};
+    if (room && !all) body.only = [...k.selected];
+    const r = await act(sc.path, body, room ? "kill room" : "stop agent");
     if (r) { k.results = r.targets; renderKill(); }
   }, "danger");
-  kill.disabled = true;
-  input.oninput = () => { kill.disabled = input.value !== room; };
-  conf.append(add(el("div", "row act"), input, kill));
+  go_.disabled = true;
+  input.oninput = () => { go_.disabled = input.value !== sc.name; };
+  conf.append(add(el("div", "row act"), input, go_));
   body.append(conf);
+}
+
+// capacity: CPU and memory per session
+
+function bytes(n) {
+  if (n == null) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(1) : String(n)) + " " + u[i];
+}
+function num(v) { return el("span", "nowrap", v); }
+function pct(v) { return v == null ? "…" : v.toFixed(1) + "%"; }
+async function loadCapacity() {
+  try { S.capacity = await api("/api/capacity"); } catch (e) { S.capacity = {error: e.message}; }
+  if (S.view.type === "capacity") renderCapacity();
+  else if (S.view.type === "agent" && S.tab === "overview" && $("resources")) {
+    const a = byKey(S.view.key);
+    if (a) $("resources").replaceWith(resourcesCard(a));
+  }
+}
+function sessionLink(key) {
+  const a = byKey(key);
+  if (!a) return key || "—";
+  const l = el("a", null, a.friendly); l.href = "#"; l.onclick = e => { e.preventDefault(); go({type: "agent", key}); };
+  return l;
+}
+function procRows(rows, withSession) {
+  return rows.map(r => {
+    const cmd = el("div", "mono", r.cmd);
+    const row = [num(r.pid), cmd, num(pct(r.cpu)), num(bytes(r.rss))];
+    if (withSession) row.push(r.session ? sessionLink(r.session) : r.mine ? "outside any session" : "other user (" + r.comm + ")");
+    return row;
+  });
+}
+function renderCapacity() {
+  const c = S.capacity, body = $("body"), top = body.scrollTop;
+  $("compose").hidden = true;
+  setTitle("Capacity", "CPU is the share of one core since the last sample; memory is resident size, shared pages counted per process", [button("Refresh", loadCapacity)]);
+  body.replaceChildren();
+  if (!c) { body.append(el("div", "empty", "Loading…")); return; }
+  if (c.error) { body.append(el("div", "empty", c.error)); return; }
+  const m = c.machine, card = add(el("div", "card"), el("h4", null, "Machine"));
+  const used = m.mem_total && m.mem_available != null ? m.mem_total - m.mem_available : null;
+  card.append(el("div", null, "load " + (m.load ? m.load.join(" · ") : "—") + " on " + m.cpus + " cores · memory " +
+    bytes(used) + " used of " + bytes(m.mem_total) + (c.first ? " · CPU appears from the next sample" : "")));
+  body.append(card);
+  body.append(table("Claude sessions, by CPU (each with everything it started)", ["Session", "Kind", "CPU", "Memory", "Processes"],
+    c.sessions.map(r => [sessionLink(r.key), r.kind || "—", num(pct(r.cpu)), num(bytes(r.rss)), num(r.procs)])));
+  body.append(table("Top processes on the machine", ["PID", "Command", "CPU", "Memory", "Belongs to"], procRows(c.top, true)));
+  body.scrollTop = top;
+}
+function resourcesCard(a) {
+  const c = S.capacity, row = c && c.sessions && c.sessions.find(r => r.pid === a.pid);
+  const card = add(el("div", "card"), el("h4", null, "Resources"));
+  card.id = "resources";
+  if (!a.alive) { card.append(el("div", "muted", "Not running.")); return card; }
+  if (!row) { card.append(el("div", "muted", "Measuring…")); return card; }
+  card.append(el("div", null, pct(row.cpu) + " CPU · " + bytes(row.rss) + " memory · " + row.procs + " processes (the session and everything it started)"));
+  const t = table("Busiest processes", ["PID", "Command", "CPU", "Memory"], procRows(row.tree));
+  t.classList.remove("card");
+  card.append(t);
+  return card;
+}
+
+// leftovers: test containers and orphaned processes
+
+async function loadLeaks() {
+  try { S.leaks = await api("/api/leaks"); } catch (e) { S.leaks = {error: e.message}; }
+  if (S.view.type === "leaks") renderLeaks();
+}
+async function leakAct(path, body, ask) {
+  if (confirm(ask) && await act(path, body, "cleanup")) loadLeaks();
+}
+function renderLeaks() {
+  const d = S.leaks, body = $("body");
+  $("compose").hidden = true;
+  setTitle("Leftovers", "Test containers and agent-bridge processes that outlived what started them", [button("Refresh", loadLeaks)]);
+  body.replaceChildren();
+  if (!d) { body.append(el("div", "empty", "Loading…")); return; }
+  if (d.error) { body.append(el("div", "empty", d.error)); return; }
+  if (d.busy) body.append(add(el("div", "card"), el("h4", null, "Test cleanup is paused"), el("div", null, d.busy +
+    ". Test containers and test processes may be in use; they can be removed once no test run is active.")));
+  body.append(table("Test broker containers", ["Name", "Status", "Created", ""], d.containers.map(c => {
+    const b = button("Remove", () => leakAct("/api/leaks/container", {name: c.name}, "docker rm -f " + c.name + "?"), "danger");
+    b.disabled = !!d.busy;
+    return [el("span", "mono", c.name), c.status, c.created, b];
+  })));
+  body.append(table("Orphaned agent-bridge processes", ["PID", "Command", "Why", "Memory", ""], d.processes.map(p => {
+    const b = button("Stop", () => leakAct("/api/leaks/process", {pid: p.pid, start: p.start}, "SIGTERM pid " + p.pid + "?\n\n" + p.cmd), "danger");
+    b.disabled = !!d.busy && p.kind === "test";
+    return [num(p.pid), el("div", "mono", p.cmd), p.reason, num(bytes(p.rss)), b];
+  })));
 }
 
 // room settings
@@ -606,12 +729,48 @@ function renderRoomSettings() {
   body.scrollTop = top;
 }
 
+const RANGES = [["all", "any time", 0], ["1h", "last hour", 3600], ["24h", "last day", 86400], ["7d", "last week", 604800]];
+async function loadAudit() {
+  const f = S.auditQ, q = new URLSearchParams();
+  if (f.action) q.set("action", f.action);
+  if (f.target) q.set("target", f.target);
+  const span = RANGES.find(r => r[0] === f.range)[2];
+  if (span) q.set("since", String(Date.now() / 1000 - span));
+  try { S.auditRes = await api("/api/audit?" + q); } catch (e) { S.auditRes = {error: e.message}; }
+  if (S.view.type === "audit") renderAudit();
+}
+function targetLink(t) {
+  // Targets read "room:<room>", "<room or kind>:<address>" or a bare address; link the agent, else the room.
+  if (!t) return "—";
+  const [head, tail] = t.includes(":") ? t.split(":", 2) : [null, t];
+  const link = v => { const l = el("a", null, t); l.href = "#"; l.onclick = e => { e.preventDefault(); go(v); }; return l; };
+  const a = head !== "room" && agentOf(tail);
+  if (a) return link({type: "agent", key: a.key});
+  const room = head === "room" ? tail : head;
+  return room && channels().rooms.includes("room:" + room) ? link({type: "chan", id: "room:" + room}) : t;
+}
 function renderAudit() {
   $("compose").hidden = true;
-  setTitle("Audit log", "Every admin action, newest first (admin-audit.jsonl in the state directory)");
-  const body = $("body");
-  body.replaceChildren(table("Actions", ["When", "Who", "Action", "Target", "Result"],
-    S.audit.slice().reverse().map(e => [clock(e.ts), e.who + " " + (e.peer || ""), e.action, e.target, e.result])));
+  setTitle("Audit log", "Every admin action, newest first (admin-audit.jsonl in the state directory)", [button("Refresh", loadAudit)]);
+  const body = $("body"), f = S.auditQ, r = S.auditRes;
+  const focused = document.activeElement && document.activeElement.id === "audit-target";
+  body.replaceChildren();
+  const act_ = el("select");
+  for (const a of ["", ...((r && r.actions) || [])]) {
+    const o = el("option", null, a || "any action"); o.value = a; o.selected = f.action === a; act_.append(o);
+  }
+  act_.onchange = () => { f.action = act_.value; loadAudit(); };
+  const tgt = el("input"); tgt.id = "audit-target"; tgt.placeholder = "target contains…"; tgt.value = f.target;
+  tgt.oninput = () => { f.target = tgt.value; clearTimeout(S.auditTimer); S.auditTimer = setTimeout(loadAudit, 300); };
+  const rng = el("select");
+  for (const [v, t] of RANGES) { const o = el("option", null, t); o.value = v; o.selected = f.range === v; rng.append(o); }
+  rng.onchange = () => { f.range = rng.value; loadAudit(); };
+  body.append(add(el("div", "card"), add(el("div", "act"), act_, tgt, rng)));
+  if (focused) { tgt.focus(); tgt.selectionStart = tgt.selectionEnd = tgt.value.length; }
+  if (!r) { body.append(el("div", "empty", "Loading…")); return; }
+  if (r.error) { body.append(el("div", "empty", r.error)); return; }
+  body.append(table("Actions", ["When", "Who", "Action", "Target", "Result"],
+    r.entries.slice().reverse().map(e => [clock(e.ts), e.who + " " + (e.peer || ""), e.action, targetLink(e.target), e.result])));
 }
 
 function renderPane(fresh) {
@@ -621,6 +780,9 @@ function renderPane(fresh) {
   else if (v.type === "ledger") renderLedger();
   else if (v.type === "kill") renderKill();
   else if (v.type === "roomset") renderRoomSettings();
+  else if (v.type === "stop") renderKill();
+  else if (v.type === "capacity") renderCapacity();
+  else if (v.type === "leaks") renderLeaks();
   else renderAudit();
 }
 function render(fresh) {
@@ -661,7 +823,7 @@ function onEvent(ev) {
     if (S.view.type === "chan" && S.view.id === "room:" + ev.info.room) renderChannel(S.view.id);
   } else if (ev.kind === "audit") {
     S.audit.push(ev.entry);
-    if (S.view.type === "audit") renderAudit();
+    if (S.view.type === "audit") loadAudit();
   } else if (ev.kind === "job") {
     const j = S.jobs[ev.id] = S.jobs[ev.id] || {id: ev.id, key: ev.key, started: Date.now() / 1000, state: "running", lines: []};
     if (ev.line != null) j.lines.push(ev.line);
@@ -750,9 +912,11 @@ function boot() {
     if (!document.hidden && S.view.type === "chan") { delete S.unread[S.view.id]; delete S.atme[S.view.id]; renderNav(); }
   });
   setInterval(() => {
-    if (S.view.type === "agent") loadProfile();
+    if (S.view.type === "agent") { loadProfile(); if (S.tab === "overview") loadCapacity(); }
     else if (S.view.type === "ledger") loadLedger();
   }, 5000);
+  setInterval(() => { if (S.view.type === "capacity") loadCapacity(); }, 3000);
+  setInterval(() => { if (S.view.type === "leaks") loadLeaks(); }, 10000);
   setInterval(() => { if (S.view.type === "chan") renderNav(); }, 30000);
   if (!S.token) { showLogin(); return; }
   stream();

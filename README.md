@@ -197,7 +197,34 @@ like this:
 
 Every signal goes through a pidfd after re-checking the process's identity. The console never targets `admin`, its
 own process or its ancestors. Each target is audited separately (`room/kill`, target `<room>:<address>`), plus one
-summary entry.
+summary entry. Unticking members in the preview kills only the ones still ticked. A profile's "Stop agent…" applies
+the same rules to that one agent (audited as `agent/stop`).
+
+**Capacity.** Shows where the machine's CPU and memory go, read from `/proc` only:
+- load, cores and memory for the machine;
+- every live Claude session with everything it started (MCP server, relay, Bash commands, test runs) summed;
+- the top processes on the machine, each linked to its session.
+
+CPU is a share of one core between samples. Memory is resident size, and shared pages count once per process. Each
+profile also gets a Resources card with its busiest processes.
+
+**Leftovers.** Lists `agent-bridge-test-<6 hex>` containers and orphaned agent-bridge processes, each with a cleanup
+button that is token-gated and audited (`docker rm -f`, or SIGTERM through a re-verified pidfd). A process counts as
+orphaned only if all of these hold:
+- it runs one of this package's commands as you;
+- what started it is gone, so it was reparented to init or a systemd user manager;
+- either its Claude session is provably dead (registry pid and start time no longer match), or its history log is
+  in a temp directory, which marks a test's process.
+
+Consoles and the live `agent-bridge-mqtt` / `agent-bridge-ledgerd` containers are never listed. Test containers and
+test processes cannot be removed while any `pytest` runs or a lease on a resource named `test-runner` is held, and
+the page says why.
+
+**Audit log.** Filters by action, by target substring and by time range. Targets link to their agent or room.
+
+**Idle cost.** The console refreshes the registry, transcripts and liveness only while a page has the live stream
+open. It re-reads a transcript only when its size or mtime changed, and looks for a missing transcript at most every
+30 s. Capacity and leftovers are computed only when asked for.
 
 ## Security model and limits
 

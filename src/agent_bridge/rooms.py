@@ -9,8 +9,6 @@ room messages it forbids, but anyone can claim to be a moderator, or overwrite t
 
 import re
 
-from paho.mqtt.subscribeoptions import SubscribeOptions
-
 from . import broker, presence
 from .protocol import PAYLOAD_MAX, parse_json
 from .validation import ADMIN, BridgeError, check_ident, check_mentions, check_text, check_ts, is_ident
@@ -19,8 +17,6 @@ MODES = ("open", "announce")
 MODS_MAX, LIST_MAX, RULES_MAX = 32, 256, 2048
 OPEN = {"mode": "open", "moderators": [], "rules": "", "muted": [], "banned": []}
 TOPICS = "rooms/+"
-# QoS 0: the retained records arrive outside the inflight window, so they come straight after the SUBACK.
-SUB = SubscribeOptions(qos=0)
 # @token not glued to a word before it, so mail addresses (a@b.c) are not mentions.
 MENTION = re.compile(r"(?<![A-Za-z0-9_@-])@([A-Za-z0-9_-]{1,64})")
 
@@ -113,7 +109,7 @@ def records(retained):
 
 def info(room):
     room = check_ident(room, "room")
-    return view(room, records(broker.retained([f"rooms/{room}"], first=True)).get(room))
+    return view(room, records(broker.retained([f"rooms/{room}"])).get(room))
 
 
 def listing():

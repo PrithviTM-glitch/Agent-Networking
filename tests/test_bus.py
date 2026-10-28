@@ -14,11 +14,12 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import conftest
 import paho.mqtt.client as mqtt
 import pytest
 from conftest import BIN
 
-from agent_bridge import config, presence, relay
+from agent_bridge import broker, config, history, presence, relay
 from agent_bridge.bus import Bus
 from agent_bridge.protocol import ORIGIN
 from agent_bridge.validation import BODY_MAX, BridgeError, is_ident
@@ -279,6 +280,48 @@ def test_broker_restart(s, fresh_broker):
     )
 
 
+def test_presence_cache(s, monkeypatch):
+    """A Bus keeps every presence record current over its own connection: no lookups, and a change another process
+    made to its record survives its next read-modify-write."""
+    lib, room = s.lib, f"cache-{RUN}"
+    newcomer = run("register", "newcomer")
+    run("join", newcomer, room)
+    run("keep", lib.addr, "on")  # another process acting as lib; lib reconnects
+    assert conftest.wait_for(lambda: (lib._seen(lib.addr) or {}).get("keep") is True, 5)
+    shots = []
+    real = broker.one_shot
+    monkeypatch.setattr(broker, "one_shot", lambda *a, **kw: shots.append(a) or real(*a, **kw))
+    lib.join(room)
+    lib.say(room, "hello @newcomer")
+    lib.dm(newcomer, "found you in the cache")
+    assert shots == [], "no short-lived lookup connections"
+    monkeypatch.undo()
+    assert presence.find(lib.addr)["keep"] is True and f"room/{room}" in presence.find(lib.addr)["topics"]
+    run("keep", lib.addr, "off")
+    run("leave", newcomer)
+    assert conftest.wait_for(lambda: lib._seen(newcomer) is None, 5), "a cleared record leaves the cache"
+    with pytest.raises(BridgeError, match="unknown address"):
+        lib.dm(newcomer, "gone")
+    lib.part(room)
+    while lib.recv(0.5):  # the newcomer's room notices, so later tests start from an empty buffer
+        pass
+
+
+def test_prune_runs_at_most_hourly(s):
+    """register prunes the log only when the last prune is an hour old; leave's targeted prune always runs."""
+    history.append(f"room/{DEMO}", {"from": s.a, "body": "ancient", "ts": 1.0})
+    run("leave", run("register", "early"))
+    assert "ancient" not in bodies("history", DEMO, "--last", "1000"), "leave prunes"
+    history.append(f"room/{DEMO}", {"from": s.a, "body": "ancient", "ts": 1.0})
+    probe = run("register", "throttled")
+    assert "ancient" in bodies("history", DEMO, "--last", "1000"), "a prune just ran: register skips it"
+    os.utime(config.data_path("prune.stamp"), (0, 0))
+    late = run("register", "late")
+    assert "ancient" not in bodies("history", DEMO, "--last", "1000"), "an hour on, register prunes again"
+    run("leave", late)
+    run("leave", probe)
+
+
 def test_idle_expiry(s):
     short = {"AGENT_BRIDGE_STALE_DAYS": str(2 / 86400)}
     brief = run("register", "brief", env_extra=short)
@@ -374,7 +417,8 @@ def test_junk_log_lines(s):
         )
     run("say", a, DEMO, "after junk")
     run("dm", a, b, "dm after junk")
-    assert bodies("history", DEMO) == ["after junk"] and bodies("dms", b) == ["dm after junk"], "junk lines are skipped"
+    room, mine = bodies("history", DEMO, "--last", "1000"), bodies("dms", b, "--last", "1000")
+    assert room[-1] == "after junk" and "x" not in room and mine[-1] == "dm after junk", "junk lines are skipped"
     run("leave", run("register", "pruner"))
     with open(config.LOG) as f:
         assert all(isinstance(json.loads(line), dict) for line in f), "prune drops junk lines"

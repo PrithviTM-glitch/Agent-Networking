@@ -8,6 +8,8 @@ from . import broker, config
 from .protocol import LINEAGE, NEVER, ORIGIN, parse_presence
 from .validation import BridgeError, check_ident, is_ident
 
+TOPICS = "agents/+"
+
 
 def parse_all(retained):
     """Address -> presence record of every well-formed record among retained topic -> payload."""
@@ -18,13 +20,13 @@ def parse_all(retained):
     }
 
 
-def presences(pattern="agents/+", first=False):
+def presences(pattern=TOPICS):
     """Address -> presence record of every well-formed record matching pattern."""
-    return parse_all(broker.retained([pattern], first))
+    return parse_all(broker.retained([pattern]))
 
 
 def find(addr):
-    return presences(f"agents/{check_ident(addr, 'address')}", first=True).get(addr)
+    return presences(f"agents/{check_ident(addr, 'address')}").get(addr)
 
 
 def need(addr):
@@ -42,10 +44,14 @@ def wipe(addr):
         broker.close(c)
 
 
+def in_room(rec, room):
+    return any(mqtt.topic_matches_sub(t, f"room/{room}") for t in rec["topics"])
+
+
 def agents(room=None):
     """Every live agent, most recently seen first; with room, only its members."""
     now = time.time()
-    room = room is not None and f"room/{check_ident(room, 'room')}"
+    room = room is not None and check_ident(room, "room")
     return [
         {
             "addr": addr,
@@ -57,7 +63,7 @@ def agents(room=None):
             **{k: rec[k] for k in (*ORIGIN, *LINEAGE) if k in rec},
         }
         for addr, rec in sorted(presences().items(), key=lambda kv: -kv[1]["seen"])
-        if not room or any(mqtt.topic_matches_sub(t, room) for t in rec["topics"])
+        if not room or in_room(rec, room)
     ]
 
 

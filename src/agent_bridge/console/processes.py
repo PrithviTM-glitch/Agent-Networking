@@ -12,6 +12,7 @@ import uuid
 from . import events
 
 SIGNALS = {"interrupt": signal.SIGINT, "terminate": signal.SIGTERM, "kill": signal.SIGKILL}
+PAGE = os.sysconf("SC_PAGE_SIZE")
 JOB_LINES = 500
 lock = threading.Lock()
 jobs = {}
@@ -22,7 +23,8 @@ class Refused(Exception):
 
 
 def info(pid):
-    """comm, ppid, start time in ticks, uid and argv of a process, or None once it is gone or a zombie."""
+    """comm, ppid, start time and CPU time in clock ticks, resident memory in bytes, uid and argv of a process, or
+    None once it is gone or a zombie."""
     try:
         with open(f"/proc/{pid}/stat", "rb") as f:
             stat = f.read()
@@ -34,7 +36,15 @@ def info(pid):
         if fields[0] in (b"Z", b"X"):
             return None
         comm = head.partition(b"(")[2].decode(errors="replace")
-        return {"comm": comm, "ppid": int(fields[1]), "start": int(fields[19]), "uid": uid, "argv": argv}
+        return {
+            "comm": comm,
+            "ppid": int(fields[1]),
+            "start": int(fields[19]),
+            "cpu": int(fields[11]) + int(fields[12]),
+            "rss": int(fields[21]) * PAGE,
+            "uid": uid,
+            "argv": argv,
+        }
     except (OSError, ValueError, IndexError):
         return None
 

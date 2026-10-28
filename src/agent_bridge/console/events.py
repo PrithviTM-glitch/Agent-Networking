@@ -33,3 +33,9 @@ def unsubscribe(q):
 def subscribed(q):
     with lock:
         return q in streams
+
+
+def watching():
+    """True while any page has the live stream open."""
+    with lock:
+        return bool(streams)

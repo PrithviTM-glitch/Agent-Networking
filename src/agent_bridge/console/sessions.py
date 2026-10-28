@@ -7,6 +7,7 @@ to Claude Code and may change between versions, so every field is optional and c
 import collections
 import glob
 import json
+import math
 import mmap
 import os
 import re
@@ -26,6 +27,7 @@ PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 REGISTRY = os.path.join(CLAUDE_DIR, "sessions")
 DESKTOP_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "Claude") + os.sep
 CHECK_S = 3
+FIND_S = 30  # how often a session without a transcript yet is looked up again
 ACTIVITY = 30
 HEAD_SCAN, TAIL_SCAN = 4 << 20, 4 << 20
 REGISTRY_MAX = 64 * 1024
@@ -61,6 +63,7 @@ class Transcript:
 
     def __init__(self, session):
         self.session, self.path, self.offset = session, None, 0
+        self.looked, self.seen = -math.inf, None
         self.title = self.prompt = self.cwd = self.branch = self.entrypoint = None
         self.recent = collections.deque(maxlen=ACTIVITY)
 
@@ -70,10 +73,20 @@ class Transcript:
 
     def refresh(self):
         if not self.path or not os.path.exists(self.path):
+            if time.monotonic() - self.looked < FIND_S:
+                return
             self.__init__(self.session)
+            self.looked = time.monotonic()
             if not (path := self.find()):
                 return
             self.path = path
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return
+        if (st.st_size, st.st_mtime_ns) == self.seen:
+            return
+        self.seen = st.st_size, st.st_mtime_ns
         try:
             with open(self.path, "rb") as f:
                 size = os.fstat(f.fileno()).st_size
@@ -376,8 +389,12 @@ def push_agents():
 
 
 def watch():
-    """Death detection, registry and transcript refresh every few seconds, so a dying session greys out live."""
+    """Death detection, registry and transcript refresh every few seconds while a page watches, so a dying session
+    greys out live. With no page open it does nothing: every read computes what it needs."""
     while True:
+        if not events.watching():
+            time.sleep(CHECK_S)
+            continue
         try:
             read_registry()
             for v in entities():

@@ -122,9 +122,12 @@ def _target(addr, rec, ctx, sig, kill_sessions):
     }
 
 
-def plan(room, signal_name="terminate", kill_sessions=False):
-    """Every member of room with its class and action, without doing anything."""
-    room = check_ident(room, "room")
+def plan(room=None, signal_name="terminate", kill_sessions=False, addr=None):
+    """Every member of room (or just the agent addr) with its class and action, without doing anything."""
+    if addr is None:
+        room = check_ident(room, "room")
+    else:
+        addr = check_ident(addr, "address")
     if signal_name not in SIGNALS:
         raise Refused(f"signal must be one of {', '.join(SIGNALS)}")
     live = sessions.live_presence()
@@ -139,10 +142,12 @@ def plan(room, signal_name="terminate", kill_sessions=False):
         "procs": processes.table(),
         "mine": processes.lineage(),
     }
+    if addr is not None and addr not in live:
+        raise Refused(f"unknown agent {addr}")
     return [
         _target(a, r, ctx, SIGNALS[signal_name], kill_sessions)
         for a, r in sorted(live.items())
-        if f"room/{room}" in r["topics"]
+        if (a == addr if addr is not None else f"room/{room}" in r["topics"])
     ]
 
 

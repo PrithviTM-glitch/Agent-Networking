@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 from .. import config, rooms
 from ..history import dms
 from ..validation import BridgeError
-from . import actions, admin, auth, events, kill, processes, sessions
+from . import actions, admin, auth, capacity, events, kill, leaks, processes, sessions
 from .processes import Refused
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -39,6 +39,47 @@ def agent_detail(query):
     return out
 
 
+def state(_query):
+    return {
+        "agents": sessions.entities(),
+        "messages": admin.backlog(),
+        "audit": actions.audit_tail(),
+        "jobs": processes.job_list(),
+        "connected": admin.held["bus"] is not None,
+        "rooms": admin.settings,
+    }
+
+
+def kill_preview(query):
+    """What a room kill or a single agent's stop would do, with the same options the POST takes."""
+    room, addr = query.get("room"), query.get("addr")
+    targets = kill.plan(room, query.get("signal", "terminate"), query.get("kill_sessions") == "true", addr=addr)
+    return {"room": room, "addr": addr, "targets": [kill.public(t) for t in targets]}
+
+
+def audit(query):
+    def number(key):
+        try:
+            return float(query[key]) if key in query else None
+        except ValueError:
+            raise Refused(f"{key} must be a unix time") from None
+
+    return actions.audit_query(query.get("action"), query.get("target"), number("since"), number("until"))
+
+
+READS = {
+    "/api/state": state,
+    "/api/agent": agent_detail,
+    "/api/room": lambda q: rooms.info(q.get("room")),
+    "/api/room/kill": kill_preview,
+    "/api/agent/stop": lambda q: kill_preview({**q, "room": None}),
+    "/api/ledger": lambda _q: admin.dump(),
+    "/api/capacity": lambda _q: capacity.snapshot(),
+    "/api/leaks": lambda _q: leaks.report(),
+    "/api/audit": audit,
+}
+
+
 class Handler(BaseHTTPRequestHandler):
     token = None
 
@@ -54,31 +95,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(401, {"error": "admin token required"})
         query = {k: v[0] for k, v in parse_qs(url.query).items()}
         try:
-            if url.path == "/api/state":
-                return self.json(
-                    200,
-                    {
-                        "agents": sessions.entities(),
-                        "messages": admin.backlog(),
-                        "audit": actions.audit_tail(),
-                        "jobs": processes.job_list(),
-                        "connected": admin.held["bus"] is not None,
-                        "rooms": admin.settings,
-                    },
-                )
-            if url.path == "/api/agent":
-                return self.json(200, agent_detail(query))
-            if url.path == "/api/room":
-                return self.json(200, rooms.info(query.get("room")))
-            if url.path == "/api/room/kill":
-                targets = kill.plan(
-                    query.get("room"), query.get("signal", "terminate"), query.get("kill_sessions") == "true"
-                )
-                return self.json(200, {"room": query["room"], "targets": [kill.public(t) for t in targets]})
-            if url.path == "/api/ledger":
-                return self.json(200, admin.dump())
             if url.path == "/api/stream":
                 return self.stream()
+            if url.path in READS:
+                return self.json(200, READS[url.path](query))
         except (Refused, BridgeError) as e:
             return self.json(400, {"error": str(e)})
         self.json(404, {"error": "not found"})

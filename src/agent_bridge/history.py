@@ -1,15 +1,19 @@
 """The history log: one JSON line per room message, DM and broadcast sent by a bridge client on this host.
 
 Writers append under an exclusive flock and readers take a shared one. Entries older than the stale period are pruned
-when an agent registers, and leaving drops the DMs an agent received.
+when an agent registers, at most hourly, and leaving drops the DMs an agent received.
 """
 
+import contextlib
 import fcntl
 import json
+import os
 import time
 
 from . import config
 from .validation import TOPIC_MAX, BridgeError, check_ident, check_last, check_mentions, check_text, check_ts
+
+PRUNE_S = 3600
 
 
 def parse_entry(line):
@@ -50,7 +54,12 @@ def entries():
 
 
 def prune(drop_topic=None):
-    """Drop entries older than the stale period, malformed lines, and with drop_topic every entry on that topic."""
+    """Drop entries older than the stale period, malformed lines, and with drop_topic every entry on that topic.
+    Without drop_topic it runs at most once per PRUNE_S (or per stale period if shorter): it rewrites the whole log."""
+    stamp = config.data_path("prune.stamp")
+    with contextlib.suppress(OSError):
+        if drop_topic is None and time.time() - os.path.getmtime(stamp) < min(PRUNE_S, config.STALE_S):
+            return
     cutoff = time.time() - config.STALE_S
     with _open() as f:
         fcntl.flock(f, fcntl.LOCK_EX)
@@ -61,6 +70,8 @@ def prune(drop_topic=None):
         f.seek(0)
         f.truncate()
         f.writelines(kept)  # rewrites the whole log; rotate by day if it ever grows past a few MB
+        with open(stamp, "a"):
+            os.utime(stamp)
 
 
 def history(room, last=20):

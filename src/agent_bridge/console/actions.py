@@ -8,8 +8,8 @@ import re
 import time
 
 from .. import config
-from ..validation import check_text
-from . import admin, events, kill, processes, sessions
+from ..validation import check_text, is_count, is_ident
+from . import admin, events, kill, leaks, processes, sessions
 from .processes import Refused
 
 AUDIT = os.path.join(os.path.dirname(os.path.abspath(config.LOG)), "admin-audit.jsonl")
@@ -92,29 +92,59 @@ def revoke(b, _peer=None):
     return f"{row['resource']} {row['level']} for {row['holder']}", f"denied as {row['owner']} (was {row['status']})"
 
 
-def kill_room(b, peer=None):
-    """Kill every agent in a room as the preview showed; the confirmation must repeat the room name. Whole sessions
-    are spared unless kill_sessions is true."""
-    room = b.get("room")
-    if not isinstance(room, str) or b.get("confirm") != room:
-        raise Refused("type the room name to confirm")
+def _kill_options(b):
     if not isinstance(kill_sessions := b.get("kill_sessions", False), bool):
         raise Refused("kill_sessions must be true or false")
-    signal_name = b.get("signal", "terminate")
-    # Subagents first: a session killed before them would take their processes down unreported.
-    targets = sorted(kill.plan(room, signal_name, kill_sessions), key=lambda t: t["class"] != "subagent")
+    return b.get("signal", "terminate"), kill_sessions
+
+
+def _kill(targets, signal_name, peer, room=None):
+    """Execute planned targets, subagents first (a session killed before them would take their processes down
+    unreported). A room kill audits each target as well as its summary."""
     results = []
-    for t in targets:
+    for t in sorted(targets, key=lambda t: t["class"] != "subagent"):
         try:
             result = kill.execute(t, signal_name)
         except Refused as e:
             result = f"refused: {e}"
-        audit("admin", peer, "room/kill", f"{room}:{t['addr']}", result)
+        if room:
+            audit("admin", peer, "room/kill", f"{room}:{t['addr']}", result)
         results.append({**kill.public(t), "result": result})
+    return results
+
+
+def kill_room(b, peer=None):
+    """Kill the agents of a room as the preview showed; the confirmation must repeat the room name. Whole sessions
+    are spared unless kill_sessions is true; `only`, a list of addresses, narrows it to those members."""
+    room = b.get("room")
+    if not isinstance(room, str) or b.get("confirm") != room:
+        raise Refused("type the room name to confirm")
+    signal_name, kill_sessions = _kill_options(b)
+    targets = kill.plan(room, signal_name, kill_sessions)
+    if (only := b.get("only")) is not None:
+        if not isinstance(only, list) or not only or not all(isinstance(a, str) and is_ident(a) for a in only):
+            raise Refused("only must be a non-empty list of addresses")
+        if missing := set(only) - {t["addr"] for t in targets}:
+            raise Refused(f"not members of #{room}: {', '.join(sorted(missing))}")
+        targets = [t for t in targets if t["addr"] in only]
+    results = _kill(targets, signal_name, peer, room)
     counts = collections.Counter(t["class"] for t in targets)
     summary = ", ".join(f"{n} {c}" for c, n in sorted(counts.items())) or "no members"
     mode = f"{signal_name}, whole sessions too" if kill_sessions else signal_name
+    if only is not None:
+        mode += f", {len(targets)} selected"
     return f"room:{room}", f"{mode}: {summary}", {"targets": results}
+
+
+def stop_agent(b, peer=None):
+    """Stop one agent with the room kill's rules: a subagent loses only its own processes, a session needs
+    kill_sessions. The confirmation must repeat the address."""
+    addr = b.get("addr")
+    if not isinstance(addr, str) or b.get("confirm") != addr:
+        raise Refused("type the agent's address to confirm")
+    signal_name, kill_sessions = _kill_options(b)
+    [result] = _kill(kill.plan(None, signal_name, kill_sessions, addr=addr), signal_name, peer)
+    return addr, result["result"], {"targets": [result]}
 
 
 def room_settings(b, _peer=None):
@@ -140,6 +170,18 @@ def room_member(b, _peer=None):
     return f"{room}:{addr}", MODERATION[action]
 
 
+def leak_container(b, _peer=None):
+    name = b.get("name")
+    return name if isinstance(name, str) else None, leaks.remove_container(name)
+
+
+def leak_process(b, _peer=None):
+    pid, start = b.get("pid"), b.get("start")
+    if not is_count(pid, 4194304) or not is_count(start, 2**53):
+        raise Refused("pid and start must be positive integers")
+    return f"pid {pid}", leaks.stop_process(pid, start)
+
+
 ROUTES = {
     "/api/send": send,
     "/api/broadcast": broadcast,
@@ -149,10 +191,16 @@ ROUTES = {
     "/api/ledger/release": release,
     "/api/ledger/revoke": revoke,
     "/api/room/kill": kill_room,
+    "/api/agent/stop": stop_agent,
+    "/api/leaks/container": leak_container,
+    "/api/leaks/process": leak_process,
     "/api/room/settings": room_settings,
     "/api/room/moderator": room_moderator,
     "/api/room/member": room_member,
 }
+
+
+ACTION_NAMES = {path.removeprefix("/api/") for path in ROUTES}
 
 
 def audit(who, peer, action, target, result):
@@ -162,6 +210,27 @@ def audit(who, peer, action, target, result):
         fcntl.flock(f, fcntl.LOCK_EX)
         f.write(json.dumps(entry) + "\n")
     events.push({"kind": "audit", "entry": entry})
+
+
+def audit_query(action=None, target=None, since=None, until=None, limit=AUDIT_SHOWN):
+    """The newest audit entries matching every given filter: action exactly, target as a substring, ts in range."""
+    out = collections.deque(maxlen=limit)
+    try:
+        with open(AUDIT, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    ts, t = float(e["ts"]), e.get("target") or ""
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if (action and e.get("action") != action) or (target and target not in str(t)):
+                    continue
+                if (since is not None and ts < since) or (until is not None and ts > until):
+                    continue
+                out.append(e)
+    except FileNotFoundError:
+        pass
+    return {"entries": list(out), "actions": sorted(ACTION_NAMES)}
 
 
 def audit_tail():

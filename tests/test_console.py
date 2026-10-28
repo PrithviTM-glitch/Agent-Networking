@@ -3,6 +3,7 @@ and fake claude / gnome-terminal binaries, against a broker with ledgerd. Covers
 messaging as admin, the event stream, friendly names, death detection, signals, restarts, ledger actions, the audit
 log and the broadcast hook. The tests are one scenario in file order."""
 
+import contextlib
 import fcntl
 import http.client
 import json
@@ -27,6 +28,7 @@ CONSOLE = str(BIN / "agent-bridge-console")
 S1, S2, S3, S4, S5, S6, S7, S8, S9 = (str(uuid.uuid4()) for _ in range(9))
 TMP = HOME = FAKE_BIN = DATA = LOG = PROJ = REG = WEB = ORIGIN = HOST = None
 procs = []
+loose = []  # pids of double-forked test processes, which are nobody's child
 state = {"token": None, "mon": None, "c": None}
 
 
@@ -116,8 +118,11 @@ def agent(addr):
 
 
 def start_fake(path):
-    p = subprocess.Popen([path, "600"])
+    """A fake claude: a copy of /bin/sh named claude, waiting on a sleep child. Not a copied sleep: coreutils that
+    dispatch on argv[0] (uutils, as on Ubuntu 26.04) exit at once when the binary is called claude."""
+    p = subprocess.Popen([path, "-c", "sleep 600 & wait"])
     procs.append(p)
+    loose.extend(wait_for(lambda: children(p.pid)) or ())
     with open(f"/proc/{p.pid}/stat") as f:
         s = f.read()
     return p, int(s[s.rfind(")") + 2 :].split()[19])
@@ -145,19 +150,21 @@ def turn(sid, kind, content, **extra):
 
 
 ASSISTANT = json.dumps(
-    {"type": "assistant", "message": {"content": [{"type": "text", "text": "hello from resume"},
-                                                  {"type": "tool_use", "name": "Bash"}]}},
+    {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": "hello from resume"}, {"type": "tool_use", "name": "Bash"}]},
+    },
     separators=(",", ":"),
-)  # fmt: skip
+)
 
 
 def fixtures():
     os.makedirs(FAKE_BIN)
     os.makedirs(PROJ)
-    shutil.copy("/bin/sleep", os.path.join(TMP, "claude"))
+    shutil.copy("/bin/sh", os.path.join(TMP, "claude"))
     desk = os.path.join(HOME, ".config", "Claude", "claude-code", "2.1.0", "abc")
     os.makedirs(desk)
-    shutil.copy("/bin/sleep", os.path.join(desk, "claude"))
+    shutil.copy("/bin/sh", os.path.join(desk, "claude"))
     scripts = {
         "claude": f"""#!/bin/sh
 printf '%s\\n' "$PWD" "$@" > {TMP}/claude-args
@@ -219,7 +226,11 @@ def console(ledgerd, state_dir):
     assert wait_for(lambda: (a := agent("admin")) and a), "admin never joined the bus"
     yield
     for p in procs:
+        kill_tree(p.pid)
         p.kill()
+    for pid in loose:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
     state["mon"].kill()
     state["mon"].wait()
     state["c"].disconnect()
@@ -627,25 +638,50 @@ def children(pid):
     return out
 
 
-def test_room_kill():
-    sk, sk2 = str(uuid.uuid4()), str(uuid.uuid4())
-    kbin = os.path.join(TMP, "kbin")
-    os.makedirs(os.path.join(kbin, "shell"))
-    ab = os.path.join(kbin, "agent-bridge")
-    with open(ab, "w") as f:
-        f.write("#!/usr/bin/env python3\nimport time\ntime.sleep(600)\n")
-    os.chmod(ab, 0o755)
-    shclaude = os.path.join(kbin, "shell", "claude")
-    shutil.copy("/bin/sh", shclaude)
-    # One fake claude session whose bus commands run as several agents, plus two decoys that must survive.
-    agents = ("sub-k", "mark-k", "twin-k", "sub-2", "other-x")
+def fake_tool(name):
+    """A fake console script: python sleeping 600 s under the given name, so argv reads like the real command."""
+    path = os.path.join(TMP, "kbin", name)
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport time\ntime.sleep(600)\n")
+        os.chmod(path, 0o755)
+    return path
+
+
+def fake_session(agents, extra=""):
+    """A fake claude process (a copy of /bin/sh named claude) running `agent-bridge recv <a>` for each agent plus any
+    extra commands: (process, start ticks, recv pid by agent, every child's argv by pid)."""
+    shclaude = os.path.join(TMP, "kbin", "shell", "claude")
+    if not os.path.exists(shclaude):
+        os.makedirs(os.path.dirname(shclaude), exist_ok=True)
+        shutil.copy("/bin/sh", shclaude)
+    ab = fake_tool("agent-bridge")
     script = " ".join(f"{ab} recv {a} --wait 600 &" for a in agents)
-    claude = subprocess.Popen([shclaude, "-c", f"{script} {ab} dm other-x sub-k hi & while :; do sleep 1; done"])
+    claude = subprocess.Popen([shclaude, "-c", f"{script} {extra} while :; do sleep 1; done"])
     procs.append(claude)
     with open(f"/proc/{claude.pid}/stat") as f:
         start = int(f.read().rsplit(")", 1)[1].split()[19])
-    kids = wait_for(lambda: len(c := children(claude.pid)) >= 6 and c)
+    want = len(agents) + extra.count(ab)
+    kids = wait_for(lambda: len(c := {p: a for p, a in children(claude.pid).items() if a[1:2] == [ab]}) >= want and c)
+    loose.extend(kids)
     by = {argv[3]: pid for pid, argv in kids.items() if len(argv) > 3 and argv[2] == "recv"}
+    return claude, start, by, kids
+
+
+def kill_tree(pid):
+    """SIGKILL everything below pid, so no fake child outlives the test."""
+    for child in children(pid):
+        kill_tree(child)
+        with contextlib.suppress(OSError):
+            os.kill(child, signal.SIGKILL)
+
+
+def test_room_kill():
+    sk, sk2 = str(uuid.uuid4()), str(uuid.uuid4())
+    # One fake claude session whose bus commands run as several agents, plus two decoys that must survive.
+    agents = ("sub-k", "mark-k", "twin-k", "sub-2", "other-x")
+    claude, start, by, kids = fake_session(agents, f"{fake_tool('agent-bridge')} dm other-x sub-k hi &")
     dm_pid = next(pid for pid, argv in kids.items() if argv[2:3] == ["dm"])
     registry_file(claude.pid, sessionId=sk, pid=claude.pid, procStart=str(start), name="Kill target")
     origin = {"pid": claude.pid, "pid_start": start}
@@ -819,6 +855,143 @@ def test_room_settings():
         ("room/member", "set:loud-a1b2c3", "unbanned"),
     ]:
         assert want in done, (want, sorted(done))
+
+
+def test_capacity():
+    sc = str(uuid.uuid4())
+    claude, start, _, _ = fake_session(("cap-x",), "python3 -c 'while True: pass' &")
+    registry_file(claude.pid, sessionId=sc, pid=claude.pid, procStart=str(start), name="Busy session")
+
+    def busy_row():
+        c = req("GET", "/api/capacity")[1]
+        row = next((r for r in c["sessions"] if r["pid"] == claude.pid), None)
+        return row and row["cpu"] > 30 and (c, row)
+
+    got = wait_for(busy_row, 20)
+    assert got, req("GET", "/api/capacity")[1]
+    c, row = got
+    assert row["key"] == sc and row["friendly"] == "Busy session" and row["procs"] >= 3 and row["rss"] > 0, row
+    spinner = next(r for r in row["tree"] if "while True" in r["cmd"])
+    assert spinner["cpu"] > 30 and any(r["pid"] == claude.pid for r in row["tree"]), row["tree"]
+    assert c["machine"]["cpus"] >= 1 and c["machine"]["mem_total"] > 0 and len(c["machine"]["load"]) == 3, c
+    assert any(t["pid"] == spinner["pid"] and t["session"] == sc for t in c["top"]), c["top"]
+    assert req("GET", "/api/capacity", token=None)[0] == 401
+    kill_tree(claude.pid)
+
+
+def double_fork(cmd, **env):
+    """Start cmd so that its parent exits at once: it is then nobody's child, like a leftover. Returns pid, start."""
+    out = subprocess.run(
+        ["sh", "-c", f"{cmd} >/dev/null 2>&1 & echo $!"],
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    pid = int(out)
+    loose.append(pid)
+    with open(f"/proc/{pid}/stat") as f:
+        return pid, int(f.read().rsplit(")", 1)[1].split()[19])
+
+
+def test_leaks():
+    from agent_bridge.console import leaks
+
+    sd = str(uuid.uuid4())
+    gone, gone_start = start_fake(os.path.join(TMP, "claude"))
+    gone.kill()
+    gone.wait()
+    registry_file(gone.pid, sessionId=sd, pid=gone.pid, procStart=str(gone_start), name="Dead session")
+    orphan, orphan_start = double_fork(
+        f"{fake_tool('agent-bridge')} recv orphan-x --wait 600", CLAUDE_CODE_SESSION_ID=sd
+    )
+    leftover, leftover_start = double_fork(f"{fake_tool('agent-bridge-ledgerd')}")
+    name = f"agent-bridge-test-{uuid.uuid4().hex[:6]}"
+    subprocess.run(["docker", "create", "--name", name, "eclipse-mosquitto:2.0.22"], check=True, capture_output=True)
+    try:
+        d = wait_for(lambda: (r := req("GET", "/api/leaks")[1]) and orphan in [p["pid"] for p in r["processes"]] and r)
+        assert d, req("GET", "/api/leaks")[1]
+        found = {p["pid"]: p for p in d["processes"]}
+        assert found[orphan]["kind"] == "session" and sd in found[orphan]["reason"], found
+        assert found[leftover]["kind"] == "test", found
+        assert state["mon"].pid not in found and os.getpid() not in found, (
+            "the console and the test run are no leftovers"
+        )
+        assert d["busy"].startswith("a pytest run is in progress"), d
+        assert name in [c["name"] for c in d["containers"]]
+        assert not {"agent-bridge-mqtt", "agent-bridge-ledgerd"} & {c["name"] for c in d["containers"]}
+
+        refused("/api/leaks/container", {"name": name}, "not now: a pytest run is in progress")
+        refused("/api/leaks/container", {"name": "agent-bridge-mqtt"}, "only agent-bridge-test-")
+        refused("/api/leaks/process", {"pid": leftover, "start": leftover_start}, "not now: a pytest run")
+        refused("/api/leaks/process", {"pid": os.getpid(), "start": 1}, "not an orphaned")
+        refused("/api/leaks/process", {"pid": "1", "start": 1}, "positive integers")
+        assert post("/api/leaks/process", {"pid": orphan, "start": orphan_start}, origin=None)[0] == 403
+        assert dead(leftover) is False and dead(orphan) is False
+        ok("/api/leaks/process", {"pid": orphan, "start": orphan_start})
+        assert wait_for(lambda: dead(orphan))
+        assert not dead(leftover), "a test leftover waits while a test run may use it"
+        assert req("GET", "/api/leaks", token=None)[0] == 401
+
+        # The removal itself, once no test run is active, checked in this process with the guard lifted.
+        real = leaks.busy
+        leaks.busy = lambda _procs: None
+        try:
+            assert leaks.remove_container(name) == f"removed container {name}"
+        finally:
+            leaks.busy = real
+        assert name not in [c["name"] for c in leaks.containers()]
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    log = [json.loads(x) for x in open(os.path.join(DATA, "admin-audit.jsonl"))]
+    assert any(
+        e["action"] == "leaks/process" and e["result"].startswith(f"sent SIGTERM to orphaned pid {orphan}") for e in log
+    )
+    assert any(e["action"] == "leaks/container" and e["result"].startswith("refused: not now") for e in log)
+
+
+def test_targeted_kill():
+    ss = str(uuid.uuid4())
+    claude, start, by, _ = fake_session(("pick-a", "pick-b", "sess-s"))
+    registry_file(claude.pid, sessionId=ss, pid=claude.pid, procStart=str(start), name="Targeted")
+    origin = {"pid": claude.pid, "pid_start": start}
+    presence("pick-a", topics=["room/pick"], **origin)
+    presence("pick-b", topics=["room/pick"], **origin)
+    presence("sess-s", session=ss, topics=["room/pick"], **origin)
+    assert wait_for(lambda: agent("pick-a") and agent("pick-b") and agent("sess-s"))
+
+    refused("/api/room/kill", {"room": "pick", "confirm": "pick", "only": ["nobody-1"]}, "not members of #pick")
+    refused("/api/room/kill", {"room": "pick", "confirm": "pick", "only": "pick-a"}, "non-empty list")
+    j = ok("/api/room/kill", {"room": "pick", "confirm": "pick", "only": ["pick-a"]})
+    assert [t["addr"] for t in j["targets"]] == ["pick-a"] and j["result"].endswith("1 selected: 1 subagent"), j
+    assert wait_for(lambda: dead(by["pick-a"]))
+    assert not dead(by["pick-b"]) and agent("pick-b"), "an unselected member is left alone"
+
+    code, p = req("GET", "/api/agent/stop?addr=pick-b")
+    assert code == 200 and [t["class"] for t in p["targets"]] == ["subagent"], p
+    assert req("GET", "/api/agent/stop?addr=nobody-1")[0] == 400
+    refused("/api/agent/stop", {"addr": "pick-b"}, "type the agent's address")
+    j = ok("/api/agent/stop", {"addr": "pick-b", "confirm": "pick-b"})
+    assert j["result"] == f"subagent stopped: signalled {by['pick-b']}; wiped the agent", j
+    assert wait_for(lambda: dead(by["pick-b"]) and not agent("pick-b"))
+    j = ok("/api/agent/stop", {"addr": "sess-s", "confirm": "sess-s"})
+    assert j["result"].startswith("session: skip: would end the WHOLE session"), j
+    time.sleep(0.3)
+    assert claude.poll() is None and not dead(by["sess-s"]), "stopping without whole sessions leaves the session"
+    kill_tree(claude.pid)
+
+
+def test_audit_filters():
+    code, j = req("GET", "/api/audit?action=agent/stop")
+    assert code == 200 and j["entries"] and {e["action"] for e in j["entries"]} == {"agent/stop"}, j
+    assert {"room/kill", "agent/stop", "leaks/process", "send"} <= set(j["actions"])
+    picked = req("GET", "/api/audit?target=pick-b")[1]["entries"]
+    assert picked and all("pick-b" in e["target"] for e in picked), picked
+    assert req("GET", f"/api/audit?since={time.time() + 100}")[1]["entries"] == []
+    recent = req("GET", f"/api/audit?action=room/kill&since={time.time() - 600}")[1]["entries"]
+    assert recent and all(e["action"] == "room/kill" for e in recent)
+    assert req("GET", "/api/audit?since=yesterday")[0] == 400
+    assert req("GET", "/api/audit", token=None)[0] == 401
 
 
 def test_audits():

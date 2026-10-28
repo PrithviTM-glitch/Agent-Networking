@@ -20,7 +20,6 @@ import sys
 import zlib
 
 from . import config, history, presence, relay, rooms
-from .broker import WINDOW
 from .bus import Bus
 from .ledger import client as ledger
 from .validation import WAIT_MAX, BridgeError, check_ident, check_session, check_wait, not_admin
@@ -94,7 +93,8 @@ def _relay(a):
 
 
 def _recv(bus, wait):
-    msgs = bus.recv(max(check_wait(wait), WINDOW))
+    # Queued messages come right after CONNACK, ahead of the Bus's connect barrier, so recv(0) already sees them.
+    msgs = bus.recv(check_wait(wait))
     while msgs:
         _show_all(msgs)
         msgs = bus.recv(QUIET)

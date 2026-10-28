@@ -2,7 +2,6 @@
 
 import socket
 import threading
-import time
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.packettypes import PacketTypes
@@ -13,10 +12,11 @@ from . import config
 from .validation import BridgeError
 
 TIMEOUT = 5
-# A fixed wait for retained messages; use a marker publish instead if a slow broker ever misses some.
-WINDOW = 0.3
 RECEIVE_MAX = 100
 SUB = SubscribeOptions(qos=1, noLocal=True)
+# Retained records at QoS 0 come straight after the SUBACK, outside the inflight window, so the ack of the next
+# request on the connection marks the moment all of them are in.
+RETAINED = SubscribeOptions(qos=0)
 
 
 def new_client(client_id, on_message=None, manual_ack=False):
@@ -54,20 +54,28 @@ def one_shot(client_id="", clean=True, on_message=None):
     return c
 
 
-def retained(patterns, first=False):
-    """Topic -> payload of the retained messages matching patterns, through a short-lived client; first=True returns
-    at the first one instead of waiting out WINDOW."""
-    found = {}
-    got = threading.Event()
+def retained(patterns):
+    """Topic -> payload of every retained message matching patterns, through a short-lived client."""
+    found, acked, cv = {}, set(), threading.Condition()
 
     def on_message(_c, _u, m):
         found[m.topic] = m.payload
-        got.set()
+
+    def on_unsubscribe(_c, _u, mid, _codes, _p):
+        with cv:
+            acked.add(mid)
+            cv.notify_all()
 
     c = one_shot(on_message=on_message)
-    c.subscribe([(p, 1) for p in patterns])
-    got.wait(WINDOW) if first else time.sleep(WINDOW)
-    close(c)
+    c.on_unsubscribe = on_unsubscribe
+    try:
+        c.subscribe([(p, RETAINED) for p in patterns])
+        _, mid = c.unsubscribe(list(patterns))
+        with cv:
+            if not cv.wait_for(lambda: mid in acked, TIMEOUT):
+                raise BridgeError("the broker did not finish sending retained records")
+    finally:
+        close(c)
     return found
 
 

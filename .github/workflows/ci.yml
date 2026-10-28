@@ -6,16 +6,45 @@ permissions:
   contents: read
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
       - run: uv run --frozen ruff check
       - run: uv run --frozen ruff format --check
   test:
-    runs-on: ubuntu-latest
+    # 26.04's coreutils pick the tool by argv[0], which breaks the tests' renamed fake binaries.
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
       - run: docker pull eclipse-mosquitto:2.0.22
       - run: uv run --frozen pytest
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+      - run: uv build
+      - name: Install the wheel into a clean environment
+        run: |
+          uv venv /tmp/wheel-env
+          uv pip install --python /tmp/wheel-env/bin/python dist/*.whl
+      - name: Check the entry points and packaged files
+        working-directory: /tmp
+        run: |
+          for cmd in agent-bridge agent-bridge-ledger agent-bridge-ledgerd agent-bridge-mcp agent-bridge-console \
+                     agent-bridge-relay-hook agent-bridge-broadcast-hook; do
+            test -x "/tmp/wheel-env/bin/$cmd" || { echo "missing $cmd"; exit 1; }
+          done
+          /tmp/wheel-env/bin/agent-bridge --help > /dev/null
+          /tmp/wheel-env/bin/agent-bridge-ledger --help > /dev/null
+          /tmp/wheel-env/bin/python -I -c '
+          import importlib, pathlib
+          for m in ("cli", "relay", "hooks", "mcp_server", "ledger.service", "console.server"):
+              importlib.import_module(f"agent_bridge.{m}")
+          import agent_bridge.console as c
+          static = pathlib.Path(c.__file__).parent / "static"
+          missing = [f for f in ("index.html", "app.js", "app.css") if not (static / f).is_file()]
+          assert not missing, f"not packaged: {missing}"
+          '
