@@ -2,7 +2,7 @@
   "mcpServers": {
     "bridge": {
       "command": "uv",
-      "args": ["run", "--quiet", "--project", "${CLAUDE_PROJECT_DIR:-.}", "agent-bridge-mcp"]
+      "args": ["run", "--quiet", "--no-sync", "--project", "${CLAUDE_PROJECT_DIR:-.}", "agent-bridge-mcp"]
     }
   }
 }

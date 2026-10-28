@@ -16,19 +16,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .. import host
+
 PROMETHEUS = (os.environ.get("AGENT_BRIDGE_PROMETHEUS_URL") or "").rstrip("/") or None
 GRAFANA = (os.environ.get("AGENT_BRIDGE_GRAFANA_URL") or "").rstrip("/") or None
 TIMEOUT, CACHE_S, RANGE = 3, 60, "30d"
 HINT = "Set AGENT_BRIDGE_PROMETHEUS_URL to the Prometheus that receives Claude Code's OpenTelemetry metrics."
-# field -> (metric, split by its type label)
-METRICS = {
-    "cost": ("claude_code_cost_usage_USD_total", False),
-    "tokens": ("claude_code_token_usage_tokens_total", True),
-    "active": ("claude_code_active_time_seconds_total", True),
-    "lines": ("claude_code_lines_of_code_count_total", True),
-    "commits": ("claude_code_commit_count_total", False),
-    "prs": ("claude_code_pull_request_count_total", False),
-}
 lock = threading.Lock()
 state = {"at": -CACHE_S, "snap": None}
 
@@ -44,7 +37,9 @@ def _query(expr):
 
 def _fetch():
     per = {}
-    for field, (metric, typed) in METRICS.items():
+    # Each framework names its own metrics (host.py); a session id belongs to one framework, so rows never collide.
+    metrics = [m for h in host.installed() for m in h.usage_metrics.items()]
+    for field, (metric, typed) in metrics:
         by = "session_id, type" if typed else "session_id"
         for labels, value in _query(f"sum by ({by}) (max_over_time({metric}[{RANGE}]))"):
             sid = labels.get("session_id", "").lower()

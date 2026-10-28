@@ -10,41 +10,81 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.2
-      - run: uv run --frozen ruff check
-      - run: uv run --frozen ruff format --check
-  test:
-    # 26.04's coreutils pick the tool by argv[0], which breaks the tests' renamed fake binaries.
+      # Only the dev tools: syncing the project itself would compile the Rust extension.
+      - run: uv sync --frozen --only-group dev
+      - run: uv run --no-sync ruff check
+      - run: uv run --no-sync ruff format --check
+  rust:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.3.2
-      - run: docker pull eclipse-mosquitto:2.0.22
-      - run: uv run --frozen pytest
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: rust
+      - run: cargo fmt --manifest-path rust/Cargo.toml --all --check
+      - run: cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
+      - run: cargo test --manifest-path rust/Cargo.toml --workspace
+  build:
+    uses: ./.github/workflows/build.yml
   package:
+    needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.2
-      - run: uv build
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-x86_64
+          path: dist
       - name: Install the wheel into a clean environment
         run: |
           uv venv /tmp/wheel-env
           uv pip install --python /tmp/wheel-env/bin/python dist/*.whl
-      - name: Check the entry points and packaged files
+      - name: Check the entry points, the extension and the packaged files
         working-directory: /tmp
         run: |
-          for cmd in agent-bridge agent-bridge-ledger agent-bridge-ledgerd agent-bridge-mcp agent-bridge-console \
-                     agent-bridge-relay-hook agent-bridge-broadcast-hook; do
+          for cmd in agent-bridge agent-bridge-ledger agent-bridge-ledgerd agent-bridge-historyd agent-bridge-mcp \
+                     agent-bridge-console agent-bridge-admin agent-bridge-relay-hook agent-bridge-broadcast-hook; do
             test -x "/tmp/wheel-env/bin/$cmd" || { echo "missing $cmd"; exit 1; }
           done
           /tmp/wheel-env/bin/agent-bridge --help > /dev/null
           /tmp/wheel-env/bin/agent-bridge-ledger --help > /dev/null
           /tmp/wheel-env/bin/python -I -c '
-          import importlib, pathlib
-          for m in ("cli", "relay", "hooks", "mcp_server", "ledger.service", "console.server"):
+          import importlib, importlib.metadata, pathlib
+          import agent_bridge._native as native
+          assert native.__version__ == importlib.metadata.version("agent-bridge"), native.__version__
+          for m in ("cli", "relay", "mcp_server", "ledger.service", "history.service", "claude.hooks", "console.server"):
               importlib.import_module(f"agent_bridge.{m}")
           import agent_bridge.console as c
           static = pathlib.Path(c.__file__).parent / "static"
           missing = [f for f in ("index.html", "app.js", "app.css") if not (static / f).is_file()]
           assert not missing, f"not packaged: {missing}"
           '
+  test:
+    # The Python suite as the conformance harness, against the built wheel rather than the source tree.
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-x86_64
+          path: dist
+      - run: docker pull eclipse-mosquitto:2.0.22
+      - name: Install the wheel and the test tools
+        run: |
+          uv venv .venv-wheel
+          uv pip install --python .venv-wheel/bin/python dist/*.whl pytest==9.1.1 paho-mqtt==2.1.0
+      - run: .venv-wheel/bin/python -m pytest -p no:cacheprovider
+  interop:
+    # Python and Rust agents on one broker, the Rust tests that need Docker.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: rust
+      - run: docker pull eclipse-mosquitto:2.0.22
+      - run: uv sync --frozen
+      - run: cargo test --manifest-path rust/Cargo.toml --workspace -- --ignored

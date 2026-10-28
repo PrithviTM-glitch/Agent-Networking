@@ -1,6 +1,6 @@
 [project]
 name = "agent-bridge"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A local message bus, resource ledger and admin console for Claude Code sessions, over MQTT 5."
 readme = "README.md"
 license = "MIT"
@@ -19,11 +19,12 @@ Issues = "https://github.com/PrithviTM-glitch/Agent-Networking/issues"
 agent-bridge = "agent_bridge.cli:main"
 agent-bridge-ledger = "agent_bridge.ledger.client:main"
 agent-bridge-ledgerd = "agent_bridge.ledger.service:main"
+agent-bridge-historyd = "agent_bridge.history.service:main"
 agent-bridge-mcp = "agent_bridge.mcp_server:main"
 agent-bridge-console = "agent_bridge.console.server:main"
 agent-bridge-admin = "agent_bridge.console.cli:main"
-agent-bridge-relay-hook = "agent_bridge.hooks:relay_start"
-agent-bridge-broadcast-hook = "agent_bridge.hooks:broadcast"
+agent-bridge-relay-hook = "agent_bridge.claude.hooks:relay_start"
+agent-bridge-broadcast-hook = "agent_bridge.claude.hooks:broadcast"
 
 [dependency-groups]
 dev = [
@@ -32,8 +33,26 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling==1.32.4"]
-build-backend = "hatchling.build"
+requires = ["maturin==1.15.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+# The Rust extension agent_bridge._native, next to the Python sources; the version comes from rust/Cargo.toml.
+manifest-path = "rust/crates/py/Cargo.toml"
+module-name = "agent_bridge._native"
+python-source = "src"
+
+[tool.uv]
+# uv rebuilds the extension when these change, not only when pyproject.toml does.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "rust/Cargo.toml" },
+    { file = "rust/Cargo.lock" },
+    { file = "rust/crates/py/**/*.rs" },
+    { file = "rust/crates/py/Cargo.toml" },
+    { file = "rust/crates/core/**/*.rs" },
+    { file = "rust/crates/core/Cargo.toml" },
+]
 
 [tool.ruff]
 line-length = 120

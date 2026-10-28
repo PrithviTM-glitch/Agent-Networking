@@ -389,6 +389,7 @@ the wheel, installs it into a clean environment and checks every command, import
 | `tests/test_mentions.py` | @mentions: resolution when sending, validation when receiving, `for_me` in `recv` |
 | `tests/test_ledger.py` | Ledger semantics, a manual-ack shared client, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, quotas, a 25-process lock stress test, the admin dump, the stale sweep |
 | `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice |
+| `tests/test_host.py` | The agent-framework adapter: the generic host, Claude Code's session and process detection, the inbox socket, a fake session registry (the `.key` files never opened), transcripts, kind detection |
 | `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, adopting a CLI-registered agent, mentions waking only the mentioned agent |
 | `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, audit filters, the broadcast hook |
 
@@ -402,7 +403,7 @@ broadcast hook stay Python.
 
 | Crate | Builds |
 |---|---|
-| `crates/core` | The library: validation, protocol, identity, history log, an MQTT 5 session layer on rumqttc's codec, presence, rooms, the Bus, the ledger client |
+| `crates/core` | The library: validation, protocol, identity, history log, an MQTT 5 session layer on rumqttc's codec, presence, rooms, the Bus, the ledger client, and `host` with the generic host and the `claude` adapter (session, process, inbox socket) |
 | `crates/cli` | `agent-bridge`: every CLI command, including `relay start\|stop\|status\|run` |
 | `crates/ledgerd` | `agent-bridge-ledgerd` |
 

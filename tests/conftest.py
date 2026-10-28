@@ -30,6 +30,11 @@ LEDGERD = shlex.split(os.environ.get("AGENT_BRIDGE_LEDGERD", "")) or [
     "-m",
     "agent_bridge.ledger.service",
 ]
+HISTORYD = shlex.split(os.environ.get("AGENT_BRIDGE_HISTORYD", "")) or [
+    sys.executable,
+    "-m",
+    "agent_bridge.history.service",
+]
 
 
 def free_port():
@@ -103,6 +108,7 @@ def pytest_configure(config):
         "CLAUDE_CODE_MESSAGING_TOKEN",
         "AGENT_BRIDGE_STALE_DAYS",
         "LEDGER_DB",
+        "HISTORY_DB",
     ):
         os.environ.pop(name, None)
     os.environ.update(
@@ -111,6 +117,46 @@ def pytest_configure(config):
         AGENT_BRIDGE_LOG=os.path.join(tmp, "history.jsonl"),
         XDG_STATE_HOME=os.path.join(tmp, "state"),
     )
+
+
+# bridge-core's checklist of bus behaviours, by name, and the tests that pin each; the summary reports them, so the
+# cutover gate shows which behaviour an implementation breaks rather than only which test failed.
+BEHAVIOURS = {
+    "write-once origin": ["tests/test_bus.py::test_subagents_and_write_once_origin"],
+    "subagent lineage": [
+        "tests/test_bus.py::test_subagents_and_write_once_origin",
+        "tests/test_relay.py::test_adopts_cli_agent",
+    ],
+    "whole-record refresh before republishing": ["tests/test_bus.py::test_presence_cache"],
+    "caches reset on reconnect": ["tests/test_bus.py::test_presence_cache", "tests/test_bus.py::test_broker_restart"],
+    "for_me and the quiet backlog": [
+        "tests/test_mentions.py::test_names_addresses_and_all_resolve",
+        "tests/test_relay.py::test_mentions_wake_only_the_mentioned",
+    ],
+    "relay lock line 2 and held()": ["tests/test_relay.py::test_mentions_wake_only_the_mentioned"],
+    "moderation at recv time": [
+        "tests/test_rooms.py::test_mute_stops_posts_and_spoofed_ones",
+        "tests/test_mentions.py::test_moderation_still_applies",
+    ],
+}
+
+
+def pytest_terminal_summary(terminalreporter):
+    outcome = {}
+    for status in ("passed", "failed", "error", "skipped", "xfailed", "xpassed"):
+        for report in terminalreporter.stats.get(status, []):
+            if getattr(report, "nodeid", None) and outcome.get(report.nodeid) not in ("failed", "error"):
+                outcome[report.nodeid] = status
+    rows = []
+    for name, tests in BEHAVIOURS.items():
+        seen = [outcome[t] for t in tests if t in outcome]
+        if seen:
+            bad = [t for t in tests if outcome.get(t) in ("failed", "error")]
+            rows.append(f"{'FAILED' if bad else 'ok':6} {name}" + (f"  ({', '.join(bad)})" if bad else ""))
+    if rows:
+        terminalreporter.section("bus behaviours")
+        for row in rows:
+            terminalreporter.write_line(row)
 
 
 class Broker:
@@ -167,12 +213,26 @@ def state_dir(request):
     from agent_bridge import config
 
     path = tempfile.mkdtemp(prefix=f"{request.module.__name__}-")
-    log = os.path.join(path, "history.jsonl")
+    log = in_temp(os.path.join(path, "history.jsonl"), "AGENT_BRIDGE_LOG")
     old = os.environ["AGENT_BRIDGE_LOG"], config.LOG
     os.environ["AGENT_BRIDGE_LOG"] = config.LOG = log
     yield path
     os.environ["AGENT_BRIDGE_LOG"], config.LOG = old
     shutil.rmtree(path, ignore_errors=True)
+
+
+def in_temp(path, what):
+    """path, which must lie in a temp directory, so no test ever opens the live state."""
+    temp = os.path.realpath(tempfile.gettempdir())
+    if os.path.commonpath([temp, os.path.realpath(path)]) != temp:
+        raise AssertionError(f"{what} {path} is outside {temp}: tests never touch the live state directory")
+    return path
+
+
+def _service_env(var, db, extra):
+    env = {**os.environ, var: db, **extra}
+    in_temp(env[var], var)
+    return env
 
 
 def start_ledgerd(db, log, **env):
@@ -183,7 +243,7 @@ def start_ledgerd(db, log, **env):
         proc = subprocess.Popen(
             LEDGERD,
             stderr=err,
-            env={**os.environ, "LEDGER_DB": db, **env},
+            env=_service_env("LEDGER_DB", db, env),
         )
 
     def answers():
@@ -195,6 +255,33 @@ def start_ledgerd(db, log, **env):
 
     assert wait_for(answers, 30), "ledgerd never answered"
     return proc
+
+
+def start_historyd(db, log, **env):
+    """A host historyd on the test broker, answering requests before this returns."""
+    from agent_bridge.history import client
+
+    with open(log, "a") as err:
+        proc = subprocess.Popen(HISTORYD, stderr=err, env=_service_env("HISTORY_DB", db, env))
+
+    def answers():
+        assert proc.poll() is None, open(log).read()
+        try:
+            return client.call("ping", timeout=1)
+        except client.HistoryError:
+            return None
+
+    assert wait_for(answers, 30), "historyd never answered"
+    return proc
+
+
+@pytest.fixture(scope="module")
+def historyd(fresh_broker, state_dir):
+    log = os.path.join(state_dir, "historyd.log")
+    proc = start_historyd(os.path.join(state_dir, "history.db"), log)
+    yield proc
+    proc.kill()
+    proc.wait()
 
 
 @pytest.fixture(scope="module")

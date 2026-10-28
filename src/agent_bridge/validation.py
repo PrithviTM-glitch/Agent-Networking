@@ -3,8 +3,8 @@
 Names, addresses, rooms and caps: 1-64 ASCII letters, digits, _ or - (names at most 57, leaving room for the address
 suffix), at most 32 caps. Text: at most 64 KiB of UTF-8; tab, newline and CR are kept, any other control character
 (C0, DEL, C1) is refused. Raw topics: at most 256 bytes of UTF-8, no control characters, never starting with $ or the
-reserved levels agents, inbox, ledger, broadcast and rooms. + and # work only in subscription filters, as whole
-levels, # only last, and not as the first level.
+reserved levels agents, inbox, ledger, broadcast, rooms and history. + and # work only in subscription filters, as
+whole levels, # only last, and not as the first level.
 """
 
 import re
@@ -13,7 +13,8 @@ ID_MAX, NAME_MAX = 64, 57
 CAPS_MAX, TOPICS_MAX, TOPIC_MAX, MENTIONS_MAX = 32, 100, 256, 32
 BODY_MAX = 64 * 1024
 WAIT_MAX, LAST_MAX = 3600, 1000
-RESERVED = ("agents", "inbox", "ledger", "broadcast", "rooms")
+RESERVED = ("agents", "inbox", "ledger", "broadcast", "rooms", "history")
+SERVICES = ("ledger", "history")  # the services' request/response levels: RPC traffic, never shown as messages
 ADMIN = "admin"
 IDENT = re.compile(r"[A-Za-z0-9_-]+")
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")

@@ -102,8 +102,8 @@ pub fn keep(rec: &Map) -> bool {
 }
 
 /// The session expiry for an agent's record: forever with keep, else the stale period.
-pub fn expiry(rec: &Map) -> u32 {
-    if keep(rec) { NEVER } else { config::get().stale_s.min(u32::MAX as u64) as u32 }
+pub fn expiry(rec: &Map) -> Result<u32> {
+    Ok(if keep(rec) { NEVER } else { config::get()?.stale_s.min(u32::MAX as u64) as u32 })
 }
 
 #[cfg(test)]

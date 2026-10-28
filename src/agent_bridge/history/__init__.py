@@ -1,7 +1,8 @@
-"""The history log: one JSON line per room message, DM and broadcast sent by a bridge client on this host.
+"""Message history. historyd (service.py) is its only writer: it records every room message, DM, broadcast and raw
+topic message from the bus in SQLite (store.py) and answers requests over MQTT 5 (client.py has the calls).
 
-Writers append under an exclusive flock and readers take a shared one. Entries older than the stale period are pruned
-when an agent registers, at most hourly, and leaving drops the DMs an agent received.
+The legacy history log (one JSON line per message, written by bridge clients before historyd) is only read here:
+historyd imports it once on its first start, and the file is never deleted.
 """
 
 import contextlib
@@ -10,14 +11,14 @@ import json
 import os
 import time
 
-from . import config
-from .validation import TOPIC_MAX, BridgeError, check_ident, check_last, check_mentions, check_text, check_ts
+from .. import config
+from ..validation import TOPIC_MAX, BridgeError, check_ident, check_last, check_mentions, check_text, check_ts
 
 PRUNE_S = 3600
 
 
 def parse_entry(line):
-    """A history log line as a dict, or None if it is malformed."""
+    """A legacy history log line as a dict, or None if it is malformed."""
     try:
         d = json.loads(line)
         if isinstance(d["topic"], str) and len(d["topic"]) <= TOPIC_MAX:
@@ -33,6 +34,18 @@ def parse_entry(line):
     except (ValueError, RecursionError, BridgeError, KeyError, TypeError):
         pass
     return None
+
+
+def read_log(path):
+    """Every well-formed entry of a legacy history log, oldest first; none if the file is missing."""
+    try:
+        with open(path, "rb") as f:
+            return [e for e in map(parse_entry, f) if e]
+    except FileNotFoundError:
+        return []
+
+
+# Until bridge clients read from historyd (phase 2), they keep appending to and reading the legacy log through these.
 
 
 def _open():

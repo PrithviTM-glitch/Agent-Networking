@@ -24,11 +24,11 @@ def acts_as(argv, addr):
 
 def bus_processes(claude_pid, addr, procs):
     """The subagent's own processes: below its claude process, ours, and running agent-bridge as addr."""
-    uid = os.getuid()
+    uid, names = os.getuid(), processes.session_names()
     return [
         {"pid": pid, "start": procs[pid]["start"], "cmd": " ".join(procs[pid]["argv"])[:200]}
         for pid in processes.descendants(claude_pid, procs)
-        if procs[pid]["uid"] == uid and procs[pid]["comm"] != "claude" and acts_as(procs[pid]["argv"], addr)
+        if procs[pid]["uid"] == uid and procs[pid]["comm"] not in names and acts_as(procs[pid]["argv"], addr)
     ]
 
 

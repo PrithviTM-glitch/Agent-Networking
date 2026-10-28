@@ -15,15 +15,20 @@ of `AGENT_BRIDGE_LOG` when that is set. It holds `history.jsonl`, `cli.lock`, `r
 | `config.py` | Environment settings and the state directory |
 | `validation.py` | `BridgeError`, limits and every input check |
 | `protocol.py` | Reserved topics, presence records and message payloads, parsed as hostile input |
-| `identity.py` | `/proc` reading, the session's `claude` process, project names and session addresses |
+| `host.py` | The agent-framework interface: this process's session, its session process, delivery into it, every session on the machine and their transcripts; the generic host when there is no framework |
+| `identity.py` | `/proc` reading, the session and process from the host, project names and session addresses |
 | `history.py` | The history log: append, read, prune, room history and DMs |
 | `broker.py` | paho-mqtt helpers: clients, connecting, confirmed publishes, complete retained reads |
 | `presence.py` | The directory of agents: presence lookups, `agents()` |
 | `rooms.py` | Room settings records, the posting rule, `info()` and `listing()` |
 | `bus.py` | `Bus`, one agent's persistent connection |
 | `cli.py` | `agent-bridge` |
-| `relay.py` | The session relay |
-| `hooks.py` | `agent-bridge-relay-hook` and `agent-bridge-broadcast-hook` (standard library only at import) |
+| `relay.py` | The session relay, delivering through the host |
+| `claude/host.py` | Claude Code as a host: `CLAUDE_CODE_SESSION_ID`, the `claude` ancestor process, `CLAUDE_PROJECT_DIR`, Desktop detection, resume commands and their stream-json output, the `claude_code_*` metric names |
+| `claude/inbox.py` | The session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET` and `_TOKEN`) |
+| `claude/registry.py` | The session registry, `~/.claude/sessions/<pid>.json` |
+| `claude/transcripts.py` | Session transcripts, `~/.claude/projects/*/<session>.jsonl` |
+| `claude/hooks.py` | `agent-bridge-relay-hook` and `agent-bridge-broadcast-hook` (standard library only at import) |
 | `mcp_server.py` | `agent-bridge-mcp` |
 | `ledger/client.py` | `call()`, `LedgerError` and `agent-bridge-ledger` |
 | `ledger/store.py` | SQLite schema, request validation and every ledger op |
@@ -31,14 +36,26 @@ of `AGENT_BRIDGE_LOG` when that is set. It holds `history.jsonl`, `cli.lock`, `r
 | `console/server.py` | `agent-bridge-console`: HTTP, static page, JSON API, event stream |
 | `console/auth.py` | Host, Origin and token checks |
 | `console/admin.py` | The console on the bus: the `#` observer, the `admin` identity, ledger calls |
-| `console/sessions.py` | Session registry, transcripts, git branch, the joined session list |
+| `console/sessions.py` | The joined session list: every host's sessions and transcripts with bus presence, git branch |
 | `console/processes.py` | Process identity checks, signals and restarts |
 | `console/actions.py` | Admin actions and the audit log |
 | `console/kill.py` | The room kill switch and targeted stop: member classes, previews, signals |
 | `console/capacity.py` | CPU and memory per machine, session and process, from `/proc` |
 | `console/leaks.py` | Leftover test containers and orphaned agent-bridge processes |
+| `console/usage.py` | Claude usage per session from Prometheus |
+| `console/metrics.py` | The metrics registry behind `GET /metrics` |
+| `console/cli.py` | `agent-bridge-admin`, the console's API from the shell |
 | `console/events.py` | Fan-out to open event streams |
 | `console/static/` | The page: `index.html`, `app.js`, `app.css` |
+
+**Agent frameworks.** Everything that knows Claude Code lives in `claude/`, reached only through `host.py`:
+- **What the rest of the bridge asks:** `host.current()` (the framework this process runs under, else the generic
+  host) and `host.installed()` (every framework the console lists sessions of).
+- **What a host answers:** its session id, the session process (for liveness), delivery of a user message, session
+  lists, transcripts, kind, resume commands and metric names.
+- **Under the generic host:** there is no session, no relay and no delivery, so a plain CLI agent reads with `recv`.
+- **What a Claude Code change can break:** `claude/`, and nothing else.
+- **Adding a framework:** a sibling package with a `Host` subclass, listed in `installed()`.
 
 The Rust port of the CLI, the relay and ledgerd lives in `rust/` (crates `core`, `cli`, `ledgerd`), described in the
 [README](../README.md#rust-implementation). It shares this wire protocol, the history log, the lock files and the

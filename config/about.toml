@@ -1,0 +1,9 @@
+# cargo-about: the licenses the Rust crates shipped in the wheel may carry; anything else fails the build.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Zlib",
+    "Unlicense",
+    "Unicode-3.0",
+]

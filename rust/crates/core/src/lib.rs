@@ -3,14 +3,18 @@
 
 pub mod broker;
 pub mod bus;
+pub mod claude;
 pub mod config;
 pub mod history;
+pub mod host;
 pub mod identity;
 pub mod json;
 pub mod ledger;
 pub mod mqtt;
+pub mod observer;
 pub mod presence;
 pub mod protocol;
+pub mod relay;
 pub mod rooms;
 pub mod stamp;
 pub mod validation;

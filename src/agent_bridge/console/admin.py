@@ -12,7 +12,7 @@ from ..bus import Bus
 from ..history import parse_entry
 from ..ledger import client as ledger
 from ..protocol import parse_message, parse_presence
-from ..validation import ADMIN, BridgeError, is_ident
+from ..validation import ADMIN, SERVICES, BridgeError, is_ident
 from . import events, sessions
 from .processes import Refused
 
@@ -41,7 +41,7 @@ def _on_message(_c, _u, m):
         if is_ident(room):
             settings[room] = rooms.view(room, m.payload and rooms.parse_room(m.payload))
             events.push({"kind": "room", "info": settings[room]})
-    elif not m.topic.startswith("ledger/") and (msg := parse_message(m.topic, m.payload)):
+    elif m.topic.split("/", 1)[0] not in SERVICES and (msg := parse_message(m.topic, m.payload)):
         events.push({"kind": "msg", "msg": {"ts": time.time(), **msg}})
 
 

@@ -14,6 +14,7 @@ import signal
 import subprocess
 import tempfile
 
+from .. import host
 from . import admin, processes, sessions
 from .processes import Refused
 
@@ -96,17 +97,17 @@ def containers():
 
 def orphans(procs, regs):
     """Processes of ours that outlived what started them, each with the reason it counts as orphaned."""
-    mine, tmp, uid = processes.lineage(), tempfile.gettempdir() + os.sep, os.getuid()
+    mine, tmp, uid, names = processes.lineage(), tempfile.gettempdir() + os.sep, os.getuid(), processes.session_names()
     out = []
     for pid, i in procs.items():
         # A console, this one or another, is never a leftover: it is what the admin is using.
-        if i["uid"] != uid or pid in mine or i["comm"] == "claude" or not ours(i["argv"]) or is_console(i["argv"]):
+        if i["uid"] != uid or pid in mine or i["comm"] in names or not ours(i["argv"]) or is_console(i["argv"]):
             continue
         parent = procs.get(i["ppid"])
         if i["ppid"] != 1 and not (parent and parent["comm"] == "systemd"):
             continue
         env = _environ(pid)
-        session = (env.get("CLAUDE_CODE_SESSION_ID") or "").lower()
+        session = next((s for h in host.installed() if (s := h.session_of_env(env))), "").lower()
         reg = regs.get(session)
         if reg and reg["pid"] and not processes.verified(reg["pid"], reg["pid_start"]):
             kind, why = "session", f"its session {session} ended (claude pid {reg['pid']} is gone)"

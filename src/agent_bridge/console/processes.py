@@ -1,6 +1,5 @@
 """Claude processes: identity checks against /proc, signals, and restarts of dead sessions."""
 
-import json
 import os
 import shutil
 import signal
@@ -9,6 +8,7 @@ import threading
 import time
 import uuid
 
+from .. import host
 from . import events
 
 SIGNALS = {"interrupt": signal.SIGINT, "terminate": signal.SIGTERM, "kill": signal.SIGKILL}
@@ -55,10 +55,15 @@ def proc(pid):
     return i and (i["comm"], i["start"], i["uid"], i["argv"][0] if i["argv"] else "")
 
 
+def session_names():
+    """The process names of every installed framework's sessions (claude for Claude Code)."""
+    return {h.process_name for h in host.installed() if h.process_name}
+
+
 def verified(pid, start):
-    """The process at pid if it is still the claude process that started at start, else None."""
+    """The process at pid if it is still the session process that started at start, else None."""
     p = pid and start and proc(pid)
-    return p if p and p[0] == "claude" and p[1] == start and p[2] == os.getuid() else None
+    return p if p and p[0] in session_names() and p[1] == start and p[2] == os.getuid() else None
 
 
 def table():
@@ -114,17 +119,20 @@ def send_signal(pid, start, name):
     return f"sent SIG{SIGNALS[name].name[3:]} to pid {pid}"
 
 
-def claude():
-    if not (path := shutil.which("claude")):
-        raise Refused("claude is not on the console's PATH")
+def executable(h):
+    if not (path := h.executable()):
+        raise Refused(f"{h.process_name or h.name} is not on the console's PATH")
     return path
 
 
-def open_terminal(session, cwd):
+def open_terminal(h, session, cwd):
+    """Reopen a dead session of framework h in a terminal."""
     if not (term := shutil.which("gnome-terminal")):
         raise Refused("gnome-terminal is not installed")
+    if not (argv := h.resume_argv(session, executable(h))):
+        raise Refused(f"{h.name} sessions cannot be resumed")
     subprocess.Popen(
-        [term, f"--working-directory={cwd}", "--", claude(), "--resume", session],
+        [term, f"--working-directory={cwd}", "--", *argv],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -133,9 +141,10 @@ def open_terminal(session, cwd):
     return f"opened a terminal resuming {session}"
 
 
-def resume(key, session, cwd, text):
-    """Run one prompt in the dead session with claude -p, streaming its reply to the console as job events."""
-    exe = claude()
+def resume(h, key, session, cwd, text):
+    """Run one prompt in the dead session of framework h, streaming its reply to the console as job events."""
+    if not (argv := h.prompt_argv(session, executable(h))):
+        raise Refused(f"{h.name} sessions cannot be resumed with a message")
     with lock:
         if any(j["session"] == session and j["state"] == "running" for j in jobs.values()):
             raise Refused("a resume is already running for this session")
@@ -151,7 +160,7 @@ def resume(key, session, cwd, text):
     try:
         # The prompt goes on stdin, so text starting with "-" can never be read as a flag.
         p = subprocess.Popen(
-            [exe, "-p", "--resume", session, "--output-format", "stream-json", "--verbose"],
+            argv,
             cwd=cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -160,44 +169,19 @@ def resume(key, session, cwd, text):
         )
     except OSError as e:
         job["state"] = "failed to start"
-        raise Refused(f"could not start claude: {e}") from None
-    threading.Thread(target=_run, args=(job, p, text), daemon=True).start()
+        raise Refused(f"could not start {h.process_name or h.name}: {e}") from None
+    threading.Thread(target=_run, args=(job, p, text, h.output_lines), daemon=True).start()
     return f"resuming {session} as job {jid}"
 
 
-def _lines(raw):
-    """What a stream-json line shows in the console: text, tool names, the result."""
-    try:
-        d = json.loads(raw)
-    except ValueError:
-        return [raw]
-    if not isinstance(d, dict):
-        return [raw]
-    if (
-        d.get("type") == "assistant"
-        and isinstance(d.get("message"), dict)
-        and isinstance(d["message"].get("content"), list)
-    ):
-        return [
-            b["text"] if b.get("type") == "text" else f"[tool] {b.get('name')}"
-            for b in d["message"]["content"]
-            if isinstance(b, dict) and b.get("type") in ("text", "tool_use")
-        ]
-    if d.get("type") == "result":
-        return [f"[result] {d.get('result') if isinstance(d.get('result'), str) else d.get('subtype')}"]
-    if d.get("type") == "system" and d.get("subtype") == "init":
-        return ["[session started]"]
-    return []
-
-
-def _run(job, p, text):
+def _run(job, p, text, lines):
     try:
         p.stdin.write(text.encode())
         p.stdin.close()
     except OSError:
         pass
     for raw in p.stdout:
-        for line in _lines(raw.decode(errors="replace").rstrip("\n")):
+        for line in lines(raw.decode(errors="replace").rstrip("\n")):
             line = line[:4000]
             with lock:
                 job["lines"] = (job["lines"] + [line])[-JOB_LINES:]

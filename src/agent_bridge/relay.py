@@ -1,10 +1,11 @@
-"""Relay: pushes a Claude Code session's bus messages into the session's own inbox socket, so an idle session
-wakes up as soon as another agent writes to it.
+"""Relay: pushes a session's bus messages into the session itself, through its framework's inbox (host.py), so an
+idle session wakes up as soon as another agent writes to it. Under a framework without one (the generic host) there
+is no relay, and the agent reads with recv.
 
-start() is the SessionStart hook's entry: it finds the session's claude process and launches `run` detached. run
-owns the agent's subscribing MQTT session while it lives. One relay per session: it holds an exclusive flock on
+start() is the SessionStart hook's entry: it finds the session's process and launches `run` detached. run owns the
+agent's subscribing MQTT session while it lives. One relay per session: it holds an exclusive flock on
 <data dir>/relay/<session id>.lock (the file also holds its pid). A message is acked to the broker only after the
-socket took it, so anything undelivered stays queued. It exits when its claude process ends or on SIGTERM.
+inbox took it, so anything undelivered stays queued. It exits when its session's process ends or on SIGTERM.
 
 The hooks and the console import this module for live(), so it imports nothing beyond the standard library at load.
 """
@@ -16,17 +17,15 @@ import fcntl
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import threading
 import time
 
-from . import config, identity
+from . import config, host, identity
 from .protocol import BROADCAST
-from .validation import UUID, BridgeError, check_session, is_ident
+from .validation import BridgeError, check_session, is_ident
 
-SOCKET, TOKEN = "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"
 COALESCE = 1.0  # messages arriving within this window go out as one inbox post
 BATCH = 20
 BACKLOG = 50  # quiet room messages kept for the next post that wakes the session
@@ -114,19 +113,6 @@ def frame(msgs, quiet=()):
     return "\n".join([head, NOTE, *_lines(msgs), *(away + _lines(quiet) if quiet else [])])
 
 
-def post(text):
-    """Write one user message to this session's inbox socket; raises OSError if it is not there."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(5)
-        s.connect(os.environ[SOCKET])
-        lines = (
-            {"type": "auth", "token": os.environ.get(TOKEN, "")},
-            {"type": "user", "message": {"role": "user", "content": text}},
-        )
-        s.sendall("".join(json.dumps(x) + "\n" for x in lines).encode())
-        s.shutdown(socket.SHUT_WR)
-
-
 def session_agent(session):
     """The most recently seen live agent registered from this session (e.g. through the CLI), or None. Never a
     subagent's agent: that one belongs to the subagent, not to the session."""
@@ -147,12 +133,13 @@ def log(*parts):
 
 
 def run(claude_pid, claude_start):
-    """Relay this session's messages until its claude process ends or SIGTERM."""
+    """Relay this session's messages until its session process ends or SIGTERM."""
     from .bus import Bus  # paho-mqtt is loaded only by the relay process itself
 
-    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    if not UUID.fullmatch(session) or not os.environ.get(SOCKET):
-        raise BridgeError(f"relay needs CLAUDE_CODE_SESSION_ID and {SOCKET}: run it from a Claude Code session")
+    h = host.current()
+    session = h.session()
+    if not session or not h.can_deliver():
+        raise BridgeError(f"relay needs a session with an inbox ({h.name} host): run it from inside the session")
     os.makedirs(os.path.dirname(path := lock_path(session)), exist_ok=True)
     with open(path, "a+") as lock:
         try:
@@ -178,7 +165,7 @@ def run(claude_pid, claude_start):
             mine = [m for m in msgs if m["from"] != bus.addr]
             quiet = [m for m in mine if m.get("for_me") is False]
             if wake := [m for m in mine if m.get("for_me") is not False]:
-                post(frame(wake, [*backlog, *quiet][-BACKLOG:]))
+                h.deliver(frame(wake, [*backlog, *quiet][-BACKLOG:]))
                 backlog.clear()
             else:
                 backlog.extend(quiet)  # acked once this returns: from here on they live only in the backlog
@@ -201,7 +188,7 @@ def start():
     """Launch this session's relay detached and return at once. The SessionStart hook's entry, so it never raises."""
     try:
         origin = identity.origin()
-        if "session" in origin and "pid" in origin and os.environ.get(SOCKET) and not live(origin["session"]):
+        if "session" in origin and "pid" in origin and host.current().can_deliver() and not live(origin["session"]):
             os.makedirs(config.data_path("relay"), exist_ok=True)
             # -I keeps the session's working directory off sys.path, so no project file can shadow a module.
             argv = [

@@ -24,7 +24,7 @@ pub fn os_text(e: &std::io::Error) -> String {
 }
 
 pub fn connect(client_id: &str, clean: bool, expiry: u32, agent: bool, handler: Arc<dyn Handler>) -> Result<Conn> {
-    let cfg = config::get();
+    let cfg = config::get()?;
     let opts = Options {
         client_id: client_id.to_owned(),
         clean_start: clean,

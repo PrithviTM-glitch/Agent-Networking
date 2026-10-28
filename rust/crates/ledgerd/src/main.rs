@@ -35,14 +35,14 @@ struct Service {
     tx: Mutex<Sender<Item>>,
     queued: AtomicUsize,
     db: String,
+    broker: String,
 }
 
 impl Handler for Service {
     fn connected(&self, conn: &Conn, _session_present: bool) {
         let topics = ["ledger/req", "ledger/req/+", "agents/+"];
         let _ = conn.subscribe(topics.iter().map(|t| filter(t, true, false)).collect());
-        let cfg = config::get();
-        log(&format!("connected to {}:{}, db {}", cfg.host, cfg.port, self.db));
+        log(&format!("connected to {}, db {}", self.broker, self.db));
     }
 
     fn disconnected(&self, reason: Option<u8>) {
@@ -70,7 +70,7 @@ fn main() {
     match args::mode(&argv) {
         args::Mode::Serve => {}
         args::Mode::Health => {
-            config::get();
+            config_or_exit();
             std::process::exit(args::health());
         }
         args::Mode::Help => {
@@ -83,7 +83,7 @@ fn main() {
             std::process::exit(1);
         }
     }
-    let cfg = config::get();
+    let cfg = config_or_exit();
     let db = std::env::var_os("LEDGER_DB")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -93,7 +93,12 @@ fn main() {
         std::process::exit(1);
     });
     let (tx, rx) = channel();
-    let service = Arc::new(Service { tx: Mutex::new(tx), queued: AtomicUsize::new(0), db: db.display().to_string() });
+    let service = Arc::new(Service {
+        tx: Mutex::new(tx),
+        queued: AtomicUsize::new(0),
+        db: db.display().to_string(),
+        broker: format!("{}:{}", cfg.host, cfg.port),
+    });
     let opts = Options {
         client_id: "ledgerd".into(),
         clean_start: false,
@@ -107,6 +112,14 @@ fn main() {
         std::process::exit(1);
     });
     serve(&mut ledger, &conn, &service, &rx);
+}
+
+/// The settings, read once: a bad one ends ledgerd with its one-line message.
+fn config_or_exit() -> config::Config {
+    config::get().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    })
 }
 
 fn serve(ledger: &mut Ledger, conn: &Conn, service: &Service, rx: &Receiver<Item>) {

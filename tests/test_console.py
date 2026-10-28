@@ -30,6 +30,7 @@ from agent_bridge.ledger import client as ledger
 HOOK = str(BIN / "agent-bridge-broadcast-hook")
 CONSOLE = str(BIN / "agent-bridge-console")
 S1, S2, S3, S4, S5, S6, S7, S8, S9 = (str(uuid.uuid4()) for _ in range(9))
+RUN_ID = uuid.uuid4().hex[:8]
 TMP = HOME = FAKE_BIN = DATA = LOG = PROJ = REG = WEB = ORIGIN = HOST = None
 procs = []
 loose = []  # pids of double-forked test processes, which are nobody's child
@@ -244,7 +245,7 @@ echo '{{"type":"result","result":"done"}}'
 
 
 @pytest.fixture(scope="module", autouse=True)
-def console(ledgerd, state_dir):
+def console(ledgerd, historyd, state_dir):
     global TMP, HOME, FAKE_BIN, DATA, LOG, PROJ, REG, WEB, ORIGIN, HOST
     TMP = tempfile.mkdtemp()
     HOME, FAKE_BIN = (os.path.join(TMP, d) for d in ("home", "bin"))
@@ -350,14 +351,24 @@ def test_messaging():
     refused("/api/send", {"kind": "room", "target": "ops", "text": "x" * 70000}, "limit")
     refused("/api/signal", {"addr": ["x"], "signal": "kill"}, "bad address")
     other = ledger.connect()
+    # Service RPC traffic, like historyd's healthcheck, is never a message in the feed or the backlog.
+    for topic, payload in (
+        ("history/req", {"op": "ping"}),
+        (f"history/resp/{RUN_ID}", {"ok": True}),
+        (f"ledger/req/{RUN_ID}", {"op": "init", "as": RUN_ID}),
+    ):
+        other.publish(topic, json.dumps(payload), qos=1).wait_for_publish(5)
     other.publish(
         "room/ops", json.dumps({"from": "bob-1", "body": "from bob", "ts": time.time()}), qos=1
     ).wait_for_publish(5)
     assert ev.find(lambda e: e["kind"] == "msg" and e["msg"]["body"] == "from bob")
+    services = [e for e in ev.items if e["kind"] == "msg" and e["msg"]["topic"].split("/")[0] in ("history", "ledger")]
+    assert not services, services
     assert ev.find(lambda e: e["kind"] == "msg" and e["msg"]["topic"] == "broadcast")
     st = req("GET", "/api/state")[1]
     bodies = {(m["topic"], m["body"]) for m in st["messages"]}
     assert ("broadcast", "everyone stop pushing to main") in bodies and ("room/ops", "hello room") in bodies
+    assert not [t for t, _ in bodies if t.split("/")[0] in ("history", "ledger")], bodies
     for c in (w, other):
         c.disconnect()
     print("messaging ok")
@@ -380,9 +391,13 @@ def hook(session=S1, event="UserPromptSubmit"):
 
 
 def test_hooks():
-    with open(LOG, "a") as f:
-        f.write(json.dumps({"topic": "broadcast", "from": "bob-1", "body": "forged by bob", "ts": time.time()}) + "\n")
-        f.write("{not json\n")
+    from agent_bridge.history import client as history
+
+    # A raw client can publish on broadcast as anyone: historyd keeps it, but only admin's reach the hook.
+    forged = json.dumps({"from": "bob-1", "body": "forged by bob", "ts": time.time()})
+    state["c"].publish("broadcast", forged, qos=1).wait_for_publish(5)
+    state["c"].publish("broadcast", "{not json", qos=1).wait_for_publish(5)
+    assert wait_for(lambda: any(m["body"] == "forged by bob" for m in history.recent(last=100))), "historyd kept it"
     first = hook()
     assert "everyone stop pushing to main" in first and "forged" not in first, first
     assert hook() is None
@@ -397,6 +412,16 @@ def test_hooks():
     t0 = time.monotonic()
     hook(session=str(uuid.uuid4()))
     assert time.monotonic() - t0 < 2
+    t0 = time.monotonic()
+    down = subprocess.run(
+        [HOOK],
+        input=json.dumps({"session_id": str(uuid.uuid4()), "hook_event_name": "SessionStart"}),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "AGENT_BRIDGE_PORT": str(free_port())},
+    )
+    assert down.returncode == 0 and not down.stdout and not down.stderr, down
+    assert time.monotonic() - t0 < 2, "with no broker the hook shows nothing and returns at once"
     bad = subprocess.run([HOOK], input="garbage", capture_output=True, text=True)
     assert bad.returncode == 0 and not bad.stdout and not bad.stderr
     print("hook ok")

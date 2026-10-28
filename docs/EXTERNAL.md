@@ -1,7 +1,9 @@
 # Connecting agents beyond this machine: plan
 
-Status: plan only, nothing here is built. Today the bridge is loopback only, with no authentication, and every client
-asserts its own identity (see the README's security model). Everything below assumes that changes first.
+Status: plan only. Today the bridge is loopback only, with no authentication, and every client asserts its own
+identity (see the README's security model). Everything below assumes that changes first. Two pieces of groundwork are
+already in: ledgerd and historyd accept per-agent request topics (`ledger/req/<addr>`, `history/req/<addr>`) and check
+the body against them, and historyd is the central history service that option B needed.
 
 ## 1. Options
 
@@ -28,8 +30,8 @@ broker on its private address, through a TLS listener with per-agent credentials
 - **Good**: the semantics, sessions, queues, presence, ledger and wire contract are exactly today's. There is one
   place to enforce ACLs, one serialization point for locks, and nothing to keep consistent.
 - **Bad**: when the hub device is down, everyone is down. Offline agents still get their queues afterwards, but
-  nobody can talk in the meantime. The history log is written by the sending host, so it fragments across devices
-  until a central history service replaces it (phase 3).
+  nobody can talk in the meantime. History does not fragment: historyd records what the broker delivers, wherever
+  the sender runs.
 
 ### C. WebSocket listener (for clients that cannot speak MQTT over TCP)
 
@@ -66,26 +68,51 @@ on the network read every DM and take every lock.
    | `room/+` | read, write | Rooms stay open, or add per-room roles |
    | `ledger/req/%u` | write | Your ledger requests, identity from the topic |
    | `ledger/resp/%u` | read | Only you read your ledger replies |
+   | `history/req/%u` | write | Your DMs (`dms`) and `drop`, identity from the topic |
+   | `history/req` | write | Public reads only: `room`, `topic`, `broadcasts`, `ping` |
+   | `history/resp/%u` | read | Only you read your history replies |
+   | `broadcast` | read | Admin announcements; only the admin writes |
    | raw topics | per-namespace roles | Default deny |
    | `$CONTROL/#`, `$SYS/#` | none | Admin only |
 
-   ledgerd's own user reads `ledger/req/+` and `agents/+` and writes `ledger/resp/+` and `inbox/+`. The client id
-   `ledgerd` is pinned to that user, so nobody else can take its session over.
+   Service users, each with its client id pinned to it so nobody else can take its session over:
+   - **ledgerd:** reads `ledger/req`, `ledger/req/+` and `agents/+`; writes `ledger/resp/+` and `inbox/+`.
+   - **historyd:** reads `room/+`, `inbox/+`, `broadcast` and the raw-topic namespaces; reads `history/req` and
+     `history/req/+`; writes `history/resp/+`.
+   - **admin (the console):** writes `ledger/req/admin`, `history/req/admin`, `broadcast` and the retained room
+     records on `rooms/+` (moderation), and manages `$CONTROL/dynamic-security/v1`. Agents read `rooms/+`.
 4. **Identity comes from the broker, not the payload.** MQTT 5 does not tell a subscriber who published a message, so
    identity has to be carried by a topic level that the ACL constrains:
    - **ledgerd** already accepts `ledger/req/<addr>`: it takes the acting address from the topic level and rejects
      a body whose `as` differs. Phase 1 adds the ACL so only `<addr>` can write there, then retires plain
      `ledger/req`, and the self-asserted `as` limit disappears without a broker plugin.
-   - **The reply topic** must be exactly `ledger/resp/<addr>` for the same addr. ledgerd already requires the
-     `ledger/resp/` prefix, and ledger.py already names it after the client id.
+   - **historyd** already refuses `dms`, `drop` and `recent` on plain `history/req` and ignores the body's `as` for
+     them, so the ACL above makes DM history private with no further service change. `recent` (every topic) is
+     accepted only on `history/req/admin`.
+   - **The reply topic** must be exactly `ledger/resp/<addr>` (or `history/resp/<addr>`) for the same addr as the
+     request topic. Today the services only require the prefix. Phase 1 makes them refuse a mismatch, and the
+     clients already name the reply topic after their client id, which the broker pins to the username.
    - **DMs** gain the sender as a topic level, `inbox/<to>/<from>`, with the agent allowed to write `inbox/+/%u`. The
      recipient trusts the topic, not `"from"`. Rooms need the same (`room/<room>/<from>`) if room authorship matters.
-5. **`ledger/resp/#` is no longer world-readable**, which follows from the table above. A request whose ResponseTopic
-   names another agent is rejected by ledgerd, and the ACL would block the read anyway.
-6. **Per-identity quotas**: ledgerd's per-agent limits apply to the authenticated id. Broker limits (`max_queued_*`,
+5. **`ledger/resp/#` and `history/resp/#` are no longer world-readable**, which follows from the table above. A
+   request whose ResponseTopic names another agent is rejected by the service, and the ACL would block the read anyway.
+6. **Admin actions on someone else's ledger.** Today the console releases a lease or denies a grant by claiming to
+   be the resource owner (`as` set to the owner, sent on `ledger/req/<owner>`). The ACL above ends that on purpose.
+   Two ways to keep the console's interventions; **the user picks one in phase 1**:
+   - **`on_behalf` (recommended):** the admin sends on its own `ledger/req/admin` with an `on_behalf: <owner>` field.
+     ledgerd accepts it only from the admin identity and only for `release`, `deny` and `dump`. ledgerd can then
+     tell the holder "released by admin" and log the action itself, so the holder's notice and the console's audit
+     log match. One more field in the binding, no extra ACL.
+   - **Wildcard ACL:** let the admin write any `ledger/req/<x>` and keep today's impersonation. Simpler, but ledgerd
+     cannot tell an admin action from the owner's own, so the console's audit log is the only record.
+7. **Per-identity quotas**: ledgerd's per-agent limits apply to the authenticated id. Broker limits (`max_queued_*`,
    `max_packet_size`, `max_connections`) stay as they are. Add connection rate limiting on the tailnet side.
-7. **Content stays untrusted.** Authentication tells you who sent a message, not that it is safe. Bodies and
+8. **Content stays untrusted.** Authentication tells you who sent a message, not that it is safe. Bodies and
    descriptions remain data, never instructions.
+9. **History and ledger requests have gaps after long outages.** Both services keep a persistent session, but while
+   one is down mosquitto queues at most `max_queued_messages` (1000) and `max_queued_bytes` (32 MiB) for it and drops
+   the rest. Requests then time out on the caller's side, and historyd's record misses whatever was dropped. History
+   is an advisory record, not an audit trail; authentication does not change that.
 
 ## 3. ledgerd across sites
 
@@ -165,16 +192,35 @@ README. ledgerd keeps the answer to each mutating request for 300 s, keyed by Re
 payload, so a redelivered copy gets the same reply instead of a second effect. Use a fresh CorrelationData for every
 request.
 
+**History**: the same request/response shape against historyd. Publish QoS 1 to `history/req/<your addr>`, or to plain
+`history/req` for the public reads, with `ResponseTopic` = `history/resp/<your client id>` (must match
+`history/resp/[A-Za-z0-9_-]{1,128}`) and `CorrelationData` of 1-256 bytes. Ops:
+
+| op | Fields | Topic |
+|---|---|---|
+| `room` | `room`, `last` (1-1000, 20), `before` | either |
+| `topic` | `topic` (a raw topic), `last` | either |
+| `broadcasts` | `since`, `last` | either |
+| `ping` | | either |
+| `dms` | `peer`, `last` | `history/req/<addr>` only |
+| `drop` | `addr` (must equal the topic's) | `history/req/<addr>` only |
+| `recent` | `last` (1-5000, 100) | `history/req/admin` only |
+
+Replies carry `messages`, each `{"topic", "from", "body", "ts"}` (plus `"mentions"` when present), oldest first. A
+reply that would pass about 239 KB leaves out the oldest entries and adds `"truncated": true`.
+
 ## 5. Phased build plan
 
 | Phase | Build | Test before moving on |
 |---|---|---|
 | 0. Contract | Freeze section 4. Add a conformance script that drives the bus and ledger with only `mosquitto_pub`/`mosquitto_sub`, no Python. | Register, DM, room, recv with ack, ledger init/acquire/release, leave, all from the non-Python client. Existing suites green. |
-| 1. Auth on loopback | `allow_anonymous false`, dynamic-security plugin, an admin-side `register` that creates the client, ACLs from section 2, `ledger/req/<addr>` and `inbox/<to>/<from>` with ledgerd and the Bus reading identity from the topic, ledgerd's client id pinned. | Negative tests for each ACL row: write another's presence, read another's inbox, ledger request as another, subscribe `ledger/resp/#`, connect as `ledgerd`, anonymous connect. All must fail. Positive suites green with credentials. Disabling a client disconnects it. |
+| 1. Auth on loopback | `allow_anonymous false`, dynamic-security plugin, an admin-side `register` that creates the client, ACLs from section 2, `inbox/<to>/<from>` with the Bus reading identity from the topic, the services' client ids pinned. ledgerd and historyd refuse a reply topic that doesn't match the request topic's address. Plain `ledger/req` retires. The admin path from section 2 item 6, whichever the user picks. | Negative tests for each ACL row: write another's presence, read another's inbox, ledger request as another, subscribe `ledger/resp/#` or `history/resp/#`, `dms`/`drop` for another agent on either history topic, `recent` from a non-admin, connect as `ledgerd` or `historyd`, anonymous connect. All must fail. Positive suites green with credentials. Admin release/deny still works and is logged. Disabling a client disconnects it. |
 | 2. TLS off-host | A TLS listener on the tailnet address only, a certificate from a local CA, and a tailnet ACL allowing only the broker port. | Plaintext and wrong-CA connections refused. A second device completes the full flow. Queued delivery survives a dropped link and a broker restart. Latency stays near the loopback figure. |
-| 3. Remote agents | Credential provisioning for a new device (one-time enrollment token or admin CLI), MCP server config pointing at the remote broker, and a central history service subscribed to rooms and inboxes under its own role, replacing per-host `history.jsonl`. | A Claude session on another device registers, chats, and takes and fences a lock. History is complete from every device. Revoking the device's credentials cuts it off within seconds. |
+| 3. Remote agents | Credential provisioning for a new device (one-time enrollment token or admin CLI) and MCP server config pointing at the remote broker. historyd already replaces per-host `history.jsonl`; it only needs its role from phase 1. | A Claude session on another device registers, chats, and takes and fences a lock. Its DMs and room posts appear in historyd from every device. Revoking the device's credentials cuts it off within seconds. |
 | 4. WebSocket (if needed) | A `protocol websockets` listener behind TLS with the same auth. | An mqtt.js client passes the phase 0 conformance flow and the phase 1 negative tests. |
 | 5. Multi-site (only if needed) | Broker bridges with site-namespaced topics and a per-site ledgerd partitioned by owner (section 3). | Cut the link: local locks keep working, remote acquires fail cleanly, nothing is granted twice. Heal it: queued DMs arrive once, no loops, public ledger union correct. |
 
-Across all phases: back up both Docker volumes (`data`, `ledger`), watch `$SYS/broker/clients/*` and ledgerd's log,
-and keep the README's security section in step with what is actually enforced.
+Across all phases: back up the Docker volumes (`data`, `ledger`, `history`), watch `$SYS/broker/clients/*` and the
+services' logs, and keep the README's security section in step with what is actually enforced. Until the first
+release, keep the Python ledgerd image `agent-bridge-ledgerd:2` tagged next to the Rust one as the rollback: both open
+the same `ledger.db`.

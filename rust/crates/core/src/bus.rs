@@ -14,7 +14,7 @@ use crate::validation::{
 use crate::{config, history, identity, ledger, presence, rooms};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 const TOUCH: Duration = Duration::from_secs(60);
@@ -23,12 +23,23 @@ const BUFFER_MAX: usize = 1000;
 type Deliver<'a> = &'a mut dyn FnMut(&[Map]) -> Result<()>;
 
 /// One agent on the bus. Bus::attach attaches to a live address; Bus::register joins the bus.
+///
+/// Every method takes &self, so one Bus serves several threads at once, and no call holds a lock while it waits on
+/// the broker or for messages, with one exception: the calls that rewrite the agent's presence (sub, unsub, join,
+/// part, keep, touch) take turns on `writing` across their broker round trip, so concurrent ones never lose a topic.
 pub struct Bus {
     pub addr: String,
-    pub rec: Map,
-    conn: Conn,
+    rec: Mutex<Map>,
+    conn: Mutex<Conn>,
     shared: Arc<Shared>,
-    touched: Option<Instant>,
+    touched: Mutex<Option<Instant>>,
+    writing: Mutex<()>,
+    /// the console's reserved identity: it may broadcast, and carries no session or process
+    admin: bool,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// What the reader thread maintains for the Bus.
@@ -49,6 +60,7 @@ struct Cache {
     /// the agent's topics, subscribed afresh when the broker lost the session
     topics: Vec<String>,
     up: bool,
+    closed: bool,
     /// set once both caches hold every retained record of this connection
     synced: bool,
     barrier: Option<u16>,
@@ -56,7 +68,7 @@ struct Cache {
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Cache> {
-        self.st.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.st)
     }
 }
 
@@ -128,7 +140,7 @@ impl Handler for Shared {
                 c.buf.push_back(((m.qos > 0).then_some(m.ack), msg));
                 self.cv.notify_all();
                 drop(c);
-                if let Some(f) = self.on_arrival.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                if let Some(f) = lock(&self.on_arrival).as_ref() {
                     f();
                 }
                 return;
@@ -155,17 +167,36 @@ impl Bus {
             on_arrival: Mutex::new(None),
         });
         // mosquitto only writes a session to disk if its latest connect had clean_start=False, even under MQTT 5.
-        let conn = broker::connect(addr, false, presence::expiry(&rec), true, shared.clone())?;
-        Ok(Bus { addr: addr.to_owned(), rec, conn, shared, touched: None })
+        let conn = broker::connect(addr, false, presence::expiry(&rec)?, true, shared.clone())?;
+        Ok(Bus {
+            addr: addr.to_owned(),
+            rec: Mutex::new(rec),
+            conn: Mutex::new(conn),
+            shared,
+            touched: Mutex::new(None),
+            writing: Mutex::new(()),
+            admin: false,
+        })
+    }
+
+    /// The connection, for one request: a handle, so no lock is held while the request waits.
+    fn conn(&self) -> Conn {
+        lock(&self.conn).clone()
+    }
+
+    /// The agent's presence record as this Bus last wrote or read it.
+    pub fn rec(&self) -> Map {
+        lock(&self.rec).clone()
     }
 
     /// Attach to a live address.
     pub fn attach(addr: &str) -> Result<Bus> {
         let addr = check_ident(addr, "address")?;
         let rec = presence::need(addr)?;
-        let mut bus = Bus::open(addr, rec)?;
-        if bus.fresh_pid().iter().any(|(k, v)| bus.rec.get(k) != Some(v)) {
-            bus.touch(false)?;
+        let bus = Bus::open(addr, rec)?;
+        let rec = bus.rec();
+        if bus.fresh_pid(&rec).iter().any(|(k, v)| rec.get(k) != Some(v)) {
+            bus.touch(&lock(&bus.writing), false)?;
         }
         Ok(bus)
     }
@@ -202,26 +233,45 @@ impl Bus {
             None => format!("{name}-{}", ledger::random_hex(3)),
         };
         history::prune(None)?;
-        let mut bus = Bus::open(&addr, rec)?;
-        bus.touch(false)?;
+        let bus = Bus::open(&addr, rec)?;
+        bus.touch(&lock(&bus.writing), false)?;
+        Ok(bus)
+    }
+
+    /// The admin console's agent: name and address admin, kept, no origin fields. Only it may broadcast.
+    pub fn register_admin() -> Result<Bus> {
+        let mut rec = Map::new();
+        rec.insert("name".into(), ADMIN.into());
+        rec.insert("caps".into(), Value::Array(vec![]));
+        rec.insert("topics".into(), Value::Array(vec![]));
+        rec.insert("keep".into(), true.into());
+        match presence::find(ADMIN)? {
+            Some(live) => rec = live,
+            None => presence::wipe(ADMIN)?,
+        }
+        history::prune(None)?;
+        let mut bus = Bus::open(ADMIN, rec)?;
+        bus.admin = true;
+        bus.touch(&lock(&bus.writing), false)?;
         Ok(bus)
     }
 
     /// Called on the reader thread after each buffered message.
     pub fn on_arrival(&self, f: impl Fn() + Send + Sync + 'static) {
-        *self.shared.on_arrival.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
+        *lock(&self.shared.on_arrival) = Some(Box::new(f));
     }
 
-    fn set_rec(&mut self, rec: Map) {
+    fn set_rec(&self, rec: Map) {
         self.shared.lock().topics = topics_of(&rec);
-        self.rec = rec;
+        *lock(&self.rec) = rec;
     }
 
     fn ready(&self) -> Result<()> {
         let c = self.shared.lock();
-        let (c, _) = self.shared.cv.wait_timeout_while(c, TIMEOUT, |c| !c.up).unwrap_or_else(|e| e.into_inner());
-        let (c, _) = self.shared.cv.wait_timeout_while(c, TIMEOUT, |c| !c.synced).unwrap_or_else(|e| e.into_inner());
-        if c.up && c.synced { Ok(()) } else { fail("not connected to the broker") }
+        let cv = &self.shared.cv;
+        let (c, _) = cv.wait_timeout_while(c, TIMEOUT, |c| !c.up && !c.closed).unwrap_or_else(|e| e.into_inner());
+        let (c, _) = cv.wait_timeout_while(c, TIMEOUT, |c| !c.synced && !c.closed).unwrap_or_else(|e| e.into_inner());
+        if c.up && c.synced && !c.closed { Ok(()) } else { fail("not connected to the broker") }
     }
 
     /// addr's presence record, from this connection's cache: complete once connected, then kept current.
@@ -231,35 +281,36 @@ impl Bus {
     }
 
     fn current(&self) -> Result<Map> {
-        Ok(self.seen(&self.addr)?.unwrap_or_else(|| self.rec.clone()))
+        Ok(self.seen(&self.addr)?.unwrap_or_else(|| self.rec()))
     }
 
-    fn touch(&mut self, refresh: bool) -> Result<()> {
-        if refresh {
-            let rec = self.current()?;
-            self.set_rec(rec);
+    /// Republish the agent's presence; the caller holds `writing`.
+    fn touch(&self, _writing: &MutexGuard<'_, ()>, refresh: bool) -> Result<()> {
+        let mut rec = if refresh { self.current()? } else { self.rec() };
+        for (k, v) in self.fresh_pid(&rec) {
+            rec.insert(k, v);
         }
-        for (k, v) in self.fresh_pid() {
-            self.rec.insert(k, v);
-        }
-        self.rec.insert("seen".into(), float(now()));
+        rec.insert("seen".into(), float(now()));
+        self.set_rec(rec.clone());
         self.ready()?;
-        let expire = (!presence::keep(&self.rec)).then(|| config::get().stale_s.min(u32::MAX as u64) as u32);
-        broker::publish(&self.conn, &format!("agents/{}", self.addr), dumps_map(&self.rec), true, expire)?;
+        let stale = config::get()?.stale_s.min(u32::MAX as u64) as u32;
+        let expire = (!presence::keep(&rec)).then_some(stale);
+        broker::publish(&self.conn(), &format!("agents/{}", self.addr), dumps_map(&rec), true, expire)?;
         // The broker echoes this publish before confirming it, so no older echo can overwrite the entry afterwards.
-        self.shared.lock().agents.insert(self.addr.clone(), self.rec.clone());
-        self.touched = Some(Instant::now());
+        self.shared.lock().agents.insert(self.addr.clone(), rec);
+        *lock(&self.touched) = Some(Instant::now());
         Ok(())
     }
 
     /// pid and pid_start of this process's claude, when it runs in the very session the record names (its session,
     /// or a subagent's parent); else nothing. Any other process acting as the agent, a moderator's kick among them,
     /// must not rewrite who the agent belongs to.
-    fn fresh_pid(&self) -> Map {
+    fn fresh_pid(&self, rec: &Map) -> Map {
         let here = identity::origin();
-        let owner = str_of(&self.rec, "session").or_else(|| str_of(&self.rec, "parent"));
+        let owner = str_of(rec, "session").or_else(|| str_of(rec, "parent"));
         let mut out = Map::new();
-        if let Some(owner) = owner
+        if !self.admin
+            && let Some(owner) = owner
             && here.contains_key("pid")
             && str_of(here, "session").unwrap_or("").to_lowercase() == owner.to_lowercase()
         {
@@ -270,22 +321,20 @@ impl Bus {
     }
 
     /// Subscribe or unsubscribe; true if that changed the agent's topics.
-    fn subscribe(&mut self, topic: &str, on: bool) -> Result<bool> {
+    fn subscribe(&self, topic: &str, on: bool) -> Result<bool> {
+        let writing = lock(&self.writing);
         // the whole record: another process may have changed any of it
-        let rec = self.current()?;
-        self.set_rec(rec);
-        let mut topics: BTreeSet<String> = topics_of(&self.rec).into_iter().collect();
+        let mut rec = self.current()?;
+        let mut topics: BTreeSet<String> = topics_of(&rec).into_iter().collect();
         let had = topics.contains(topic);
         if on && !had && topics.len() >= TOPICS_MAX {
             return fail(format!("at most {TOPICS_MAX} subscriptions"));
         }
         self.ready()?;
-        let pkid = if on {
-            self.conn.subscribe(vec![filter(topic, true, true)])
-        } else {
-            self.conn.unsubscribe(vec![topic.to_owned()])
-        };
-        if pkid.ok().and_then(|p| self.conn.wait_ack(p, TIMEOUT)) != Some(true) {
+        let conn = self.conn();
+        let pkid =
+            if on { conn.subscribe(vec![filter(topic, true, true)]) } else { conn.unsubscribe(vec![topic.to_owned()]) };
+        if pkid.ok().and_then(|p| conn.wait_ack(p, TIMEOUT)) != Some(true) {
             return fail(format!("broker refused or did not confirm {} {topic}", if on { "sub" } else { "unsub" }));
         }
         if on {
@@ -293,10 +342,9 @@ impl Bus {
         } else {
             topics.remove(topic);
         }
-        let mut rec = self.rec.clone();
         rec.insert("topics".into(), topics.into_iter().collect::<Vec<_>>().into());
         self.set_rec(rec);
-        self.touch(false)?;
+        self.touch(&writing, false)?;
         Ok(had != on)
     }
 
@@ -308,8 +356,9 @@ impl Bus {
         if rooms::refusal(self.room_rec(room).as_ref(), &self.addr).is_some() {
             return Ok(());
         }
-        let caps: Vec<&str> = self.rec["caps"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-        let name = self.rec["name"].as_str().unwrap_or("");
+        let rec = self.rec();
+        let caps: Vec<&str> = rec["caps"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let name = rec["name"].as_str().unwrap_or("");
         let mut body = format!("[{verb} #{room}] {name}");
         if !caps.is_empty() {
             body += &format!(", caps: {}", caps.join(", "));
@@ -326,13 +375,14 @@ impl Bus {
             entry.insert("mentions".into(), m.into());
         }
         self.ready()?;
-        broker::publish(&self.conn, topic, dumps_map(&entry), false, None)?;
+        broker::publish(&self.conn(), topic, dumps_map(&entry), false, None)?;
         history::append(topic, &entry)
     }
 
     /// Delete this agent: its ledger, session, queued messages, presence and received DMs in the log. Its rooms get
     /// a "[left #room]" message. Returns a warning if ledgerd could not drop the ledger; the agent leaves regardless.
-    pub fn leave(mut self) -> Result<Option<String>> {
+    /// The Bus is closed afterwards: later calls fail with "not connected to the broker".
+    pub fn leave(&self) -> Result<Option<String>> {
         let warning = match ledger::call("drop", &self.addr, Map::new(), Some(3.0)) {
             Err(e) if !e.to_string().starts_with("no ledger for") => Some(format!("ledger not dropped: {e}")),
             _ => None,
@@ -348,20 +398,40 @@ impl Bus {
         Ok(warning)
     }
 
+    /// Change how other agents see this one; the address stays.
+    pub fn describe(&self, name: Option<&str>, caps: Option<&[String]>) -> Result<()> {
+        if self.addr != ADMIN {
+            not_admin(name, "name")?;
+        }
+        let writing = lock(&self.writing);
+        let mut rec = self.current()?;
+        if let Some(name) = name {
+            rec.insert("name".into(), check_ident(name, "name")?.into());
+        }
+        if let Some(caps) = caps {
+            rec.insert("caps".into(), check_caps(caps)?.into());
+        }
+        self.set_rec(rec);
+        self.touch(&writing, false)
+    }
+
     /// on exempts the agent from idle expiry, off opts back in.
-    pub fn keep(&mut self, on: bool) -> Result<()> {
+    pub fn keep(&self, on: bool) -> Result<()> {
+        let writing = lock(&self.writing);
         let mut rec = self.current()?;
         rec.insert("keep".into(), on.into());
         self.set_rec(rec);
-        self.touch(false)?;
-        self.close();
-        // the session expiry interval only changes on connect
-        self.conn = broker::connect(&self.addr, false, presence::expiry(&self.rec), true, self.shared.clone())?;
+        self.touch(&writing, false)?;
+        // The session expiry interval only changes on connect; calls meanwhile wait in ready() as on a reconnect.
+        self.conn().close();
+        self.shared.lock().up = false;
+        let fresh = broker::connect(&self.addr, false, presence::expiry(&self.rec())?, true, self.shared.clone())?;
+        *lock(&self.conn) = fresh;
         Ok(())
     }
 
     /// Join a room; its members get a "[joined #room]" message unless this agent was already in it.
-    pub fn join(&mut self, room: &str) -> Result<()> {
+    pub fn join(&self, room: &str) -> Result<()> {
         self.ready()?;
         let room = check_ident(room, "room")?;
         if self.room_rec(room).is_some_and(|r| rooms::listed(&r, "banned", &self.addr)) {
@@ -374,7 +444,7 @@ impl Bus {
     }
 
     /// Leave a room; its members get a "[left #room]" message unless this agent was not in it.
-    pub fn part(&mut self, room: &str) -> Result<()> {
+    pub fn part(&self, room: &str) -> Result<()> {
         let room = check_ident(room, "room")?;
         if self.subscribe(&format!("room/{room}"), false)? {
             self.announce(room, "left")?;
@@ -382,12 +452,20 @@ impl Bus {
         Ok(())
     }
 
-    pub fn sub(&mut self, topic: &str) -> Result<()> {
+    pub fn sub(&self, topic: &str) -> Result<()> {
         self.subscribe(check_topic(topic, true)?, true).map(drop)
     }
 
-    pub fn unsub(&mut self, topic: &str) -> Result<()> {
+    pub fn unsub(&self, topic: &str) -> Result<()> {
         self.subscribe(check_topic(topic, true)?, false).map(drop)
+    }
+
+    /// Send body to every agent; only the console's Bus (register_admin) may.
+    pub fn broadcast(&self, body: &str) -> Result<()> {
+        if !self.admin {
+            return fail("only the admin console can broadcast");
+        }
+        self.send(BROADCAST, body, None)
     }
 
     /// Post to a room. @address or @name (every member with that name) mentions members: their relays wake for it,
@@ -427,12 +505,17 @@ impl Bus {
 
     /// Drain up to limit buffered messages, blocking up to wait seconds for the first. They are acked once returned,
     /// or with deliver once deliver(messages) returns; if it fails they go back to the buffer.
-    pub fn recv(&mut self, wait: f64, limit: Option<usize>, deliver: Option<Deliver>) -> Result<Vec<Map>> {
+    pub fn recv(&self, wait: f64, limit: Option<usize>, deliver: Option<Deliver>) -> Result<Vec<Map>> {
         check_wait(wait)?;
         // while reconnecting, buffered messages may still be resent, so wait until connected() sorted them
         self.ready()?;
-        if self.touched.is_none_or(|t| t.elapsed() > TOUCH) {
-            self.touch(true)?;
+        if lock(&self.touched).is_none_or(|t| t.elapsed() > TOUCH) {
+            // A presence writer already busy refreshes it anyway; recv never waits for one.
+            match self.writing.try_lock() {
+                Ok(writing) => self.touch(&writing, true)?,
+                Err(TryLockError::Poisoned(e)) => self.touch(&e.into_inner(), true)?,
+                Err(TryLockError::WouldBlock) => {}
+            }
         }
         let got: Vec<(Option<Ack>, Map)> = {
             let c = self.shared.lock();
@@ -455,12 +538,18 @@ impl Bus {
             }
             return Err(e);
         }
+        let conn = self.conn();
         for (ack, _) in got {
             if let Some(ack) = ack {
-                self.conn.ack(ack);
+                conn.ack(ack);
             }
         }
         Ok(msgs)
+    }
+
+    /// How many messages are buffered, not yet received.
+    pub fn pending(&self) -> usize {
+        self.shared.lock().buf.len()
     }
 
     fn for_me(&self, m: &Map) -> Map {
@@ -499,7 +588,7 @@ impl Bus {
         d.insert("by".into(), self.addr.clone().into());
         d.insert("ts".into(), float(now()));
         let rec = rooms::check_record(&d)?;
-        broker::publish(&self.conn, &format!("rooms/{room}"), dumps_map(&rec), true, None)?;
+        broker::publish(&self.conn(), &format!("rooms/{room}"), dumps_map(&rec), true, None)?;
         self.shared.lock().rooms.insert(room.to_owned(), rec.clone());
         for note in notes {
             self.send(&format!("room/{room}"), &format!("{note} by {}", self.addr), None)?;
@@ -552,8 +641,7 @@ impl Bus {
         };
         let settings = self.listed(room, addr, field, on, &verb, "")?;
         if verb == "kicked" && self.seen(addr)?.is_some() {
-            let mut target = Bus::attach(addr)?;
-            target.subscribe(&format!("room/{room}"), false)?;
+            Bus::attach(addr)?.subscribe(&format!("room/{room}"), false)?;
         }
         Ok(settings)
     }
@@ -577,10 +665,13 @@ impl Bus {
         })
     }
 
-    /// Disconnect; the session and anything not yet received stay with the broker.
-    pub fn close(&mut self) {
-        self.conn.close();
-        self.shared.lock().up = false;
+    /// Disconnect; the session and anything not yet received stay with the broker. Later calls fail.
+    pub fn close(&self) {
+        self.conn().close();
+        let mut c = self.shared.lock();
+        c.up = false;
+        c.closed = true;
+        self.shared.cv.notify_all();
     }
 }
 

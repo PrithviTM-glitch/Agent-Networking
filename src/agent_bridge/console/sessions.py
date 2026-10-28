@@ -1,168 +1,41 @@
-"""Every Claude session and bus agent, joined by session id: names, liveness, kind and activity.
+"""Every agent-framework session and bus agent, joined by session id: names, liveness, kind and activity.
 
-Sources: Claude Code's session registry (CLAUDE_CONFIG_DIR or ~/.claude, sessions/<pid>.json), bus presence, the
-session transcripts (projects/*/<session>.jsonl) and each working directory's .git/HEAD. The registry is internal
-to Claude Code and may change between versions, so every field is optional and checked before use."""
+Sources: each installed framework's session list and transcripts (agent_bridge.host; for Claude Code, its session
+registry and transcript files), bus presence, and each working directory's .git/HEAD."""
 
-import collections
-import glob
 import json
-import math
-import mmap
 import os
 import re
 import sys
 import threading
 import time
 
-from .. import config
+from .. import config, host
 from ..protocol import ORIGIN
 from ..relay import live as relay_live
 from ..validation import ADMIN, UUID, check_ident, is_ident
 from . import events
 from .processes import Refused, verified
 
-CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-PROJECTS = os.path.join(CLAUDE_DIR, "projects")
-REGISTRY = os.path.join(CLAUDE_DIR, "sessions")
-DESKTOP_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "Claude") + os.sep
 CHECK_S = 3
-FIND_S = 30  # how often a session without a transcript yet is looked up again
-ACTIVITY = 30
-HEAD_SCAN, TAIL_SCAN = 4 << 20, 4 << 20
-REGISTRY_MAX = 64 * 1024
-PID_MAX, TICKS_MAX = 4194304, 2**53
-REGISTRY_FILE = re.compile(r"[0-9]{1,7}\.json")
-TAGS = re.compile(r"<(system-reminder|command-[a-z-]+|local-command-[a-z-]+)>.*?</\1>", re.S)
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 lock = threading.Lock()
 presence = {}
 transcripts = {}
+hosts = {}  # session -> the framework whose transcript it is
+frameworks = {}  # agent or session key -> the framework last seen for it
 kinds = {}
 state = {"registry": None, "view": None}
 
 
-def clean(text):
-    return " ".join(CTRL.sub(" ", TAGS.sub(" ", text)).split())
-
-
-# transcripts
-
-
-def _texts(content):
-    if isinstance(content, str):
-        return [content]
-    return [
-        b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
-    ]
-
-
-class Transcript:
-    """What the console shows from one session's transcript, read incrementally from where it left off."""
-
-    def __init__(self, session):
-        self.session, self.path, self.offset = session, None, 0
-        self.looked, self.seen = -math.inf, None
-        self.title = self.prompt = self.cwd = self.branch = self.entrypoint = None
-        self.recent = collections.deque(maxlen=ACTIVITY)
-
-    def find(self):
-        found = glob.glob(os.path.join(glob.escape(PROJECTS), "*", f"{self.session}.jsonl"))
-        return max(found, key=os.path.getmtime) if found else None
-
-    def refresh(self):
-        if not self.path or not os.path.exists(self.path):
-            if time.monotonic() - self.looked < FIND_S:
-                return
-            self.__init__(self.session)
-            self.looked = time.monotonic()
-            if not (path := self.find()):
-                return
-            self.path = path
-        try:
-            st = os.stat(self.path)
-        except OSError:
-            return
-        if (st.st_size, st.st_mtime_ns) == self.seen:
-            return
-        self.seen = st.st_size, st.st_mtime_ns
-        try:
-            with open(self.path, "rb") as f:
-                size = os.fstat(f.fileno()).st_size
-                if size < self.offset:
-                    self.__init__(self.session)
-                    return self.refresh()
-                if self.offset == 0 and size:
-                    self._first_read(f, size)
-                f.seek(self.offset)
-                data = f.read(size - self.offset)
-        except OSError:
-            return
-        end = data.rfind(b"\n") + 1
-        for line in data[:end].splitlines():
-            self._feed(line)
-        self.offset += end
-
-    def _first_read(self, f, size):
-        """Seed from the first prompt and the latest title, then let refresh read only the tail."""
-        scanned = 0
-        for line in f:
-            scanned += len(line)
-            if self.prompt or scanned > HEAD_SCAN:
-                break
-            if b'"type":"user"' in line:
-                self._feed(line, activity=False)
-        with mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ) as m:
-            if (i := m.rfind(b'"customTitle":')) >= 0:
-                end = m.find(b"\n", i)
-                self._feed(m[m.rfind(b"\n", 0, i) + 1 : end if end >= 0 else size])
-            if size > TAIL_SCAN:
-                self.offset = m.find(b"\n", size - TAIL_SCAN) + 1 or size
-
-    def _feed(self, line, activity=True):
-        if b'"customTitle"' not in line and b'"type":"user"' not in line and b'"type":"assistant"' not in line:
-            return
-        try:
-            d = json.loads(line)
-        except ValueError:
-            return
-        if not isinstance(d, dict) or d.get("isSidechain"):
-            return
-        if d.get("type") == "custom-title" and isinstance(d.get("customTitle"), str):
-            self.title = clean(d["customTitle"])[:120] or None
-            return
-        msg = d.get("message")
-        if d.get("type") not in ("user", "assistant") or not isinstance(msg, dict):
-            return
-        for key, attr in (("cwd", "cwd"), ("gitBranch", "branch"), ("entrypoint", "entrypoint")):
-            if isinstance(d.get(key), str):
-                setattr(self, attr, d[key])
-        content = msg.get("content")
-        if not isinstance(content, (str, list)):
-            return
-        ts = d.get("timestamp") if isinstance(d.get("timestamp"), str) else None
-        if d["type"] == "user" and not d.get("isMeta"):
-            for t in map(clean, _texts(content)):
-                if t and not t.startswith("[Request interrupted"):
-                    self.prompt = self.prompt or t[:500]
-                    activity and self.recent.append({"ts": ts, "role": "user", "text": t[:400]})
-        elif d["type"] == "assistant" and activity:
-            for b in content if isinstance(content, list) else []:
-                if (
-                    isinstance(b, dict)
-                    and b.get("type") == "text"
-                    and isinstance(b.get("text"), str)
-                    and b["text"].strip()
-                ):
-                    self.recent.append({"ts": ts, "role": "assistant", "text": b["text"].strip()[:400]})
-                elif isinstance(b, dict) and b.get("type") == "tool_use" and isinstance(b.get("name"), str):
-                    self.recent.append({"ts": ts, "role": "tool", "text": b["name"][:80]})
-
-
 def transcript(session):
+    """The session's transcript reader from whichever framework keeps one, created once and cached."""
     with lock:
-        return transcripts.setdefault(session, Transcript(session))
+        if session not in transcripts:
+            found = next(((h, t) for h in host.installed() if (t := h.transcript(session)) is not None), (None, None))
+            hosts[session], transcripts[session] = found
+        return transcripts[session]
 
 
 def activity(session):
@@ -170,68 +43,12 @@ def activity(session):
     return list(t.recent) if t else []
 
 
-# registry
-
-
-def _count(v, cap):
-    if isinstance(v, str) and v.isdigit() and len(v) < 20:
-        v = int(v)
-    return v if isinstance(v, int) and not isinstance(v, bool) and 0 < v <= cap else None
-
-
-def _text(v, cap=200):
-    return clean(v)[:cap] or None if isinstance(v, str) else None
-
-
-def _ms(v):
-    return v / 1000 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < 1e13 else None
-
-
-def _registry_entry(path):
-    try:
-        if os.path.getsize(path) > REGISTRY_MAX:
-            return None
-        with open(path, encoding="utf-8") as f:
-            d = json.load(f)
-    except (OSError, ValueError, RecursionError):
-        return None
-    if not isinstance(d, dict) or not isinstance(d.get("sessionId"), str) or not UUID.fullmatch(d["sessionId"]):
-        return None
-    cwd = d.get("cwd")
-    cwd = cwd if isinstance(cwd, str) and os.path.isabs(cwd) and len(cwd) < 4096 and not CTRL.search(cwd) else None
-    pid, start = _count(d.get("pid"), PID_MAX), _count(d.get("procStart"), TICKS_MAX)
-    return {
-        "session": d["sessionId"].lower(),
-        "pid": pid if start else None,
-        "pid_start": start if pid else None,
-        "cwd": cwd,
-        "entrypoint": _text(d.get("entrypoint")),
-        "mode": _text(d.get("kind")),
-        "status": _text(d.get("status")),
-        "version": _text(d.get("version")),
-        "name": _text(d.get("name")),
-        "name_source": _text(d.get("nameSource")),
-        "desktop_id": _text(d.get("hostSessionId")),
-        "started": _ms(d.get("startedAt")),
-        "updated": _ms(d.get("updatedAt")),
-    }
-
-
 def read_registry():
-    """session id -> registry entry; of several files for one session, the live one, else the newest."""
+    """session id -> session record from every installed framework, each tagged with its framework's name."""
     out = {}
-    try:
-        names = os.listdir(REGISTRY)
-    except OSError:
-        names = []
-    for name in names:
-        # Only <pid>.json: the <pid>.<hash>.key files next to them are never opened.
-        if not REGISTRY_FILE.fullmatch(name) or not (e := _registry_entry(os.path.join(REGISTRY, name))):
-            continue
-        e["alive"] = bool(e["pid"] and verified(e["pid"], e["pid_start"]))
-        old = out.get(e["session"])
-        if not old or (e["alive"], e["started"] or 0) > (old["alive"], old["started"] or 0):
-            out[e["session"]] = e
+    for h in host.installed():
+        for sid, e in h.sessions().items():
+            out.setdefault(sid, {**e, "host": h.name})
     state["registry"] = out
     return out
 
@@ -258,7 +75,9 @@ def git_branch(cwd):
             if os.path.isdir(git):
                 with open(os.path.join(git, "HEAD")) as f:
                     head = f.readline(4096).strip()
-                return clean(head[16:])[:200] or None if head.startswith("ref: refs/heads/") else None
+                if not head.startswith("ref: refs/heads/"):
+                    return None
+                return " ".join(CTRL.sub(" ", head[16:]).split())[:200] or None
             if (parent := os.path.dirname(d)) == d:
                 return None
             d = parent
@@ -295,6 +114,17 @@ def live_presence():
 # views
 
 
+def framework(key, reg, proc, session):
+    """The framework a session belongs to: its registry's, else its process's, else its transcript's, else the one
+    last seen for it, else the only installed one."""
+    named = reg and next((h for h in host.installed() if h.name == reg.get("host")), None)
+    if h := named or (proc and host.by_process(proc[0])) or hosts.get(session):
+        frameworks[key] = h
+        return h
+    only = host.installed()
+    return frameworks.get(key) or (only[0] if len(only) == 1 else None)
+
+
 def view(addr, rec, reg):
     """One session or agent as the page shows it. key is the address when on the bus, else the session id."""
     session = (reg and reg["session"]) or (rec and rec.get("session"))
@@ -308,10 +138,11 @@ def view(addr, rec, reg):
     )
     p = verified(pid, start) if pid else None
     key = addr or session
-    if p:
-        kinds[key] = "desktop" if p[3].startswith(DESKTOP_DIR) else "cli"
+    h = framework(key, reg, p, session)
+    if p and h:
+        kinds[key] = h.kind(argv0=p[3])
     entry = (reg and reg["entrypoint"]) or (t and t.entrypoint)
-    kind = ("desktop" if entry == "claude-desktop" else "cli") if entry else kinds.get(key)
+    kind = h.kind(entrypoint=entry) if entry and h else kinds.get(key)
     cwd = (reg and reg["cwd"]) or (t and t.cwd)
     branch = (cwd and git_branch(cwd)) or (t and t.branch if t and t.branch != "HEAD" else None)
     named = reg and reg["name_source"] != "derived" and reg["name"]
@@ -324,6 +155,7 @@ def view(addr, rec, reg):
         "addr": addr,
         "session": session,
         "on_bus": rec is not None,
+        "framework": h.name if h else None,
         "parent": rec and rec.get("parent"),
         "subagent": bool(rec and (rec.get("kind") == "subagent" or "parent" in rec)),
         "friendly": " · ".join(x for x in (short, task) if x) or fallback,

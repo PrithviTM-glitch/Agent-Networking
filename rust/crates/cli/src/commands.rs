@@ -55,14 +55,13 @@ fn turn(addr: &str) -> Result<File> {
     Ok(f)
 }
 
-fn attached<T>(addr: &str, take_turn: bool, f: impl FnOnce(&mut Bus) -> Result<T>) -> Result<T> {
+fn attached<T>(addr: &str, take_turn: bool, f: impl FnOnce(&Bus) -> Result<T>) -> Result<T> {
     not_admin(Some(addr), "address")?;
     let _turn = if take_turn { Some(turn(addr)?) } else { None };
-    let mut bus = Bus::attach(addr)?;
-    f(&mut bus)
+    f(&Bus::attach(addr)?)
 }
 
-fn shown(addr: &str, f: impl FnOnce(&mut Bus) -> Result<Map>) -> Result<()> {
+fn shown(addr: &str, f: impl FnOnce(&Bus) -> Result<Map>) -> Result<()> {
     attached(addr, true, |b| f(b).map(|m| show_all(&[m])))
 }
 

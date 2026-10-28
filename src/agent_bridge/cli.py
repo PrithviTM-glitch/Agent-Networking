@@ -19,7 +19,7 @@ import os
 import sys
 import zlib
 
-from . import config, history, presence, relay, rooms
+from . import config, history, host, presence, relay, rooms
 from .bus import Bus
 from .ledger import client as ledger
 from .validation import WAIT_MAX, BridgeError, check_ident, check_session, check_wait, not_admin
@@ -86,7 +86,7 @@ def _ledger(op, *fields):
 def _relay(a):
     if a.action == "start":
         return relay.start()
-    session = check_session(os.environ.get("CLAUDE_CODE_SESSION_ID") if a.session is None else a.session)
+    session = check_session(host.current().session_key() if a.session is None else a.session)
     if a.action == "stop" and not relay.stop(session):
         raise BridgeError("the relay did not stop within 5 s")
     _show_all([{"session": session, "live": relay.live(session), "lock": relay.lock_path(session)}])

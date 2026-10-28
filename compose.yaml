@@ -30,6 +30,31 @@ services:
       start_period: 15s
     depends_on:
       - mosquitto
+  historyd:
+    # The Python historyd from the root Dockerfile, the reference until the Rust port lands.
+    build: .
+    image: agent-bridge-historyd:1
+    container_name: agent-bridge-historyd
+    restart: unless-stopped
+    command: ["agent-bridge-historyd"]
+    environment:
+      AGENT_BRIDGE_HOST: mosquitto
+      HISTORY_DB: /data/history.db
+      HISTORY_IMPORT: /import/history.jsonl
+    volumes:
+      - history:/data
+      # The host's legacy history log, imported once on the first start and never changed (read-only).
+      - ${HOME}/.local/state/agent-bridge:/import:ro
+    healthcheck:
+      # A round trip through the broker, so it fails when historyd is disconnected or wedged, not just when it exits.
+      test: ["CMD", "agent-bridge-historyd", "--health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mosquitto
 volumes:
   data:
   ledger:
+  history:

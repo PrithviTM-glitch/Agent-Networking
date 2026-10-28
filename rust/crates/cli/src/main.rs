@@ -18,7 +18,10 @@ fn main() {
         eprintln!("internal error: {}", what.split_whitespace().collect::<Vec<_>>().join(" "));
         std::process::exit(1);
     }));
-    agent_bridge::config::get();
+    if let Err(e) = agent_bridge::config::get() {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
     let cli = match args::Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => e.exit(),

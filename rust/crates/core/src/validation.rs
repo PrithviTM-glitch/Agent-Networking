@@ -3,8 +3,8 @@
 //! Names, addresses, rooms and caps: 1-64 ASCII letters, digits, _ or - (names at most 57, leaving room for the
 //! address suffix), at most 32 caps. Text: at most 64 KiB of UTF-8; tab, newline and CR are kept, any other control
 //! character (C0, DEL, C1) is refused. Raw topics: at most 256 bytes of UTF-8, no control characters, never starting
-//! with $ or the reserved levels agents, inbox, ledger, broadcast and rooms. + and # work only in subscription filters,
-//! as whole levels, # only last, and not as the first level.
+//! with $ or the reserved levels agents, inbox, ledger, broadcast, rooms and history. + and # work only in subscription
+//! filters, as whole levels, # only last, and not as the first level.
 
 use serde_json::Value;
 use std::fmt;
@@ -20,7 +20,9 @@ pub const MENTIONS_MAX: usize = 32;
 pub const BODY_MAX: usize = 64 * 1024;
 pub const WAIT_MAX: f64 = 3600.0;
 pub const LAST_MAX: i64 = 1000;
-pub const RESERVED: [&str; 5] = ["agents", "inbox", "ledger", "broadcast", "rooms"];
+pub const RESERVED: [&str; 6] = ["agents", "inbox", "ledger", "broadcast", "rooms", "history"];
+/// The services' request/response levels: RPC traffic, never shown as messages.
+pub const SERVICES: [&str; 2] = ["ledger", "history"];
 pub const ADMIN: &str = "admin";
 
 /// Bad input, an unknown address or a broker problem; the message is one line.
@@ -346,12 +348,12 @@ mod tests {
             (
                 "inbox/x",
                 false,
-                "topic 'inbox/x' is reserved: $, agents, inbox, ledger, broadcast, rooms belong to the bridge",
+                "topic 'inbox/x' is reserved: $, agents, inbox, ledger, broadcast, rooms, history belong to the bridge",
             ),
             (
                 "$SYS/x",
                 true,
-                "topic '$SYS/x' is reserved: $, agents, inbox, ledger, broadcast, rooms belong to the bridge",
+                "topic '$SYS/x' is reserved: $, agents, inbox, ledger, broadcast, rooms, history belong to the bridge",
             ),
             ("a/+", false, "+ and # are wildcards, they only work in sub"),
             ("#", true, "a filter's first level must be literal, a wildcard there would reach reserved topics"),

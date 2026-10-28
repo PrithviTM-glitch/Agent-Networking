@@ -33,12 +33,15 @@ pub fn parse_entry(line: &str) -> Option<Map> {
 
 fn open() -> Result<File> {
     config::data_dir()?;
-    let path = &config::get().log;
-    OpenOptions::new().read(true).append(true).create(true).open(path).map_err(|e| os_error(&e, Some(path)))
+    let path = config::get()?.log;
+    OpenOptions::new().read(true).append(true).create(true).open(&path).map_err(|e| os_error(&e, Some(&path)))
 }
 
 fn io(e: std::io::Error) -> crate::Error {
-    os_error(&e, Some(&config::get().log))
+    match config::get() {
+        Ok(cfg) => os_error(&e, Some(&cfg.log)),
+        Err(bad) => bad,
+    }
 }
 
 /// entry is {from, body, ts[, mentions]}; the line gets topic first, as Python writes it.
@@ -68,8 +71,8 @@ pub fn entries() -> Result<Vec<Map>> {
 /// Drop entries older than the stale period, malformed lines, and with drop_topic every entry on that topic.
 /// Without drop_topic it runs at most once per PRUNE_S (or per stale period if shorter): it rewrites the whole log.
 pub fn prune(drop_topic: Option<&str>) -> Result<()> {
-    let cfg = config::get();
-    let stamp = config::data_path(&["prune.stamp"]);
+    let cfg = config::get()?;
+    let stamp = config::data_path(&["prune.stamp"])?;
     if drop_topic.is_none()
         && let Ok(modified) = std::fs::metadata(&stamp).and_then(|m| m.modified())
         && now() - unix(modified) < PRUNE_S.min(cfg.stale_s) as f64

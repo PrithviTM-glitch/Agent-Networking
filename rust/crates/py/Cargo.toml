@@ -1,0 +1,19 @@
+[package]
+name = "agent-bridge-py"
+description = "agent_bridge._native: the Rust core as a Python extension module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+# An extension module links against the interpreter that loads it, so it has no test binary of its own.
+test = false
+doctest = false
+
+[dependencies]
+agent-bridge-core.workspace = true
+pyo3.workspace = true
+serde_json.workspace = true

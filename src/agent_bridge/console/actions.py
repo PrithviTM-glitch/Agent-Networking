@@ -7,7 +7,7 @@ import os
 import re
 import time
 
-from .. import config
+from .. import config, host
 from ..validation import check_text, is_count, is_ident
 from . import admin, events, kill, leaks, processes, sessions
 from .processes import Refused
@@ -56,20 +56,22 @@ def _restartable(b):
     cwd = v["cwd"]
     if v["kind"] != "cli" or not v["session"] or not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
         raise Refused("its session, kind or working directory is unknown")
-    return v
+    if not (h := next((h for h in host.installed() if h.name == v["framework"]), None)):
+        raise Refused("its agent framework is unknown")
+    return v, h
 
 
 def terminal(b, _peer=None):
-    v = _restartable(b)
-    return _name(v), processes.open_terminal(v["session"], v["cwd"])
+    v, h = _restartable(b)
+    return _name(v), processes.open_terminal(h, v["session"], v["cwd"])
 
 
 def resume(b, _peer=None):
-    v = _restartable(b)
+    v, h = _restartable(b)
     text = check_text(b.get("text"))
     if not text.strip():
         raise Refused("the message is empty")
-    return _name(v), processes.resume(v["key"], v["session"], v["cwd"], text)
+    return _name(v), processes.resume(h, v["key"], v["session"], v["cwd"], text)
 
 
 def release(b, _peer=None):

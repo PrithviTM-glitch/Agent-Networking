@@ -1,9 +1,10 @@
 """Claude Code hooks. Both print nothing on failure and always exit 0, so they can never block a session.
 
 broadcast (UserPromptSubmit, SessionStart): shows this session the admin console's broadcasts it has not seen. It
-reads them from the history log and never connects to the broker, so it adds no latency worth noticing. It skips
-sessions with a live relay, which delivers broadcasts itself. State: <data dir>/hook-state/<session id>, the timestamp
-of the newest broadcast already shown to that session; a session the hook has never seen gets the last FIRST_S seconds.
+asks historyd for them in one request with a 1 s timeout (a few ms while historyd is up, at once if the broker is
+down) and shows nothing if that fails. It skips sessions with a live relay, which delivers broadcasts itself. State:
+<data dir>/hook-state/<session id>, the timestamp of the newest broadcast already shown to that session; a session
+the hook has never seen gets the last FIRST_S seconds.
 
 relay_start (SessionStart): starts this session's relay in the background and returns at once. SessionStart output
 becomes context, so it prints nothing.
@@ -22,23 +23,14 @@ EVENTS = ("UserPromptSubmit", "SessionStart")
 
 
 def _broadcasts(since):
-    from . import config, history
-    from .validation import ADMIN
+    from ..history import client
 
-    out = []
-    with open(config.LOG, "rb") as f:
-        for line in f:
-            if b'"broadcast"' not in line:
-                continue
-            e = history.parse_entry(line)
-            if e and e["topic"] == "broadcast" and e["from"] == ADMIN and e["ts"] > since:
-                out.append(e)
-    return out
+    return client.broadcasts(since=since, last=SHOWN_MAX, timeout=1.0)
 
 
 def _show_broadcasts():
-    from . import config, relay
-    from .validation import UUID
+    from .. import config, relay
+    from ..validation import UUID
 
     hook = json.load(sys.stdin)
     session, event = hook.get("session_id"), hook.get("hook_event_name")
@@ -81,7 +73,7 @@ def relay_start():
     for fd in (0, 1, 2):
         os.dup2(devnull, fd)
     try:
-        from . import relay
+        from .. import relay
 
         relay.start()
     except BaseException:  # noqa: BLE001  the session must start whatever happens here

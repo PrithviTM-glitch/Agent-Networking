@@ -12,7 +12,7 @@ are one line on stderr with a non-zero exit.
 Names, addresses, rooms and caps: 1-64 ASCII letters, digits, _ or - (names at most 57, leaving room for the address
 suffix), at most 32 caps. TEXT: at most 64 KiB of UTF-8; tab, newline and CR are kept, any other control character
 (C0, DEL, C1) is refused. Raw topics: at most 256 bytes of UTF-8, no control characters, never starting with $ or the
-reserved levels agents, inbox, ledger, broadcast and rooms (only the dedicated commands touch those). + and # work
+reserved levels agents, inbox, ledger, broadcast, rooms and history (only the dedicated commands touch those). + and # work
 only in sub, as whole levels, # only last, and not as the first level. Incoming messages that are over 256 KiB, not
 UTF-8, or break these rules are dropped; plain text on a raw topic arrives with \"from\": null. \"from\" is checked for
 shape only: any local process can claim any address. Room moderation (mode, moderators, mute, ban) is advisory for

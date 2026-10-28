@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/cli", "crates/ledgerd"]
+members = ["crates/core", "crates/cli", "crates/ledgerd", "crates/py"]
 resolver = "3"
 
 [workspace.package]
@@ -14,6 +14,7 @@ bytes = "=1.12.1"
 clap = { version = "=4.6.7", features = ["derive"] }
 getrandom = "=0.4.3"
 libc = "=0.2.191"
+pyo3 = { version = "=0.30.1", features = ["extension-module", "abi3-py312"] }
 nix = { version = "=0.31.3", features = ["fs", "signal", "process", "user"] }
 rumqttc = { version = "=0.25.1", default-features = false }
 rusqlite = { version = "=0.41.0", features = ["bundled"] }

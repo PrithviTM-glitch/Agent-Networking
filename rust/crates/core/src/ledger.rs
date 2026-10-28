@@ -91,7 +91,7 @@ pub fn call(op: &str, as_: &str, fields: Map, timeout: Option<f64>) -> Result<Ma
         got: Mutex::new(None),
         cv: Condvar::new(),
     });
-    let cfg = config::get();
+    let cfg = config::get().map_err(|e| LedgerError::new(e.0))?;
     let opts = Options {
         client_id: String::new(),
         clean_start: true,

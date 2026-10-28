@@ -1,0 +1,37 @@
+name: build
+# Called by ci.yml and release.yml: manylinux wheels and the sdist, uploaded as artifacts.
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  wheels:
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          manylinux: 2_28
+          args: --release --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+  sdist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1.51.0
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error

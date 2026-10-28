@@ -295,15 +295,18 @@ impl Conn {
 
     fn run(self, first: Option<Dialed>) {
         let max = self.0.opts.reconnect;
+        // Started without a connection (Conn::start): dial at once; after a lost one, wait first.
+        let mut wait = first.is_some();
         let mut next = first;
         loop {
             let (mut stream, ack, buf) = match next.take() {
                 Some(d) => d,
-                None => match self.redial(max.unwrap_or(Duration::ZERO)) {
+                None => match self.redial(max.unwrap_or(Duration::ZERO), wait) {
                     Some(d) => d,
                     None => return,
                 },
             };
+            wait = true;
             self.attach(&stream, &ack);
             let reason = self.read_loop(&mut stream, buf);
             self.detach(reason);
@@ -313,9 +316,9 @@ impl Conn {
         }
     }
 
-    /// Wait, then dial until it works; None once closed.
-    fn redial(&self, max: Duration) -> Option<Dialed> {
-        let mut delay = Duration::from_secs(1);
+    /// Dial until it works, waiting first if wait, backing off between failures; None once closed.
+    fn redial(&self, max: Duration, wait: bool) -> Option<Dialed> {
+        let mut delay = if wait { Duration::from_secs(1) } else { Duration::ZERO };
         loop {
             let st = lock(&self.0.state);
             let (st, _) = self.0.cv.wait_timeout_while(st, delay, |s| !s.closed).unwrap_or_else(|e| e.into_inner());
@@ -326,7 +329,7 @@ impl Conn {
             if let Ok(d) = dial(&self.0.host, self.0.port, &self.0.opts) {
                 return Some(d);
             }
-            delay = (delay * 2).min(max.max(Duration::from_secs(1)));
+            delay = (delay * 2).clamp(Duration::from_secs(1), max.max(Duration::from_secs(1)));
         }
     }
 

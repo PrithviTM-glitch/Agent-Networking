@@ -1,45 +1,37 @@
-"""Who an agent is: the Claude Code session and process it runs under, and the addresses derived from them."""
+"""Who an agent is: the session and process of the agent framework it runs under (see host.py), and the addresses
+derived from them."""
 
 import functools
 import hashlib
 import os
 import re
 
-from .validation import ADMIN, UUID
+from . import host
+from .validation import ADMIN
 
-ANCESTRY_MAX = 64
-ANCESTOR = None  # where origin() starts walking up; the relay sets it, being detached from its claude process
+ANCESTOR = None  # where origin() starts walking up; the relay sets it, being detached from its session's process
 
 
 def read_proc(pid):
     """comm, ppid and start time in clock ticks of a live process, or None."""
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            stat = f.read()
-        # comm is parenthesised and may itself hold spaces or parens: only the last ")" ends it.
-        fields = stat[stat.rfind(")") + 2 :].split()
-        return {"comm": stat[stat.find("(") + 1 : stat.rfind(")")], "ppid": int(fields[1]), "start": int(fields[19])}
-    except (OSError, ValueError, IndexError):
-        return None
+    p = host.stat(pid)
+    return p and {"comm": p["comm"], "ppid": p["ppid"], "start": p["start"]}
 
 
 @functools.cache
 def origin():
-    """The Claude Code session and process this agent runs under, published in presence for the admin console."""
-    out = {"session": sid} if UUID.fullmatch(sid := os.environ.get("CLAUDE_CODE_SESSION_ID", "")) else {}
-    pid = ANCESTOR or os.getppid()
-    for _ in range(ANCESTRY_MAX):
-        if pid < 1 or not (p := read_proc(pid)):
-            break
-        if p["comm"] == "claude":
-            return {**out, "pid": pid, "pid_start": p["start"]}
-        pid = p["ppid"]
+    """The session and process this agent runs under, published in presence for the admin console."""
+    h = host.current()
+    out = {"session": sid} if (sid := h.session()) else {}
+    if p := h.process(ANCESTOR):
+        out.update(pid=p[0], pid_start=p[1])
     return out
 
 
 def project_name(path=None):
-    """A Claude Code project's default agent name: its folder name as an identifier."""
-    base = os.path.basename(path or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    """A session's default agent name: its project folder's name as an identifier."""
+    project = next((d for h in host.installed() if (d := h.project_dir())), None)
+    base = os.path.basename(path or project or os.getcwd())
     name = re.sub(r"[^A-Za-z0-9_-]+", "-", base).strip("-")[:40]
     return name if name and name.lower() != ADMIN else "agent"
 
@@ -49,5 +41,5 @@ def short_hash(text):
 
 
 def session_address(session):
-    """The fixed bus address of a Claude Code session, shared by its MCP server and its relay."""
+    """The fixed bus address of a session, shared by its MCP server and its relay."""
     return f"{project_name()}-{short_hash(session)}"
