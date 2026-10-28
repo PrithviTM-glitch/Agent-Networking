@@ -82,7 +82,11 @@ def call(op, as_=None, client=None, timeout=None, **fields):
     if as_ is not None:
         req["as"] = as_
     wait = fields.get("wait", 0)
-    timeout = timeout or 10 + (wait if isinstance(wait, (int, float)) else 0)
+    extra = min(max(wait, 0), 300) if isinstance(wait, (int, float)) and math.isfinite(wait) else 0
+    timeout = timeout or 10 + extra
+    # math.ceil and Event.wait reject infinite, NaN or huge timeouts; a bad wait is left for ledgerd to refuse.
+    if not 0 < timeout <= 3600:
+        timeout = 3600 if timeout > 3600 else 10 + extra
     c = client or connect()
     try:
         topic, pending = _channel(c)

@@ -713,6 +713,15 @@ def test_cli_and_log():
         text=True,
     )  # fmt: skip
     assert cli.returncode == 1 and "no such resource" in json.loads(cli.stdout)["error"], cli
+    for flags in (["--wait", "inf"], ["--wait", "nan"], ["--wait", "1e300"], ["--timeout", "inf"], ["--ttl", "inf"]):
+        cli = subprocess.run(
+            [sys.executable, "-m", "agent_bridge.ledger.client", "acquire", "--as", "active-a1", "--resource", "x-1/y",
+             "--level", "read", *flags],
+            capture_output=True,
+            text=True,
+        )  # fmt: skip
+        assert cli.returncode == 1 and "Traceback" not in cli.stderr, (flags, cli)
+        assert json.loads(cli.stdout)["ok"] is False, (flags, cli)
     with open(LOG) as f:
         log = f.read()
     assert "Traceback" not in log, log
