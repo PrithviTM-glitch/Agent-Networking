@@ -58,6 +58,8 @@ jobs:
           static = pathlib.Path(c.__file__).parent / "static"
           missing = [f for f in ("index.html", "app.js", "app.css") if not (static / f).is_file()]
           assert not missing, f"not packaged: {missing}"
+          licenses = pathlib.Path(c.__file__).parent.parent / "THIRD_PARTY_LICENSES.md"
+          assert "## MIT License" in licenses.read_text(), "third-party licenses not packaged"
           '
   test:
     # The Python suite as the conformance harness, against the built wheel rather than the source tree.
@@ -76,6 +78,14 @@ jobs:
           uv venv .venv-wheel
           uv pip install --python .venv-wheel/bin/python dist/*.whl pytest==9.1.1 paho-mqtt==2.1.0
       - run: .venv-wheel/bin/python -m pytest -p no:cacheprovider
+  docker:
+    # The service images Compose builds: the Python one from the root Dockerfile, the Rust ledgerd from rust/.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t agent-bridge-ci:python .
+      - run: docker run --rm --entrypoint python agent-bridge-ci:python -I -c 'import agent_bridge._native, agent_bridge.history.service, agent_bridge.ledger.service'
+      - run: docker build -t agent-bridge-ci:rust rust
   interop:
     # Python and Rust agents on one broker, the Rust tests that need Docker.
     runs-on: ubuntu-24.04

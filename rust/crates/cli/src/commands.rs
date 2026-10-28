@@ -68,7 +68,7 @@ fn shown(addr: &str, f: impl FnOnce(&Bus) -> Result<Map>) -> Result<()> {
 fn register(name: &str, caps: &str, keep: bool, addr: Option<&str>, subagent: bool) -> Result<()> {
     let _turn = addr.map(turn).transpose()?;
     let caps: Vec<String> = caps.split(',').filter(|c| !c.is_empty()).map(str::to_owned).collect();
-    let bus = Bus::register(name, &caps, keep, addr, subagent)?;
+    let bus = Bus::register(name, &caps, keep, addr, subagent, true)?;
     let addr = bus.addr.clone();
     drop(bus);
     out(&addr);
@@ -145,7 +145,7 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::Room { action: RoomCmd::Info { room } } => rooms::info(&room).map(|r| show_all(&[r])),
         Cmd::Room { action: RoomCmd::Set { addr, room, mode, rules } } => {
             let mode = mode.map(|m| m.name());
-            shown(&addr, |b| b.room_set(&room, mode.as_deref(), rules.as_deref()))
+            shown(&addr, |b| b.room_set(&room, mode.map(Value::from), rules.map(Value::from)))
         }
         Cmd::Mod { addr, room, change, target } => shown(&addr, |b| b.moderator(&room, &change.name(), &target)),
         Cmd::Mute(m) => moderation("mute", &m),
@@ -153,9 +153,9 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::Ban(m) => moderation("ban", &m),
         Cmd::Unban(m) => moderation("unban", &m),
         Cmd::Kick(m) => moderation("kick", &m),
-        Cmd::History { room, last } => history::history(&room, last).map(|h| show_all(&h)),
+        Cmd::History { room, last } => history::client::room(&room, last, None).map(|h| show_all(&h)),
         Cmd::Dm { addr, to, text } => attached(&addr, true, |b| b.dm(&to, &text)),
-        Cmd::Dms { addr, peer, last } => history::dms(&addr, peer.as_deref(), last).map(|h| show_all(&h)),
+        Cmd::Dms { addr, peer, last } => history::client::dms(&addr, peer.as_deref(), last).map(|h| show_all(&h)),
         Cmd::Sub { addr, topic } => attached(&addr, true, |b| b.sub(&topic)),
         Cmd::Unsub { addr, topic } => attached(&addr, true, |b| b.unsub(&topic)),
         Cmd::Pub { addr, topic, text } => attached(&addr, true, |b| b.publish(&topic, &text)),

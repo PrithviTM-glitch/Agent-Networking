@@ -1,5 +1,6 @@
 """The relay end to end against a fake inbox socket and a fake claude parent: one relay per session, framing,
-batching, hostile bodies, ack after write, exit with its claude process, and coexistence with the MCP server.
+batching, hostile bodies, ack after write, exit with its claude process, and coexistence with the MCP server (its
+channel notices included).
 Needs a broker with ledgerd."""
 
 import contextlib
@@ -34,7 +35,7 @@ CLAUDES = []
 
 
 @pytest.fixture(scope="module", autouse=True)
-def session_env(ledgerd):
+def session_env(ledgerd, historyd):
     """This process and its children act as one Claude Code session with an inbox socket."""
     global TMP, ADDR, FAKE
     TMP = tempfile.mkdtemp()
@@ -293,6 +294,88 @@ async def coexist(inbox, sender, console, room):
             assert [m["body"] for m in await call(s, "recv", wait=5)] == ["to mcp"]
             assert len(inbox.posts) == posts, "nothing doubled through the inbox"
             await call(s, "leave")
+
+
+def test_notices_across_owner_flip(s):
+    anyio.run(notices_across_flip, s.sender)
+
+
+async def notices_across_flip(sender):
+    """Channel notices across the relay taking the session and handing it back: none while the relay delivers, then
+    exactly one per arrival, and every replaced Bus's arrival thread ends quietly."""
+    proc = await anyio.open_process([SERVER], env=dict(os.environ), stderr=subprocess.PIPE)
+    buf, notes, ids = b"", [], iter(range(1, 1000))
+
+    async def send(msg):
+        await proc.stdin.send((json.dumps({"jsonrpc": "2.0", **msg}) + "\n").encode())
+
+    async def read():
+        nonlocal buf
+        while b"\n" not in buf:
+            buf += await proc.stdout.receive()
+        line, buf = buf.split(b"\n", 1)
+        return json.loads(line)
+
+    async def tool(name, **args):
+        n = next(ids)
+        await send({"id": n, "method": "tools/call", "params": {"name": name, "arguments": args}})
+        while (msg := await read()).get("id") != n:
+            notes.append(msg)
+        text = msg["result"]["content"][0]["text"]
+        return json.loads(text.split("\n", 1)[1] if text.startswith("UNTRUSTED") else text)
+
+    async def collect(seconds):
+        with anyio.move_on_after(seconds):
+            while True:
+                notes.append(await read())
+
+    async def delivery(mode):
+        deadline = time.monotonic() + 10
+        while (await tool("whoami"))["delivery"] != mode:
+            assert time.monotonic() < deadline, f"timed out waiting for delivery {mode}"
+            await anyio.sleep(0.1)
+
+    def threads():
+        tasks = f"/proc/{proc.pid}/task"
+        return sorted(open(f"{tasks}/{t}/comm").read().strip() for t in os.listdir(tasks))
+
+    info = {"name": "t", "version": "0"}
+    await send({"id": 0, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "clientInfo": info}})
+    assert (await read())["id"] == 0
+    await send({"method": "notifications/initialized"})
+    await delivery("recv")
+    await collect(1)
+    notes.clear()
+    before = threads()
+
+    claude = await anyio.to_thread.run_sync(session_claude)
+    await delivery("relay")
+    sender.dm(ADDR, "for the relay")
+    await collect(2)
+    assert notes == [], "a publisher-only Bus never announces messages: the relay delivers them"
+
+    await anyio.to_thread.run_sync(end, claude)
+    await delivery("recv")
+    await collect(1)
+    for n, body in enumerate(("one", "two"), 1):
+        notes.clear()
+        sender.dm(ADDR, body)
+        await collect(2)
+        assert [m["params"]["meta"] for m in notes] == [{"waiting": str(n)}], notes
+    assert [m["body"] for m in await tool("recv")] == ["one", "two"]
+    deadline = time.monotonic() + 10  # a closed connection's mqtt thread can take a few seconds to wind down
+    while threads() != before and time.monotonic() < deadline:
+        await anyio.sleep(0.1)
+    assert threads() == before, "the replaced Buses' threads are gone"
+
+    await tool("leave")
+    await proc.stdin.aclose()
+    await proc.wait()
+    err = b""
+    with contextlib.suppress(anyio.EndOfStream):
+        while True:
+            err += await proc.stderr.receive()
+    assert b"arrivals:" not in err, err.decode()
 
 
 def test_adopts_cli_agent(s):

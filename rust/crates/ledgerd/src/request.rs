@@ -1,6 +1,7 @@
 //! Request validation: the ops, their fields and every field check, with ledgerd's error texts.
 
 use agent_bridge::json::{Map, float};
+use agent_bridge::ledger::{MAX_TTL, MAX_WAIT};
 use agent_bridge::validation::{ID_MAX, is_ident};
 use serde_json::Value;
 
@@ -10,8 +11,6 @@ pub struct Bad(pub String);
 pub const ADDR: &str = "[A-Za-z0-9_-]{1,64}";
 const NAME: &str = "[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}";
 const ROWID: &str = "[0-9a-f]{16}";
-pub const MAX_TTL: f64 = 3600.0;
-pub const MAX_WAIT: f64 = 300.0;
 
 #[derive(Clone, Copy)]
 enum Check {

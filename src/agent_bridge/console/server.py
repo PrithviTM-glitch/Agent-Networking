@@ -8,11 +8,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from .. import config, rooms
-from ..history import dms
-from ..validation import BridgeError
+from .. import _native, config
+from ..history import client as history
 from . import actions, admin, auth, capacity, events, kill, leaks, metrics, processes, sessions, usage
-from .processes import Refused
+from .processes import ERRORS, Refused
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 STATIC = {
@@ -32,7 +31,10 @@ def agent_detail(query):
     v = sessions.find(query)
     out = {"agent": v, "activity": sessions.activity(v["session"]) if v["session"] else [], "dms": [], "ledger": None}
     if v["addr"]:
-        out["dms"] = dms(v["addr"], last=DMS_SHOWN)
+        try:
+            out["dms"] = history.dms(v["addr"], last=DMS_SHOWN)
+        except history.HistoryError as e:
+            out["dms_error"] = str(e)
         try:
             out["ledger"] = admin.ledger_of(v["addr"], admin.dump())
         except Refused as e:
@@ -71,7 +73,7 @@ def audit(query):
 READS = {
     "/api/state": state,
     "/api/agent": agent_detail,
-    "/api/room": lambda q: rooms.info(q.get("room")),
+    "/api/room": lambda q: _native.rooms_info(q.get("room", "")),  # "" is refused as a bad room name, None a TypeError
     "/api/room/kill": kill_preview,
     "/api/agent/stop": lambda q: kill_preview({**q, "room": None}),
     "/api/ledger": lambda _q: admin.dump(),
@@ -109,7 +111,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.stream()
             if url.path in READS:
                 return self.json(200, READS[url.path](query))
-        except (Refused, BridgeError) as e:
+        except ERRORS as e:
             return self.json(400, {"error": str(e)})
         self.json(404, {"error": "not found"})
 
@@ -139,7 +141,7 @@ class Handler(BaseHTTPRequestHandler):
         target = target[:200] if isinstance(target, str) else None
         try:
             target, result, *extra = actions.ROUTES[self.path](body, peer)
-        except (Refused, BridgeError) as e:
+        except ERRORS as e:
             actions.audit("admin", peer, action, target, f"refused: {e}")
             return self.json(400, {"error": str(e)})
         except Exception as e:  # noqa: BLE001  any failure still lands in the audit log

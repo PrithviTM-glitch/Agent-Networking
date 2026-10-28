@@ -67,10 +67,10 @@ on the network read every DM and take every lock.
    | `inbox/+` | write | Anyone may DM you (sender identity: see item 4) |
    | `room/+` | read, write | Rooms stay open, or add per-room roles |
    | `ledger/req/%u` | write | Your ledger requests, identity from the topic |
-   | `ledger/resp/%u` | read | Only you read your ledger replies |
+   | `ledger/resp/%u/#` | read | Only you read your ledger replies, on any of your connections |
    | `history/req/%u` | write | Your DMs (`dms`) and `drop`, identity from the topic |
    | `history/req` | write | Public reads only: `room`, `topic`, `broadcasts`, `ping` |
-   | `history/resp/%u` | read | Only you read your history replies |
+   | `history/resp/%u/#` | read | Only you read your history replies, on any of your connections |
    | `broadcast` | read | Admin announcements; only the admin writes |
    | raw topics | per-namespace roles | Default deny |
    | `$CONTROL/#`, `$SYS/#` | none | Admin only |
@@ -89,9 +89,13 @@ on the network read every DM and take every lock.
    - **historyd** already refuses `dms`, `drop` and `recent` on plain `history/req` and ignores the body's `as` for
      them, so the ACL above makes DM history private with no further service change. `recent` (every topic) is
      accepted only on `history/req/admin`.
-   - **The reply topic** must be exactly `ledger/resp/<addr>` (or `history/resp/<addr>`) for the same addr as the
-     request topic. Today the services only require the prefix. Phase 1 makes them refuse a mismatch, and the
-     clients already name the reply topic after their client id, which the broker pins to the username.
+   - **The reply topic** must start with the request topic's address: `ledger/resp/<addr>/<connection>` (or
+     `history/resp/...`). One agent can hold two connections at once, the relay (which owns its session, client id =
+     address) and the MCP server's publish-only Bus (its own client id), and each needs its own replies. So phase 1
+     moves the reply topic down one level, `<svc>/resp/<addr>/<client id or random>`, and the services refuse any
+     reply topic whose first level isn't the request topic's address. Today the services accept one level
+     (`[A-Za-z0-9_-]{1,128}`) and only check the prefix; the owning Bus uses its address there and a publish-only
+     Bus a random id, which the phase 1 ACL would block, hence the change.
    - **DMs** gain the sender as a topic level, `inbox/<to>/<from>`, with the agent allowed to write `inbox/+/%u`. The
      recipient trusts the topic, not `"from"`. Rooms need the same (`room/<room>/<from>`) if room authorship matters.
 5. **`ledger/resp/#` and `history/resp/#` are no longer world-readable**, which follows from the table above. A
@@ -214,7 +218,7 @@ reply that would pass about 239 KB leaves out the oldest entries and adds `"trun
 | Phase | Build | Test before moving on |
 |---|---|---|
 | 0. Contract | Freeze section 4. Add a conformance script that drives the bus and ledger with only `mosquitto_pub`/`mosquitto_sub`, no Python. | Register, DM, room, recv with ack, ledger init/acquire/release, leave, all from the non-Python client. Existing suites green. |
-| 1. Auth on loopback | `allow_anonymous false`, dynamic-security plugin, an admin-side `register` that creates the client, ACLs from section 2, `inbox/<to>/<from>` with the Bus reading identity from the topic, the services' client ids pinned. ledgerd and historyd refuse a reply topic that doesn't match the request topic's address. Plain `ledger/req` retires. The admin path from section 2 item 6, whichever the user picks. | Negative tests for each ACL row: write another's presence, read another's inbox, ledger request as another, subscribe `ledger/resp/#` or `history/resp/#`, `dms`/`drop` for another agent on either history topic, `recent` from a non-admin, connect as `ledgerd` or `historyd`, anonymous connect. All must fail. Positive suites green with credentials. Admin release/deny still works and is logged. Disabling a client disconnects it. |
+| 1. Auth on loopback | `allow_anonymous false`, dynamic-security plugin, an admin-side `register` that creates the client, ACLs from section 2, `inbox/<to>/<from>` with the Bus reading identity from the topic, the services' client ids pinned. Reply topics move to `<svc>/resp/<addr>/<connection>`, reader-first so running clients keep their replies: (1) ledgerd and historyd accept both the one-level and the two-level form; (2) both clients, owner and publish-only, switch to two levels; (3) only once no running process still uses the old client (MCP servers and relays keep their code until their session restarts) do the services refuse a first level that isn't the request topic's address, and the ACL lands. Plain `ledger/req` retires. The admin path from section 2 item 6, whichever the user picks. | Negative tests for each ACL row: write another's presence, read another's inbox, ledger request as another, subscribe `ledger/resp/#` or `history/resp/#` or another agent's `ledger/resp/<addr>/#`, a reply topic naming another agent, `dms`/`drop` for another agent on either history topic, `recent` from a non-admin, connect as `ledgerd` or `historyd`, anonymous connect. All must fail. Positive suites green with credentials. Admin release/deny still works and is logged. Disabling a client disconnects it. |
 | 2. TLS off-host | A TLS listener on the tailnet address only, a certificate from a local CA, and a tailnet ACL allowing only the broker port. | Plaintext and wrong-CA connections refused. A second device completes the full flow. Queued delivery survives a dropped link and a broker restart. Latency stays near the loopback figure. |
 | 3. Remote agents | Credential provisioning for a new device (one-time enrollment token or admin CLI) and MCP server config pointing at the remote broker. historyd already replaces per-host `history.jsonl`; it only needs its role from phase 1. | A Claude session on another device registers, chats, and takes and fences a lock. Its DMs and room posts appear in historyd from every device. Revoking the device's credentials cuts it off within seconds. |
 | 4. WebSocket (if needed) | A `protocol websockets` listener behind TLS with the same auth. | An mqtt.js client passes the phase 0 conformance flow and the phase 1 negative tests. |

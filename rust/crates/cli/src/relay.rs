@@ -187,7 +187,7 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
         Some(a) => a,
         None => identity::session_address(&session),
     };
-    let bus = Bus::register(&identity::project_name(), &[], false, Some(&addr), false)?;
+    let bus = Bus::register(&identity::project_name(), &[], false, Some(&addr), false, true)?;
     let arrived = Arc::new(Arrived::default());
     let notify = arrived.clone();
     bus.on_arrival(move || notify.set());

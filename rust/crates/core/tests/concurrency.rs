@@ -23,8 +23,8 @@ fn bodies(msgs: &[Map]) -> Vec<String> {
 #[ignore = "needs Docker"]
 fn one_bus_many_threads() {
     let _broker = common::broker("concurrency");
-    let a = Arc::new(Bus::register("conc-a", &[], false, None, false).expect("a registers"));
-    let b = Bus::register("conc-b", &[], false, None, false).expect("b registers");
+    let a = Arc::new(Bus::register("conc-a", &[], false, None, false, true).expect("a registers"));
+    let b = Bus::register("conc-b", &[], false, None, false, true).expect("b registers");
 
     // A recv blocked for up to 30 s does not hold up say, dm or join from another thread.
     let waiting = {
@@ -64,4 +64,40 @@ fn one_bus_many_threads() {
         assert!(Instant::now() < deadline, "heard only {heard:?}");
         heard.extend(bodies(&a.recv(1.0, None, None).expect("recv")));
     }
+
+    // wait_arrival: idle, it waits out its timeout; a new arrival wakes it at once; unread ones never do.
+    let t = Instant::now();
+    let (pending, seq) = a.wait_arrival(Duration::from_millis(500), u64::MAX).expect("open");
+    assert!(pending == 0 && t.elapsed() >= Duration::from_millis(400));
+    for i in 0..3 {
+        b.dm(&a.addr, &format!("burst {i}")).expect("b's dm");
+    }
+    let (pending, _) = a.wait_arrival(Duration::from_secs(5), seq).expect("open");
+    assert!(pending >= 1);
+    std::thread::sleep(Duration::from_millis(500));
+    let (_, seq) = a.wait_arrival(Duration::ZERO, seq).expect("open");
+    let t = Instant::now();
+    assert_eq!(a.wait_arrival(Duration::from_millis(500), seq).ok(), Some((3, seq)), "unread messages do not wake it");
+    assert!(t.elapsed() >= Duration::from_millis(400));
+    assert_eq!(bodies(&a.recv(1.0, None, None).expect("recv")), ["burst 0", "burst 1", "burst 2"]);
+    a.close();
+    let t = Instant::now();
+    assert_eq!(a.wait_arrival(Duration::from_secs(5), seq).unwrap_err().0, "not connected to the broker");
+    assert!(t.elapsed() < Duration::from_secs(1), "a closed Bus fails at once");
+
+    // A Bus closed while it waits to redial never comes back to kick the session's new owner.
+    let old = Bus::register("redial", &[], false, None, false, true).expect("an agent");
+    let owner = Bus::attach(&old.addr).expect("a second connection takes the session over");
+    std::thread::sleep(Duration::from_millis(200));
+    old.close();
+    let mut stamps = Vec::new();
+    for i in 0..6 {
+        b.dm(&owner.addr, &format!("steady {i}")).expect("b's dm");
+        let got = owner.recv(2.0, None, None).expect("the owner keeps receiving");
+        assert_eq!(bodies(&got), [format!("steady {i}")]);
+        stamps.push(Instant::now());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let worst = stamps.windows(2).map(|w| w[1] - w[0]).max().unwrap_or_default();
+    assert!(worst < Duration::from_millis(800), "a takeover cost the owner {worst:?}");
 }

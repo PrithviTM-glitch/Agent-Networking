@@ -19,6 +19,7 @@ from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 
 from .. import config
+from ..errors import LedgerError
 
 _channels = weakref.WeakKeyDictionary()
 _lock = threading.Lock()
@@ -27,14 +28,6 @@ _lock = threading.Lock()
 def nodelay(_c, _u, sock):
     # Without it Nagle holds each small packet for the peer's 40 ms delayed ACK, twice per request/response.
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-
-class LedgerError(Exception):
-    """An ok:false reply, a timeout or a malformed reply; .reply holds the reply dict."""
-
-    def __init__(self, reply):
-        super().__init__(reply.get("error", "ledger error"))
-        self.reply = reply
 
 
 def connect(client_id=""):

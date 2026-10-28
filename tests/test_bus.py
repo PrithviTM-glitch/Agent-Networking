@@ -19,8 +19,9 @@ import paho.mqtt.client as mqtt
 import pytest
 from conftest import BIN
 
-from agent_bridge import broker, config, history, presence, relay
+from agent_bridge import broker, config, presence, relay
 from agent_bridge.bus import Bus
+from agent_bridge.history import client as history
 from agent_bridge.protocol import ORIGIN
 from agent_bridge.validation import BODY_MAX, BridgeError, is_ident
 
@@ -115,13 +116,8 @@ def raises(fn, *args, **kw):
     raise AssertionError(f"{fn.__name__}{args} accepted bad input")
 
 
-def log_lines():
-    with open(config.LOG) as f:
-        return list(map(json.loads, f))
-
-
 @pytest.fixture(scope="module")
-def s(ledgerd):
+def s(ledgerd, historyd):
     """What the scenario carries from one test to the next."""
     return SimpleNamespace()
 
@@ -202,7 +198,7 @@ def test_leave(s):
     run("leave", r3)
     assert r3 not in agents()
     run("dm", a, r3, "x", ok=False)
-    assert not any(e["topic"] == f"inbox/{r3}" for e in log_lines()), "DMs go too"
+    assert history.dms(r3) == [], "its DMs go too"
 
 
 def test_bus_library(s):
@@ -307,21 +303,6 @@ def test_presence_cache(s, monkeypatch):
         pass
 
 
-def test_prune_runs_at_most_hourly(s):
-    """register prunes the log only when the last prune is an hour old; leave's targeted prune always runs."""
-    history.append(f"room/{DEMO}", {"from": s.a, "body": "ancient", "ts": 1.0})
-    run("leave", run("register", "early"))
-    assert "ancient" not in bodies("history", DEMO, "--last", "1000"), "leave prunes"
-    history.append(f"room/{DEMO}", {"from": s.a, "body": "ancient", "ts": 1.0})
-    probe = run("register", "throttled")
-    assert "ancient" in bodies("history", DEMO, "--last", "1000"), "a prune just ran: register skips it"
-    os.utime(config.data_path("prune.stamp"), (0, 0))
-    late = run("register", "late")
-    assert "ancient" not in bodies("history", DEMO, "--last", "1000"), "an hour on, register prunes again"
-    run("leave", late)
-    run("leave", probe)
-
-
 def test_idle_expiry(s):
     short = {"AGENT_BRIDGE_STALE_DAYS": str(2 / 86400)}
     brief = run("register", "brief", env_extra=short)
@@ -401,27 +382,6 @@ def test_forged_presence(s):
     for t in [f"agents/{x}" for x in forged] + odd_topics:
         raw_pub(evil, t, b"", retain=True)
     evil.loop_stop()
-
-
-def test_junk_log_lines(s):
-    a, b = s.a, s.b
-    with open(config.LOG, "ab") as f:
-        f.write(b"not json\n{}\n[]\n\xff\xfe\n" + b"[" * 100_000 + b"\n")
-        f.write(
-            f'{{"topic": 5, "from": "a", "body": "x", "ts": 1}}\n'
-            f'{{"topic": "room/{DEMO}", "from": "a", "body": "\\u0000", "ts": 1}}\n'.encode()
-        )
-        f.write(
-            f'{{"topic": "room/{DEMO}", "from": "a b", "body": "x", "ts": 1}}\n'
-            f'{{"topic": "room/{DEMO}", "from": "a", "body": "x", "ts": NaN}}\n'.encode()
-        )
-    run("say", a, DEMO, "after junk")
-    run("dm", a, b, "dm after junk")
-    room, mine = bodies("history", DEMO, "--last", "1000"), bodies("dms", b, "--last", "1000")
-    assert room[-1] == "after junk" and "x" not in room and mine[-1] == "dm after junk", "junk lines are skipped"
-    run("leave", run("register", "pruner"))
-    with open(config.LOG) as f:
-        assert all(isinstance(json.loads(line), dict) for line in f), "prune drops junk lines"
 
 
 def test_ledger_commands(s):
@@ -610,7 +570,7 @@ def test_broadcast(s):
         "a session from before broadcast picks it up on its next attach"
     )
     assert "broadcast" not in agents()[off]["topics"] and "broadcast" not in {r["room"] for r in lines("rooms")}
-    logged = [e for e in log_lines() if e["topic"] == "broadcast"][-1]
+    logged = history.broadcasts()[-1]
     assert {"topic": "broadcast", "from": "admin", "body": "maintenance at noon"}.items() <= logged.items()
     for args in (
         ["pub", off, "broadcast", "x"],
@@ -743,7 +703,6 @@ def test_bad_arguments(s):
         fails(*args)
     for extra in BAD_ENV:
         fails("agents", env_extra=extra)
-    fails("history", DEMO, env_extra={"AGENT_BRIDGE_LOG": "/proc/nope/history.jsonl"})
     for fn, args in [
         (lib.say, ("libroom", 5)),
         (lib.say, ("libroom", "a\x00b")),

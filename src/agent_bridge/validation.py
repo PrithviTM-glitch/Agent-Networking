@@ -9,6 +9,8 @@ whole levels, # only last, and not as the first level.
 
 import re
 
+from .errors import BridgeError  # noqa: F401  defined once, with the other errors, raised by _native too
+
 ID_MAX, NAME_MAX = 64, 57
 CAPS_MAX, TOPICS_MAX, TOPIC_MAX, MENTIONS_MAX = 32, 100, 256, 32
 BODY_MAX = 64 * 1024
@@ -20,10 +22,6 @@ IDENT = re.compile(r"[A-Za-z0-9_-]+")
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 BODY_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-
-
-class BridgeError(Exception):
-    """Bad input, an unknown address or a broker problem; the message is one line."""
 
 
 def show(value):

@@ -216,6 +216,25 @@ def test_service_records_and_serves(svc):
     bo.leave()
 
 
+# phase 2 from here
+def test_clients_read_through_historyd(svc):
+    """The CLI's history and dms, the Bus's dms and leave all go through historyd."""
+    al, bo = Bus.register("al"), Bus.register("bo")
+    room = f"c{RUN}"
+    al.join(room)
+    al.say(room, "said")
+    al.dm(bo.addr, "to bo")
+    bo.dm(al.addr, "to al")
+    assert wait_for(lambda: len(client.dms(bo.addr)) == 2, 5)
+    assert [m["body"] for m in cli("history", room, "--last", "1")] == ["said"]
+    assert [m["body"] for m in cli("dms", bo.addr)] == ["to bo", "to al"]
+    assert [m["body"] for m in bo.dms(al.addr)] == ["to bo", "to al"]
+    assert al.leave() is None, "ledger and DMs dropped without a warning"
+    assert [m for m in client.dms(al.addr) if m["topic"] == f"inbox/{al.addr}"] == [], "al's inbox went with al"
+    bo.leave()
+
+
+# phase 2 to here
 def test_restart_keeps_history_and_catches_up(svc):
     db, log, proc = svc
     room = f"r{RUN}"
@@ -225,6 +244,8 @@ def test_restart_keeps_history_and_catches_up(svc):
     proc.kill()
     proc.wait()
     sender.say(room, "while historyd was down")  # sending never depends on historyd
+    err = cli("history", room, ok=False)  # phase 2
+    assert err.startswith("history: no reply from historyd"), err  # phase 2
     with pytest.raises(client.HistoryError):
         client.broadcasts(timeout=0.5)
     svc_proc = start_historyd(db, log)

@@ -7,6 +7,7 @@ use crate::broker::{self, TIMEOUT};
 use crate::json::{Map, dumps_map, float, now};
 use crate::mqtt::{Ack, Conn, Handler, Message, filter};
 use crate::protocol::{BROADCAST, parse_message, parse_presence};
+use crate::request::Replies;
 use crate::validation::{
     ADMIN, Error, ID_MAX, NAME_MAX, Result, TOPICS_MAX, check_body, check_caps, check_ident, check_ident_cap,
     check_topic, check_wait, fail, is_ident, not_admin,
@@ -45,6 +46,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// What the reader thread maintains for the Bus.
 struct Shared {
     addr: String,
+    /// false for a publish-only connection that leaves the agent's session to the process owning it
+    owner: bool,
+    /// ledger/resp/<this>, history/resp/<this>: the client id, or a random one when it has none
+    reply_id: String,
+    replies: Replies,
     st: Mutex<Cache>,
     cv: Condvar,
     on_arrival: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -57,6 +63,8 @@ struct Cache {
     /// address -> presence record, kept current by the agents/+ subscription
     agents: HashMap<String, Map>,
     buf: VecDeque<(Option<Ack>, Map)>,
+    /// how many messages were ever buffered, for wait_arrival
+    arrivals: u64,
     /// the agent's topics, subscribed afresh when the broker lost the session
     topics: Vec<String>,
     up: bool,
@@ -95,7 +103,12 @@ impl Handler for Shared {
             wanted.push(format!("inbox/{}", self.addr));
             wanted.extend(topics);
         }
-        let barrier = conn.subscribe(wanted.iter().map(|t| filter(t, true, true)).collect()).ok();
+        let barrier = if self.owner {
+            conn.subscribe(wanted.iter().map(|t| filter(t, true, true)).collect()).ok()
+        } else {
+            // never subscribed here: only the barrier
+            conn.unsubscribe(vec![format!("inbox/{}", self.addr)]).ok()
+        };
         let mut c = self.lock();
         c.barrier = barrier;
         c.up = true;
@@ -119,6 +132,14 @@ impl Handler for Shared {
 
     fn message(&self, conn: &Conn, m: Message) {
         let Some(topic) = m.topic else { return conn.ack(m.ack) };
+        // Service replies are acked at once and never buffered, so they cannot fill the receive window.
+        if let Some((_, id)) = topic.split_once("/resp/")
+            && id == self.reply_id
+            && (topic.starts_with("ledger/") || topic.starts_with("history/"))
+        {
+            self.replies.fill(m.correlation.as_ref(), m.payload);
+            return conn.ack(m.ack);
+        }
         for (prefix, is_room) in [("rooms/", true), ("agents/", false)] {
             if let Some(key) = topic.strip_prefix(prefix) {
                 if is_ident(key, ID_MAX) {
@@ -138,6 +159,7 @@ impl Handler for Shared {
             // Unacked QoS 1 messages are already capped by ReceiveMaximum, only QoS 0 floods need BUFFER_MAX.
             if m.qos > 0 || c.buf.len() < BUFFER_MAX {
                 c.buf.push_back(((m.qos > 0).then_some(m.ack), msg));
+                c.arrivals += 1;
                 self.cv.notify_all();
                 drop(c);
                 if let Some(f) = lock(&self.on_arrival).as_ref() {
@@ -159,15 +181,22 @@ fn str_of<'a>(rec: &'a Map, key: &str) -> Option<&'a str> {
 }
 
 impl Bus {
-    fn open(addr: &str, rec: Map) -> Result<Bus> {
+    fn open(addr: &str, rec: Map, owner: bool) -> Result<Bus> {
         let shared = Arc::new(Shared {
             addr: addr.to_owned(),
+            owner,
+            reply_id: if owner { addr.to_owned() } else { ledger::random_hex(16) },
+            replies: Replies::default(),
             st: Mutex::new(Cache { topics: topics_of(&rec), ..Default::default() }),
             cv: Condvar::new(),
             on_arrival: Mutex::new(None),
         });
         // mosquitto only writes a session to disk if its latest connect had clean_start=False, even under MQTT 5.
-        let conn = broker::connect(addr, false, presence::expiry(&rec)?, true, shared.clone())?;
+        let conn = if owner {
+            broker::connect(addr, false, presence::expiry(&rec)?, true, shared.clone())?
+        } else {
+            broker::connect("", true, 0, true, shared.clone())?
+        };
         Ok(Bus {
             addr: addr.to_owned(),
             rec: Mutex::new(rec),
@@ -191,9 +220,15 @@ impl Bus {
 
     /// Attach to a live address.
     pub fn attach(addr: &str) -> Result<Bus> {
+        Bus::attach_as(addr, true)
+    }
+
+    /// Attach to a live address; owner=false publishes as the agent over a connection of its own, leaving the
+    /// agent's session (subscriptions, queued messages) to the process that owns it, such as its relay.
+    pub fn attach_as(addr: &str, owner: bool) -> Result<Bus> {
         let addr = check_ident(addr, "address")?;
         let rec = presence::need(addr)?;
-        let bus = Bus::open(addr, rec)?;
+        let bus = Bus::open(addr, rec, owner)?;
         let rec = bus.rec();
         if bus.fresh_pid(&rec).iter().any(|(k, v)| rec.get(k) != Some(v)) {
             bus.touch(&lock(&bus.writing), false)?;
@@ -204,7 +239,14 @@ impl Bus {
     /// Join the bus. With addr, reattach to it if it is live (its record stays as is), else create it.
     /// subagent marks a subagent's own agent: "kind": "subagent" and the creating session as "parent" instead of
     /// "session", so neither the session's relay nor the console mistakes it for the session itself.
-    pub fn register(name: &str, caps: &[String], keep: bool, addr: Option<&str>, subagent: bool) -> Result<Bus> {
+    pub fn register(
+        name: &str,
+        caps: &[String],
+        keep: bool,
+        addr: Option<&str>,
+        subagent: bool,
+        owner: bool,
+    ) -> Result<Bus> {
         not_admin(Some(name), "name")?;
         not_admin(addr, "address")?;
         let cap = if addr.is_some_and(|a| !a.is_empty()) { ID_MAX } else { NAME_MAX };
@@ -232,8 +274,7 @@ impl Bus {
             }
             None => format!("{name}-{}", ledger::random_hex(3)),
         };
-        history::prune(None)?;
-        let bus = Bus::open(&addr, rec)?;
+        let bus = Bus::open(&addr, rec, owner)?;
         bus.touch(&lock(&bus.writing), false)?;
         Ok(bus)
     }
@@ -249,8 +290,7 @@ impl Bus {
             Some(live) => rec = live,
             None => presence::wipe(ADMIN)?,
         }
-        history::prune(None)?;
-        let mut bus = Bus::open(ADMIN, rec)?;
+        let mut bus = Bus::open(ADMIN, rec, true)?;
         bus.admin = true;
         bus.touch(&lock(&bus.writing), false)?;
         Ok(bus)
@@ -322,6 +362,9 @@ impl Bus {
 
     /// Subscribe or unsubscribe; true if that changed the agent's topics.
     fn subscribe(&self, topic: &str, on: bool) -> Result<bool> {
+        if !self.shared.owner {
+            return self.owner_does(|b| b.subscribe(topic, on));
+        }
         let writing = lock(&self.writing);
         // the whole record: another process may have changed any of it
         let mut rec = self.current()?;
@@ -375,18 +418,104 @@ impl Bus {
             entry.insert("mentions".into(), m.into());
         }
         self.ready()?;
-        broker::publish(&self.conn(), topic, dumps_map(&entry), false, None)?;
-        history::append(topic, &entry)
+        // historyd records it from the bus
+        broker::publish(&self.conn(), topic, dumps_map(&entry), false, None)
     }
 
-    /// Delete this agent: its ledger, session, queued messages, presence and received DMs in the log. Its rooms get
-    /// a "[left #room]" message. Returns a warning if ledgerd could not drop the ledger; the agent leaves regardless.
-    /// The Bus is closed afterwards: later calls fail with "not connected to the broker".
+    /// Subscriptions and session expiry live in the agent's session: change them through a brief owner connection,
+    /// which takes the session over from its owner until that reconnects.
+    fn owner_does<T>(&self, f: impl FnOnce(&Bus) -> Result<T>) -> Result<T> {
+        let b = Bus::attach(&self.addr)?;
+        let result = f(&b);
+        self.set_rec(b.rec());
+        result
+    }
+
+    /// Does this connection own the agent's session (receive its messages), or only publish as the agent?
+    pub fn owner(&self) -> bool {
+        self.shared.owner
+    }
+
+    /// One ledgerd request over this connection, as this agent or, for the console, as_ (an owner it acts for).
+    /// Replies come back on ledger/resp/<this client id>, acked by the reader thread and never buffered.
+    pub fn ledger(
+        &self,
+        op: &str,
+        as_: Option<&str>,
+        fields: Map,
+        timeout: Option<f64>,
+    ) -> std::result::Result<Map, ledger::LedgerError> {
+        self.ledger_value(op.into(), as_.map(Value::from), fields, timeout)
+    }
+
+    /// ledger with op and as_ as a caller gave them (as_ None: this agent); ledgerd refuses what is wrong with them.
+    pub fn ledger_value(
+        &self,
+        op: Value,
+        as_: Option<Value>,
+        fields: Map,
+        timeout: Option<f64>,
+    ) -> std::result::Result<Map, ledger::LedgerError> {
+        let topic = format!("ledger/resp/{}", self.shared.reply_id);
+        let as_ = as_.unwrap_or_else(|| Value::from(self.addr.as_str()));
+        ledger::call_over(&self.conn(), &self.shared.replies, &topic, op, Some(as_), fields, timeout)
+    }
+
+    /// One historyd request over this connection, as this agent when as_agent (dms, drop), else on plain
+    /// history/req.
+    pub fn history_call(
+        &self,
+        op: impl Into<Value>,
+        as_agent: bool,
+        fields: Map,
+        timeout: f64,
+    ) -> std::result::Result<Map, history::client::HistoryError> {
+        let topic = format!("history/resp/{}", self.shared.reply_id);
+        let as_ = as_agent.then(|| Value::from(self.addr.as_str()));
+        history::client::call_over(&self.conn(), &self.shared.replies, &topic, op.into(), as_, fields, timeout)
+    }
+
+    /// This agent's direct messages in both directions, oldest first; with peer, only those with peer.
+    pub fn dms(&self, peer: Option<&str>, last: i64) -> Result<Vec<Map>> {
+        if let Some(p) = peer {
+            check_ident(p, "address")?;
+        }
+        crate::validation::check_last(last)?;
+        let mut f = Map::new();
+        f.insert("peer".into(), peer.map_or(Value::Null, Value::from));
+        f.insert("last".into(), last.into());
+        let reply = self.history_call("dms", true, f, history::client::TIMEOUT)?;
+        Ok(reply
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.as_object().cloned())
+            .collect())
+    }
+
+    /// Delete this agent: its ledger, the DMs it received in history, its session, queued messages and presence.
+    /// Its rooms get a "[left #room]" message. Returns a warning if ledgerd or historyd could not drop what it holds;
+    /// the agent leaves the bus regardless. The Bus is closed afterwards: later calls fail with "not connected to the
+    /// broker".
     pub fn leave(&self) -> Result<Option<String>> {
-        let warning = match ledger::call("drop", &self.addr, Map::new(), Some(3.0)) {
-            Err(e) if !e.to_string().starts_with("no ledger for") => Some(format!("ledger not dropped: {e}")),
-            _ => None,
-        };
+        // Both drops go over this connection at once, so a service that is down costs its 3 s only once.
+        let (ledger, history) = std::thread::scope(|s| {
+            let history = s.spawn(|| self.history_call("drop", true, Map::new(), history::client::DROP_TIMEOUT));
+            let ledger = self.ledger("drop", None, Map::new(), Some(3.0));
+            (ledger, history.join())
+        });
+        let mut warnings = Vec::new();
+        if let Err(e) = ledger
+            && !e.to_string().starts_with("no ledger for")
+        {
+            warnings.push(format!("ledger not dropped: {e}"));
+        }
+        match history {
+            Ok(Err(e)) => warnings.push(format!("DMs not dropped: {e}")),
+            Err(_) => warnings.push("DMs not dropped: history: internal error".into()),
+            Ok(Ok(_)) => {}
+        }
         for topic in topics_of(&self.current()?) {
             if let Some(room) = topic.strip_prefix("room/") {
                 let _ = self.announce(room, "left");
@@ -394,8 +523,7 @@ impl Bus {
         }
         self.close();
         presence::wipe(&self.addr)?;
-        history::prune(Some(&format!("inbox/{}", self.addr)))?;
-        Ok(warning)
+        Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
     }
 
     /// Change how other agents see this one; the address stays.
@@ -417,6 +545,9 @@ impl Bus {
 
     /// on exempts the agent from idle expiry, off opts back in.
     pub fn keep(&self, on: bool) -> Result<()> {
+        if !self.shared.owner {
+            return self.owner_does(|b| b.keep(on));
+        }
         let writing = lock(&self.writing);
         let mut rec = self.current()?;
         rec.insert("keep".into(), on.into());
@@ -507,6 +638,9 @@ impl Bus {
     /// or with deliver once deliver(messages) returns; if it fails they go back to the buffer.
     pub fn recv(&self, wait: f64, limit: Option<usize>, deliver: Option<Deliver>) -> Result<Vec<Map>> {
         check_wait(wait)?;
+        if !self.shared.owner {
+            return fail("this connection does not own the agent's session, its owner receives the messages");
+        }
         // while reconnecting, buffered messages may still be resent, so wait until connected() sorted them
         self.ready()?;
         if lock(&self.touched).is_none_or(|t| t.elapsed() > TOUCH) {
@@ -545,6 +679,22 @@ impl Bus {
             }
         }
         Ok(msgs)
+    }
+
+    /// Wait up to timeout for a message newer than arrival number after: (messages buffered, newest arrival number).
+    /// Unread messages that arrived before do not wake it, so a notice loop fires once per new arrival, never spins.
+    /// A closed Bus fails at once, so such a loop ends instead of spinning; a reconnecting one just waits.
+    pub fn wait_arrival(&self, timeout: Duration, after: u64) -> Result<(usize, u64)> {
+        let c = self.shared.lock();
+        let (c, _) = self
+            .shared
+            .cv
+            .wait_timeout_while(c, timeout, |c| c.arrivals <= after && !c.closed)
+            .unwrap_or_else(|e| e.into_inner());
+        if c.closed {
+            return fail("not connected to the broker");
+        }
+        Ok((c.buf.len(), c.arrivals))
     }
 
     /// How many messages are buffered, not yet received.
@@ -597,18 +747,20 @@ impl Bus {
     }
 
     /// Change a room's mode ("open" or "announce") and/or its rules text; admin or a moderator only.
-    pub fn room_set(&self, room: &str, mode: Option<&str>, rules: Option<&str>) -> Result<Map> {
+    /// mode and rules are checked only once the caller may change the room, as given (any JSON value).
+    pub fn room_set(&self, room: &str, mode: Option<Value>, rules: Option<Value>) -> Result<Map> {
         if mode.is_none() && rules.is_none() {
             return fail("nothing to change: give mode or rules");
         }
         self.moderate(room, |_| {
             let (mut fields, mut notes) = (Map::new(), Vec::new());
             if let Some(mode) = mode {
-                fields.insert("mode".into(), rooms::check_mode(&mode.into())?.into());
+                let mode = rooms::check_mode(&mode)?;
                 notes.push(format!("[mode #{room}] {mode}"));
+                fields.insert("mode".into(), mode.into());
             }
             if let Some(rules) = rules {
-                fields.insert("rules".into(), rooms::check_rules(&rules.into())?.into());
+                fields.insert("rules".into(), rooms::check_rules(&rules)?.into());
                 notes.push(format!("[rules #{room}] updated"));
             }
             Ok((fields, notes))

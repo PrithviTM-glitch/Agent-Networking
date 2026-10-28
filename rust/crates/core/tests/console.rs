@@ -26,7 +26,7 @@ fn observer_admin_and_describe() {
     let obs = Observer::open().expect("the observer starts");
     until(&obs, "its connect", |e| matches!(e, Event::Connected));
 
-    let a = Bus::register("watched", &[], false, None, false).expect("an agent registers");
+    let a = Bus::register("watched", &[], false, None, false, true).expect("an agent registers");
     until(&obs, "the agent's presence", |e| matches!(e, Event::Presence { addr, rec: Some(_) } if *addr == a.addr));
 
     let admin = Bus::register_admin().expect("the console's identity");
@@ -34,7 +34,7 @@ fn observer_admin_and_describe() {
     let rec = presence::find("admin").unwrap().expect("admin is live");
     assert!(rec["keep"] == true && !rec.contains_key("session") && !rec.contains_key("pid"), "{rec:?}");
 
-    admin.room_set("watched-room", Some("announce"), None).expect("admin sets a room");
+    admin.room_set("watched-room", Some("announce".into()), None).expect("admin sets a room");
     until(
         &obs,
         "the room record",
@@ -61,4 +61,26 @@ fn observer_admin_and_describe() {
     );
     assert_eq!(a.describe(Some("Admin"), None).unwrap_err().0, "name 'Admin' is reserved for the admin console");
     assert_eq!(obs.dropped(), 0);
+
+    // A publish-only Bus (the MCP server's while a relay owns the session) speaks as the agent but never receives;
+    // its join goes through a brief owner connection, and the owner gets the room's messages.
+    let publisher = Bus::attach_as(&a.addr, false).expect("a publish-only Bus");
+    assert!(!publisher.owner() && a.owner());
+    assert_eq!(
+        publisher.recv(0.0, None, None).unwrap_err().0,
+        "this connection does not own the agent's session, its owner receives the messages"
+    );
+    publisher.join("pub-room").expect("join through the owner");
+    let rec = presence::find(&a.addr).unwrap().expect("live");
+    assert!(presence::topics(&rec).any(|t| t == "room/pub-room"), "{rec:?}");
+    admin.say("pub-room", "for the owner").expect("admin says");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut heard = Vec::new();
+    while !heard.iter().any(|b| b == "for the owner") {
+        assert!(Instant::now() < deadline, "the owner heard only {heard:?}");
+        heard.extend(
+            a.recv(1.0, None, None).unwrap_or_default().iter().map(|m| m["body"].as_str().unwrap_or("").to_owned()),
+        );
+    }
+    publisher.say("pub-room", "from the publisher").expect("the publisher speaks as a");
 }

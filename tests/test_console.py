@@ -365,9 +365,10 @@ def test_messaging():
     services = [e for e in ev.items if e["kind"] == "msg" and e["msg"]["topic"].split("/")[0] in ("history", "ledger")]
     assert not services, services
     assert ev.find(lambda e: e["kind"] == "msg" and e["msg"]["topic"] == "broadcast")
-    st = req("GET", "/api/state")[1]
-    bodies = {(m["topic"], m["body"]) for m in st["messages"]}
-    assert ("broadcast", "everyone stop pushing to main") in bodies and ("room/ops", "hello room") in bodies
+    want = {("broadcast", "everyone stop pushing to main"), ("room/ops", "hello room")}
+    # The backlog comes from historyd, which records what it sees on the bus a moment later.
+    assert wait_for(lambda: want <= {(m["topic"], m["body"]) for m in req("GET", "/api/state")[1]["messages"]})
+    bodies = {(m["topic"], m["body"]) for m in req("GET", "/api/state")[1]["messages"]}
     assert not [t for t, _ in bodies if t.split("/")[0] in ("history", "ledger")], bodies
     for c in (w, other):
         c.disconnect()

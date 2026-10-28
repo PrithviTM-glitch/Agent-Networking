@@ -122,22 +122,50 @@ def pytest_configure(config):
 # bridge-core's checklist of bus behaviours, by name, and the tests that pin each; the summary reports them, so the
 # cutover gate shows which behaviour an implementation breaks rather than only which test failed.
 BEHAVIOURS = {
-    "write-once origin": ["tests/test_bus.py::test_subagents_and_write_once_origin"],
-    "subagent lineage": [
-        "tests/test_bus.py::test_subagents_and_write_once_origin",
-        "tests/test_relay.py::test_adopts_cli_agent",
-    ],
-    "whole-record refresh before republishing": ["tests/test_bus.py::test_presence_cache"],
-    "caches reset on reconnect": ["tests/test_bus.py::test_presence_cache", "tests/test_bus.py::test_broker_restart"],
-    "for_me and the quiet backlog": [
-        "tests/test_mentions.py::test_names_addresses_and_all_resolve",
-        "tests/test_relay.py::test_mentions_wake_only_the_mentioned",
-    ],
-    "relay lock line 2 and held()": ["tests/test_relay.py::test_mentions_wake_only_the_mentioned"],
-    "moderation at recv time": [
-        "tests/test_rooms.py::test_mute_stops_posts_and_spoofed_ones",
-        "tests/test_mentions.py::test_moderation_still_applies",
-    ],
+    name: [*tests, *(f"tests/test_conformance.py::{conformance}[{impl}]" for impl in ("python", "native"))]
+    for name, tests, conformance in (
+        (
+            "write-once origin",
+            ["tests/test_bus.py::test_subagents_and_write_once_origin"],
+            "test_origin_is_written_once",
+        ),
+        (
+            "subagent lineage",
+            ["tests/test_bus.py::test_subagents_and_write_once_origin", "tests/test_relay.py::test_adopts_cli_agent"],
+            "test_subagent_keeps_its_lineage",
+        ),
+        (
+            "whole-record refresh before republishing",
+            ["tests/test_bus.py::test_presence_cache"],
+            "test_a_join_keeps_what_another_process_changed",
+        ),
+        (
+            "caches reset on reconnect",
+            ["tests/test_bus.py::test_presence_cache", "tests/test_bus.py::test_broker_restart"],
+            "test_presence_cache_resets_on_reconnect",
+        ),
+        (
+            "for_me and the quiet backlog",
+            [
+                "tests/test_mentions.py::test_names_addresses_and_all_resolve",
+                "tests/test_relay.py::test_mentions_wake_only_the_mentioned",
+            ],
+            "test_recv_marks_mentions_for_me",
+        ),
+        (
+            "relay lock line 2 and held()",
+            ["tests/test_relay.py::test_mentions_wake_only_the_mentioned"],
+            "test_relay_lock_names_the_relayed_agent",
+        ),
+        (
+            "moderation at recv time",
+            [
+                "tests/test_rooms.py::test_mute_stops_posts_and_spoofed_ones",
+                "tests/test_mentions.py::test_moderation_still_applies",
+            ],
+            "test_moderation_applies_at_recv",
+        ),
+    )
 }
 
 

@@ -12,7 +12,8 @@ import threading
 import time
 import uuid
 
-from . import broker, config, history, identity, presence, rooms
+from . import broker, config, identity, presence, rooms
+from .history import client as history
 from .ledger import client as ledger
 from .protocol import BROADCAST, parse_message, parse_presence
 from .validation import (
@@ -40,7 +41,7 @@ class Bus:
     agents = staticmethod(presence.agents)
     room_info = staticmethod(rooms.info)  # before the next line, whose attribute shadows the rooms module here
     rooms = staticmethod(rooms.listing)
-    history = staticmethod(history.history)
+    history = staticmethod(history.room)
 
     def __init__(self, addr, rec=None, owner=True):
         """Attach to a live address; rec is only for register. owner=False publishes as the agent over a connection
@@ -92,7 +93,6 @@ class Bus:
             presence.wipe(addr)
         else:
             addr = f"{name}-{uuid.uuid4().hex[:6]}"
-        history.prune()
         bus = cls(addr, rec, owner)
         bus._admin = admin
         bus._touch(refresh=False)
@@ -241,26 +241,28 @@ class Bus:
         if mentions:
             entry["mentions"] = mentions
         self._ready()
-        broker.publish(self._c, topic, json.dumps(entry))
-        history.append(topic, entry)
+        broker.publish(self._c, topic, json.dumps(entry))  # historyd records it from the bus
 
     def ledger(self, op, **fields):
         """One ledgerd request as this agent, over this connection; raises LedgerError."""
         return ledger.call(op, as_=self.addr, client=self._c, **fields)
 
     def leave(self):
-        """Delete this agent: its ledger, session, queued messages, presence and received DMs in the log. Its rooms
-        get a "[left #room]" message.
-        Returns a warning if ledgerd could not drop the ledger; the agent leaves the bus regardless."""
-        warning = _drop_ledger(lambda: self.ledger("drop", timeout=3))
+        """Delete this agent: its ledger, the DMs it received in history, its session, queued messages and presence.
+        Its rooms get a "[left #room]" message. Returns a warning if ledgerd or historyd could not drop what it holds;
+        the agent leaves the bus regardless."""
+        warnings = [_drop_ledger(lambda: self.ledger("drop", timeout=3))]
+        try:
+            history.drop(self.addr, client=self._c)
+        except history.HistoryError as e:
+            warnings.append(f"DMs not dropped: {e}")
         for topic in (self._seen(self.addr) or self.rec)["topics"]:
             if topic.startswith("room/"):
                 with contextlib.suppress(BridgeError):
                     self._announce(topic[5:], "left")
         self.close()
         presence.wipe(self.addr)
-        history.prune(drop_topic=f"inbox/{self.addr}")
-        return warning
+        return "; ".join(w for w in warnings if w) or None
 
     def describe(self, name=None, caps=None):
         """Change how other agents see this one; the address stays."""
@@ -328,7 +330,7 @@ class Bus:
         self._send(check_topic(topic), body)
 
     def dms(self, peer=None, last=20):
-        return history.dms(self.addr, peer, last)
+        return history.dms(self.addr, peer, last, client=self._c)
 
     def pending(self):
         with self._cv:

@@ -1,15 +1,13 @@
-//! Client for ledgerd: call(op, as, fields) returns the reply or a LedgerError, over a connection of its own.
+//! Client for ledgerd: call(op, as, fields) returns the reply or a LedgerError, over a connection of its own;
+//! call_over does the same over an existing one, such as an agent's Bus.
 
 use crate::config;
 use crate::json::{Map, dumps};
-use crate::mqtt::{Conn, DialError, Handler, Message, Options, filter};
-use crate::validation::{ID_MAX, is_ident};
-use bytes::Bytes;
-use rumqttc::v5::mqttbytes::v5::PublishProperties;
+use crate::mqtt::{Conn, DialError, Handler, Message, Options};
+use crate::request::{self, Replies};
 use serde_json::Value;
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 /// An ok:false reply, a timeout or a malformed reply; reply holds the reply.
 #[derive(Debug)]
@@ -18,7 +16,7 @@ pub struct LedgerError {
 }
 
 impl LedgerError {
-    fn new(error: impl Into<String>) -> LedgerError {
+    pub fn new(error: impl Into<String>) -> LedgerError {
         let mut reply = Map::new();
         reply.insert("ok".into(), false.into());
         reply.insert("error".into(), error.into().into());
@@ -56,42 +54,79 @@ pub fn fmt_g(v: f64) -> String {
     if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_owned() } else { s }
 }
 
-struct Reply {
-    topic: String,
-    corr: Bytes,
-    got: Mutex<Option<Bytes>>,
-    cv: Condvar,
-}
+/// The limits ledgerd enforces, exported so clients and tests follow the implementation.
+pub const MAX_LEDGERS: i64 = 1000;
+pub const MAX_RESOURCES: i64 = 128;
+pub const MAX_PENDING: i64 = 64;
+pub const MAX_LEASES: i64 = 256;
+pub const MAX_WAITERS: i64 = 256;
+/// stored requests per holder, any status
+pub const MAX_REQUESTS: i64 = 512;
+pub const MAX_TTL: f64 = 3600.0;
+pub const MAX_WAIT: f64 = 300.0;
 
-impl Handler for Reply {
+/// Collects the replies to a connection of its own.
+struct Own(Replies);
+
+impl Handler for Own {
     fn message(&self, _conn: &Conn, msg: Message) {
-        if msg.topic.as_deref() == Some(&self.topic) && msg.correlation.as_ref() == Some(&self.corr) {
-            *self.got.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.payload);
-            self.cv.notify_all();
-        }
+        self.0.fill(msg.correlation.as_ref(), msg.payload);
     }
 }
 
-/// One ledgerd request as as_; timeout defaults to 10 s plus the request's wait.
-pub fn call(op: &str, as_: &str, fields: Map, timeout: Option<f64>) -> Result<Map, LedgerError> {
+/// How long to wait: timeout, else 10 s plus the request's wait. A bad wait is left for ledgerd to refuse; the
+/// timeout itself stays usable.
+fn timeout_for(fields: &Map, timeout: Option<f64>) -> f64 {
     let wait =
-        fields.get("wait").and_then(Value::as_f64).filter(|w| w.is_finite()).map_or(0.0, |w| w.clamp(0.0, 300.0));
-    let mut timeout = timeout.filter(|t| *t != 0.0).unwrap_or(10.0 + wait);
-    // A bad wait is left for ledgerd to refuse; the timeout itself stays usable.
-    if !(timeout > 0.0 && timeout <= 3600.0) {
-        timeout = if timeout > 3600.0 { 3600.0 } else { 10.0 + wait };
+        fields.get("wait").and_then(Value::as_f64).filter(|w| w.is_finite()).map_or(0.0, |w| w.clamp(0.0, MAX_WAIT));
+    let timeout = timeout.filter(|t| *t != 0.0).unwrap_or(10.0 + wait);
+    if timeout > 0.0 && timeout <= 3600.0 {
+        timeout
+    } else if timeout > 3600.0 {
+        3600.0
+    } else {
+        10.0 + wait
     }
+}
+
+/// One ledgerd request as as_ over conn, whose reader thread fills replies from reply_topic.
+pub fn call_over(
+    conn: &Conn,
+    replies: &Replies,
+    reply_topic: &str,
+    op: Value,
+    as_: Option<Value>,
+    fields: Map,
+    timeout: Option<f64>,
+) -> Result<Map, LedgerError> {
+    let timeout = timeout_for(&fields, timeout);
     let mut req = Map::new();
-    req.insert("op".into(), op.into());
+    req.insert("op".into(), op);
     req.extend(fields);
-    req.insert("as".into(), as_.into());
-    let reply = Arc::new(Reply {
-        topic: format!("ledger/resp/{}", random_hex(16)),
-        corr: Bytes::from(random_bytes(16)),
-        got: Mutex::new(None),
-        cv: Condvar::new(),
-    });
+    if let Some(a) = as_.clone() {
+        req.insert("as".into(), a);
+    }
+    let payload =
+        request::send(conn, replies, reply_topic, "ledger", as_.as_ref(), dumps(&Value::Object(req)), timeout)
+            .ok_or_else(|| {
+                LedgerError::new(format!("no reply from ledgerd within {}s, is it running?", fmt_g(timeout)))
+            })?;
+    match crate::json::loads(&payload) {
+        Some(Value::Object(reply)) if reply.get("ok") == Some(&Value::Bool(true)) => Ok(reply),
+        Some(Value::Object(reply)) => Err(LedgerError { reply }),
+        _ => Err(LedgerError::new("malformed reply")),
+    }
+}
+
+/// One ledgerd request as as_, over a connection of its own.
+pub fn call(op: &str, as_: &str, fields: Map, timeout: Option<f64>) -> Result<Map, LedgerError> {
+    call_value(op.into(), Some(as_.into()), fields, timeout)
+}
+
+/// call with op and as_ as the caller gave them; ledgerd refuses what is wrong with them, as it does for any client.
+pub fn call_value(op: Value, as_: Option<Value>, fields: Map, timeout: Option<f64>) -> Result<Map, LedgerError> {
     let cfg = config::get().map_err(|e| LedgerError::new(e.0))?;
+    let own = Arc::new(Own(Replies::default()));
     let opts = Options {
         client_id: String::new(),
         clean_start: true,
@@ -100,7 +135,7 @@ pub fn call(op: &str, as_: &str, fields: Map, timeout: Option<f64>) -> Result<Ma
         manual_ack: false,
         reconnect: None,
     };
-    let c = Conn::open(&cfg.host, cfg.port, opts, reply.clone()).map_err(|e| match e {
+    let c = Conn::open(&cfg.host, cfg.port, opts, own.clone()).map_err(|e| match e {
         DialError::Unreachable(e) => LedgerError::new(format!(
             "broker unreachable at {}:{} ({})",
             cfg.host,
@@ -109,31 +144,9 @@ pub fn call(op: &str, as_: &str, fields: Map, timeout: Option<f64>) -> Result<Ma
         )),
         DialError::NotAccepted => LedgerError::new("broker did not accept the connection"),
     })?;
-    let _ = c.subscribe(vec![filter(&reply.topic, true, false)]);
-    let properties = PublishProperties {
-        response_topic: Some(reply.topic.clone()),
-        correlation_data: Some(reply.corr.clone()),
-        // The broker discards the request if ledgerd cannot pick it up before we stop listening.
-        message_expiry_interval: Some(timeout.ceil().clamp(0.0, u32::MAX as f64) as u32),
-        ..Default::default()
-    };
-    // Per-agent topic, so broker ACLs can later vouch for the address; ledgerd checks it matches "as".
-    let topic = if is_ident(as_, ID_MAX) { format!("ledger/req/{as_}") } else { "ledger/req".into() };
-    let _ = c.publish(&topic, dumps(&Value::Object(req)), true, false, Some(properties), false);
-    let got = reply.got.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut got, _) = reply
-        .cv
-        .wait_timeout_while(got, Duration::from_secs_f64(timeout), |g| g.is_none())
-        .unwrap_or_else(|e| e.into_inner());
-    let payload = got.take();
+    let reply = call_over(&c, &own.0, &request::reply_topic("ledger", ""), op, as_, fields, timeout);
     c.close();
-    let payload = payload
-        .ok_or_else(|| LedgerError::new(format!("no reply from ledgerd within {}s, is it running?", fmt_g(timeout))))?;
-    match crate::json::loads(&payload) {
-        Some(Value::Object(reply)) if reply.get("ok") == Some(&Value::Bool(true)) => Ok(reply),
-        Some(Value::Object(reply)) => Err(LedgerError { reply }),
-        _ => Err(LedgerError::new("malformed reply")),
-    }
+    reply
 }
 
 #[cfg(test)]

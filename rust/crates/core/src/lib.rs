@@ -15,6 +15,7 @@ pub mod observer;
 pub mod presence;
 pub mod protocol;
 pub mod relay;
+pub mod request;
 pub mod rooms;
 pub mod stamp;
 pub mod validation;

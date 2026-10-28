@@ -9,6 +9,7 @@ import time
 import uuid
 
 from .. import host
+from ..errors import BridgeError, LedgerError
 from . import events
 
 SIGNALS = {"interrupt": signal.SIGINT, "terminate": signal.SIGTERM, "kill": signal.SIGKILL}
@@ -20,6 +21,10 @@ jobs = {}
 
 class Refused(Exception):
     """An admin action that is not allowed; the message is shown to the admin."""
+
+
+# Every failure an admin action reports as one line. LedgerError is deliberately not a BridgeError.
+ERRORS = (Refused, BridgeError, LedgerError)
 
 
 def info(pid):

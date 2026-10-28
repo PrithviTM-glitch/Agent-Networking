@@ -23,20 +23,30 @@ def _id16(body, key):
     return v
 
 
+def _str(body, key, optional=False):
+    """A field the bus takes as a string: the native Bus raises a bare TypeError for anything else."""
+    if (v := body.get(key)) is None and optional:
+        return None
+    if not isinstance(v, str):
+        raise Refused(f"{key} must be a string, got {type(v).__name__}")
+    return v
+
+
 def _name(v):
     return v["addr"] or v["session"]
 
 
 def send(b, _peer=None):
-    console, kind, target = admin.need_bus(), b.get("kind"), b.get("target")
+    console, kind = admin.need_bus(), b.get("kind")
     if kind not in ("room", "dm", "topic"):
         raise Refused("kind must be room, dm or topic")
-    {"room": console.say, "dm": console.dm, "topic": console.pub}[kind](target, b.get("text"))
+    target = _str(b, "target")
+    {"room": console.say, "dm": console.dm, "topic": console.pub}[kind](target, _str(b, "text"))
     return f"{kind}:{target}", "sent"
 
 
 def broadcast(b, _peer=None):
-    admin.need_bus().broadcast(b.get("text"))
+    admin.need_bus().broadcast(_str(b, "text"))
     return "broadcast", "sent"
 
 
@@ -150,13 +160,13 @@ def stop_agent(b, peer=None):
 
 
 def room_settings(b, _peer=None):
-    room, mode, rules = b.get("room"), b.get("mode"), b.get("rules")
+    room, mode, rules = _str(b, "room"), _str(b, "mode", optional=True), _str(b, "rules", optional=True)
     info = admin.need_bus().room_set(room, mode=mode, rules=rules)
     return f"room:{room}", f"mode {info['mode']}, rules {len(info['rules'])} chars"
 
 
 def room_moderator(b, _peer=None):
-    room, action, addr = b.get("room"), b.get("action"), b.get("addr")
+    room, action, addr = _str(b, "room"), _str(b, "action"), _str(b, "addr")
     admin.need_bus().mod(room, action, addr)
     return f"{room}:{addr}", f"moderator {action}"
 
@@ -165,7 +175,7 @@ MODERATION = {"mute": "muted", "unmute": "unmuted", "ban": "banned", "unban": "u
 
 
 def room_member(b, _peer=None):
-    room, action, addr = b.get("room"), b.get("action"), b.get("addr")
+    room, action, addr = _str(b, "room"), b.get("action"), _str(b, "addr")
     if action not in MODERATION:
         raise Refused(f"action must be one of {', '.join(MODERATION)}")
     getattr(admin.need_bus(), action)(room, addr)

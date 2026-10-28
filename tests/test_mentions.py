@@ -9,8 +9,9 @@ from types import SimpleNamespace
 import paho.mqtt.client as mqtt
 import pytest
 
-from agent_bridge import config, history
+from agent_bridge import config
 from agent_bridge.bus import Bus
+from agent_bridge.history import client as history
 from agent_bridge.validation import MENTIONS_MAX, BridgeError
 
 RUN = uuid.uuid4().hex[:6]
@@ -19,8 +20,8 @@ S = SimpleNamespace()
 
 
 @pytest.fixture(scope="module", autouse=True)
-def with_ledgerd(ledgerd):
-    """leave drops the agent's ledger first; without ledgerd each leave would wait out its timeout."""
+def with_services(ledgerd, historyd):
+    """history comes from historyd, and leave drops the ledger and the DMs, each waiting out a timeout if absent."""
 
 
 def heard(bus, wait=3):
@@ -58,7 +59,7 @@ def test_names_addresses_and_all_resolve():
     assert heard(S.carol) == [{"body": "@all standup now, @bob too"}, {"body": "mail me at alice@example.com"}], (
         "@all means no mentions, and a@b is not a mention"
     )
-    logged = [e for e in history.history(ROOM, 1000) if e["body"] == "hey @bob, ready?"]
+    logged = [e for e in history.room(ROOM, 1000) if e["body"] == "hey @bob, ready?"]
     assert logged[0]["mentions"] == bobs
 
 

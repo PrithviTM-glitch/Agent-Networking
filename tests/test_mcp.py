@@ -26,7 +26,7 @@ UNTRUSTED = "UNTRUSTED DATA"
 
 
 @pytest.fixture(scope="module", autouse=True)
-def quiet_client(ledgerd):
+def quiet_client(ledgerd, historyd):
     """The SDK client logs every channel notice as an unknown notification."""
     logging.disable(logging.WARNING)
     yield

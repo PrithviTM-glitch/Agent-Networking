@@ -13,14 +13,14 @@ struct World {
     port: u16,
     dir: PathBuf,
     python: PathBuf,
-    ledgerd: Option<Child>,
+    services: Vec<Child>,
 }
 
 impl Drop for World {
     fn drop(&mut self) {
-        if let Some(mut l) = self.ledgerd.take() {
-            let _ = l.kill();
-            let _ = l.wait();
+        for mut s in self.services.drain(..) {
+            let _ = s.kill();
+            let _ = s.wait();
         }
         let _ = Command::new("docker").args(["rm", "-f", &self.broker]).output();
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -34,7 +34,8 @@ impl World {
             .env("AGENT_BRIDGE_PORT", self.port.to_string())
             .env("AGENT_BRIDGE_LOG", self.dir.join("history.jsonl"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
-            .env("LEDGER_DB", self.dir.join("ledger.db"));
+            .env("LEDGER_DB", self.dir.join("ledger.db"))
+            .env("HISTORY_DB", self.dir.join("history.db"));
         for name in
             ["CLAUDE_CODE_SESSION_ID", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_MESSAGING_SOCKET", "AGENT_BRIDGE_STALE_DAYS"]
         {
@@ -80,7 +81,7 @@ fn start() -> World {
         port: free_port(),
         dir,
         python: repo.join(".venv/bin"),
-        ledgerd: None,
+        services: Vec::new(),
     };
     let conf = repo.join("config/mosquitto.conf");
     let started = Command::new("docker")
@@ -95,9 +96,15 @@ fn start() -> World {
         assert!(Instant::now() < deadline, "the broker never came up");
         std::thread::sleep(Duration::from_millis(100));
     }
-    let mut ledgerd = w.cmd(&w.python.join("python"));
-    w.ledgerd =
-        Some(ledgerd.args(["-m", "agent_bridge.ledger.service"]).stderr(Stdio::null()).spawn().expect("ledgerd"));
+    for service in ["agent_bridge.ledger.service", "agent_bridge.history.service"] {
+        let mut c = w.cmd(&w.python.join("python"));
+        w.services.push(c.args(["-m", service]).stderr(Stdio::null()).spawn().expect("a service"));
+    }
+    // Both CLIs read history through historyd: wait until it answers.
+    while !w.run(Path::new(RUST), &["history", "warmup"]).status.success() {
+        assert!(Instant::now() < deadline, "historyd never answered");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     w
 }
 

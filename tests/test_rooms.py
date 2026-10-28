@@ -17,8 +17,9 @@ from conftest import BIN, wait_for
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from agent_bridge import config, history, presence, rooms
+from agent_bridge import config, presence, rooms
 from agent_bridge.bus import Bus
+from agent_bridge.history import client as history
 from agent_bridge.validation import BridgeError
 
 BRIDGE, SERVER = str(BIN / "agent-bridge"), str(BIN / "agent-bridge-mcp")
@@ -28,7 +29,7 @@ S = SimpleNamespace()
 
 
 @pytest.fixture(scope="module", autouse=True)
-def quiet(ledgerd):
+def quiet(ledgerd, historyd):
     """The MCP client logs every channel notice as an unknown notification."""
     logging.disable(logging.WARNING)
     yield
@@ -204,7 +205,7 @@ def test_admin_overrides_moderators():
 
 def test_announcements_are_in_the_transcript():
     verbs = ("[moderator", "[muted", "[unmuted", "[banned", "[unbanned", "[kicked", "[rules", "[mode")
-    notes = [e["body"] for e in history.history(ROOM, 1000) if e["body"].startswith(verbs)]
+    notes = [e["body"] for e in history.room(ROOM, 1000) if e["body"].startswith(verbs)]
     by_a, by_admin = f"by {S.alice.addr}", "by admin"
     assert notes == [
         f"[moderator #{ROOM}] +{S.alice.addr} {by_admin}",

@@ -11,18 +11,11 @@ import uuid
 import weakref
 
 from .. import broker
+from ..errors import HistoryError
 from ..validation import ADMIN, BridgeError, check_ident, check_last, check_topic, is_ident
 
 _channels = weakref.WeakKeyDictionary()
 _lock = threading.Lock()
-
-
-class HistoryError(BridgeError):
-    """An ok:false reply, a timeout, a malformed reply or no broker; .reply holds the reply dict."""
-
-    def __init__(self, reply):
-        super().__init__("history: " + " ".join(str(reply.get("error", "error")).split()))
-        self.reply = reply
 
 
 def _channel(c):

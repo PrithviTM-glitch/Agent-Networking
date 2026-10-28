@@ -7,12 +7,11 @@ A whole session is killed only through its primary agent, and only when the admi
 import os
 import signal
 
-from .. import relay
+from .. import _native, relay
 from ..identity import short_hash
-from ..presence import wipe
-from ..validation import ADMIN, BridgeError, check_ident
+from ..validation import ADMIN, check_ident
 from . import processes, sessions
-from .processes import Refused
+from .processes import ERRORS, Refused
 
 SIGNALS = {"terminate": signal.SIGTERM, "kill": signal.SIGKILL}
 
@@ -171,9 +170,9 @@ def execute(t, signal_name):
             done.append(str(e))
     if t["wipe"]:
         try:
-            wipe(t["addr"])
+            _native.presence_wipe(t["addr"])
             done.append("wiped the agent")
-        except BridgeError as e:
+        except ERRORS as e:
             done.append(f"wipe failed: {e}")
     prefix = "subagent stopped" if t["class"] == "subagent" else t["class"]
     return f"{prefix}: {'; '.join(done) or t['action']}"

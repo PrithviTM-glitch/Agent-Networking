@@ -244,14 +244,7 @@ impl Conn {
         lock(&self.0.state).closed = true;
         self.0.cv.notify_all();
         if let Some(stream) = lock(&self.0.writer).stream.take() {
-            let mut buf = BytesMut::new();
-            if Packet::Disconnect(Disconnect::new(DisconnectReasonCode::NormalDisconnection))
-                .write(&mut buf, None)
-                .is_ok()
-            {
-                let _ = (&stream).write_all(&buf);
-            }
-            let _ = stream.shutdown(Shutdown::Both);
+            disconnect(&stream);
         }
         let handle = lock(&self.0.reader).take();
         if let Some(h) = handle.filter(|h| h.thread().id() != thread::current().id()) {
@@ -307,7 +300,9 @@ impl Conn {
                 },
             };
             wait = true;
-            self.attach(&stream, &ack);
+            if !self.attach(&stream, &ack) {
+                return;
+            }
             let reason = self.read_loop(&mut stream, buf);
             self.detach(reason);
             if max.is_none() || lock(&self.0.state).closed {
@@ -333,11 +328,21 @@ impl Conn {
         }
     }
 
-    fn attach(&self, stream: &TcpStream, ack: &ConnAck) {
+    /// false if the Conn was closed while it was redialling: the session it just took is let go at once, so a
+    /// closed Conn never holds it against the client that owns it now.
+    fn attach(&self, stream: &TcpStream, ack: &ConnAck) -> bool {
         if let Ok(clone) = stream.try_clone() {
             let mut w = lock(&self.0.writer);
             w.stream = Some(clone);
             w.last_sent = Instant::now();
+        }
+        // The writer is set first and close() sets closed first: one of the two sees the other.
+        if lock(&self.0.state).closed {
+            if let Some(s) = lock(&self.0.writer).stream.take() {
+                disconnect(&s);
+            }
+            disconnect(stream);
+            return false;
         }
         {
             let mut st = lock(&self.0.state);
@@ -358,6 +363,7 @@ impl Conn {
         self.flush(&mut st);
         st.up = true;
         self.0.cv.notify_all();
+        true
     }
 
     fn detach(&self, reason: Option<u8>) {
@@ -480,6 +486,15 @@ impl Conn {
         self.0.cv.notify_all();
         self.0.handler.acked(pkid);
     }
+}
+
+/// End a connection cleanly: DISCONNECT, then shut the socket for every clone of it.
+fn disconnect(stream: &TcpStream) {
+    let mut buf = BytesMut::new();
+    if Packet::Disconnect(Disconnect::new(DisconnectReasonCode::NormalDisconnection)).write(&mut buf, None).is_ok() {
+        let _ = (&*stream).write_all(&buf);
+    }
+    let _ = stream.shutdown(Shutdown::Both);
 }
 
 fn alloc(st: &mut State) -> u16 {

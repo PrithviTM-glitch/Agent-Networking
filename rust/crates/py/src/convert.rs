@@ -74,3 +74,11 @@ pub fn from_py(o: &Bound<'_, PyAny>) -> PyResult<Value> {
         Err(PyTypeError::new_err(format!("{} is not JSON", o.get_type().name()?)))
     }
 }
+
+/// Keyword arguments as a JSON object; none gives an empty one.
+pub fn object(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Map> {
+    match kwargs.map(|k| from_py(k.as_any())).transpose()? {
+        Some(Value::Object(m)) => Ok(m),
+        _ => Ok(Map::new()),
+    }
+}

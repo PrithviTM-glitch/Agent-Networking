@@ -3,12 +3,12 @@ stderr with a non-zero exit.
 
 Names, addresses, rooms and caps: 1-64 ASCII letters, digits, _ or - (names at most 57, leaving room for the address
 suffix), at most 32 caps. TEXT: at most 64 KiB of UTF-8; tab, newline and CR are kept, any other control character
-(C0, DEL, C1) is refused. Raw topics: at most 256 bytes of UTF-8, no control characters, never starting with $ or the
-reserved levels agents, inbox, ledger, broadcast and rooms (only the dedicated commands touch those). + and # work
-only in sub, as whole levels, # only last, and not as the first level. Incoming messages that are over 256 KiB, not
-UTF-8, or break these rules are dropped; plain text on a raw topic arrives with "from": null. "from" is checked for
-shape only: any local process can claim any address. Room moderation (mode, moderators, mute, ban) is advisory for
-the same reason.
+(C0, DEL, C1) is refused. Raw topics: at most 256 bytes of UTF-8, no control characters, never starting with $ or
+the reserved levels agents, inbox, ledger, broadcast, rooms and history (only the dedicated commands touch those). +
+and # work only in sub, as whole levels, # only last, and not as the first level. Incoming messages that are over
+256 KiB, not UTF-8, or break these rules are dropped; plain text on a raw topic arrives with "from": null. "from" is
+checked for shape only: any local process can claim any address. Room moderation (mode, moderators, mute, ban) is
+advisory for the same reason.
 """
 
 import argparse
@@ -19,8 +19,9 @@ import os
 import sys
 import zlib
 
-from . import config, history, host, presence, relay, rooms
+from . import config, host, presence, relay, rooms
 from .bus import Bus
+from .history import client as history
 from .ledger import client as ledger
 from .validation import WAIT_MAX, BridgeError, check_ident, check_session, check_wait, not_admin
 
@@ -184,7 +185,7 @@ def _parser():
         cmd(verb, shown(verb, "room", "target"), f"{help} (admin or a moderator)", me, room, target)
     cmd(
         "history",
-        lambda a: _show_all(history.history(a.room, a.last)),
+        lambda a: _show_all(history.room(a.room, a.last)),
         "a chat room's transcript, to catch up after joining",
         room,
         last,

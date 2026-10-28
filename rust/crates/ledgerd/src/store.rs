@@ -5,7 +5,9 @@
 
 use crate::request::{Bad, parse};
 use agent_bridge::json::{Map, dumps, dumps_map, float, loads, now};
-use agent_bridge::ledger::random_hex;
+use agent_bridge::ledger::{
+    MAX_LEASES, MAX_LEDGERS, MAX_PENDING, MAX_REQUESTS, MAX_RESOURCES, MAX_WAITERS, random_hex,
+};
 use agent_bridge::stamp::stamp;
 use agent_bridge::validation::is_ident;
 use rusqlite::types::{Value as Sql, ValueRef};
@@ -18,13 +20,6 @@ const MAX_PAYLOAD: usize = 16384;
 const MAX_CORR: usize = 256;
 /// Under config/mosquitto.conf max_packet_size 270000: a bigger publish gets ledgerd disconnected, then resent forever.
 const MAX_REPLY: usize = 240_000;
-const MAX_LEDGERS: i64 = 1000;
-const MAX_RESOURCES: i64 = 128;
-const MAX_PENDING: i64 = 64;
-const MAX_LEASES: i64 = 256;
-const MAX_WAITERS: i64 = 256;
-/// stored requests per holder, any status
-const MAX_REQUESTS: i64 = 512;
 /// how long a mutating request's answer is kept to replay to a redelivered copy
 const DEDUPE_S: f64 = 300.0;
 const READ_ONLY: [&str; 4] = ["ledger", "public", "grants", "dump"];
@@ -133,6 +128,9 @@ impl Ledger {
             if !has_queued {
                 db.execute_batch("ALTER TABLE waiters ADD COLUMN queued REAL")?;
             }
+            // Schema 1 is all of the above. A later migration checks this row, migrates, then raises it; the first
+            // one retires the Python ledgerd (image :2) as a rollback, which only knows schema 1.
+            db.execute_batch("INSERT OR IGNORE INTO meta VALUES ('schema', 1)")?;
             Ok(())
         };
         setup().map_err(|e| e.to_string())?;
@@ -661,6 +659,7 @@ impl Ledger {
                 body.insert((*k).into(), v[..n.unwrap_or(v.len()).min(v.len())].to_vec().into());
             }
             body.insert("ts".into(), float(now));
+            body.insert("ledgerd".into(), json!({"impl": "rust", "version": env!("CARGO_PKG_VERSION")}));
             if n.is_some() {
                 body.insert("truncated".into(), true.into());
             }
@@ -801,4 +800,22 @@ fn lease_view(row: &Map) -> Map {
         view.insert("token".into(), row["token"].clone());
     }
     view
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_row_and_dump_names_the_implementation() {
+        let dir = std::env::temp_dir().join(format!("ledgerd-store-{}", std::process::id()));
+        let mut ledger = Ledger::open(&dir.join("ledger.db"), 3.0).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ledger.count("SELECT value FROM meta WHERE key='schema'", []).ok(), Some(1));
+        let dump = ledger.run(&mut |_| {}, |l| l.op_dump(now())).ok().expect("dump");
+        assert_eq!(dump["ledgerd"], json!({"impl": "rust", "version": env!("CARGO_PKG_VERSION")}));
+        drop(ledger);
+        let reopened = Ledger::open(&dir.join("ledger.db"), 3.0).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(reopened.count("SELECT count(*) FROM meta WHERE key='schema'", []).ok(), Some(1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
