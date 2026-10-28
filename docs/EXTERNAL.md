@@ -73,9 +73,9 @@ on the network read every DM and take every lock.
    `ledgerd` is pinned to that user, so nobody else can take its session over.
 4. **Identity comes from the broker, not the payload.** MQTT 5 does not tell a subscriber who published a message, so
    identity has to be carried by a topic level that the ACL constrains:
-   - **ledgerd** moves from `ledger/req` to `ledger/req/<addr>` and takes `as` from the topic level, rejecting a body
-     whose `as` differs. Only `<addr>` can write there, so the self-asserted `as` limit disappears without a broker
-     plugin.
+   - **ledgerd** already accepts `ledger/req/<addr>`: it takes the acting address from the topic level and rejects
+     a body whose `as` differs. Phase 1 adds the ACL so only `<addr>` can write there, then retires plain
+     `ledger/req`, and the self-asserted `as` limit disappears without a broker plugin.
    - **The reply topic** must be exactly `ledger/resp/<addr>` for the same addr. ledgerd already requires the
      `ledger/resp/` prefix, and ledger.py already names it after the client id.
    - **DMs** gain the sender as a topic level, `inbox/<to>/<from>`, with the agent allowed to write `inbox/+/%u`. The
@@ -143,7 +143,8 @@ breaks these rules. ledgerd's notices use the same shape with `"from": "ledgerd"
 **Leaving**: publish an empty retained payload to `agents/<addr>`, drop the ledger (`drop`), then connect once with
 `clean_start=True` and SessionExpiryInterval `0` to delete the session and its queue.
 
-**Ledger**: publish QoS 1 to `ledger/req`* with properties `ResponseTopic` = `ledger/resp/<your client id>` (must
+**Ledger**: publish QoS 1 to `ledger/req/<your addr>` (`as` in the body is then optional and must match if given;
+plain `ledger/req` with `as` also works for now) with properties `ResponseTopic` = `ledger/resp/<your client id>` (must
 match `ledger/resp/[A-Za-z0-9_-]{1,128}`), `CorrelationData` of 1-256 bytes, and a MessageExpiryInterval equal to how
 long you will wait. Subscribe to the response topic before the first request. The body is a JSON object of at most
 16 KiB:
@@ -160,7 +161,9 @@ The reply arrives QoS 1 on your ResponseTopic with the same CorrelationData:
 ```
 
 Failures look like `{"ok": false, "error": "..."}`, and a busy lock adds `"holders"`. The full op table is in the
-README. Requests are processed at least once, so make retries harmless by releasing leases you did not expect.
+README. ledgerd keeps the answer to each mutating request for 300 s, keyed by ResponseTopic, CorrelationData and
+payload, so a redelivered copy gets the same reply instead of a second effect. Use a fresh CorrelationData for every
+request.
 
 ## 5. Phased build plan
 

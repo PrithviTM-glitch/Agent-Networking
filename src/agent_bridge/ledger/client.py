@@ -96,7 +96,9 @@ def call(op, as_=None, client=None, timeout=None, **fields):
             props.CorrelationData = corr
             # The broker discards the request if ledgerd cannot pick it up before we stop listening.
             props.MessageExpiryInterval = math.ceil(timeout)
-            c.publish("ledger/req", json.dumps(req), qos=1, properties=props)
+            # Per-agent topic, so broker ACLs can later vouch for the address; ledgerd checks it matches "as".
+            valid = isinstance(as_, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", as_)
+            c.publish(f"ledger/req/{as_}" if valid else "ledger/req", json.dumps(req), qos=1, properties=props)
             if not slot[0].wait(timeout):
                 raise LedgerError({"ok": False, "error": f"no reply from ledgerd within {timeout:g}s, is it running?"})
         finally:

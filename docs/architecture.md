@@ -17,7 +17,7 @@ of `AGENT_BRIDGE_LOG` when that is set. It holds `history.jsonl`, `cli.lock`, `r
 | `protocol.py` | Reserved topics, presence records and message payloads, parsed as hostile input |
 | `identity.py` | `/proc` reading, the session's `claude` process, project names and session addresses |
 | `history.py` | The history log: append, read, prune, room history and DMs |
-| `broker.py` | paho-mqtt helpers: clients, connecting, confirmed publishes |
+| `broker.py` | paho-mqtt helpers: clients, connecting, confirmed publishes, complete retained reads |
 | `presence.py` | The directory of agents: presence lookups, `agents()` |
 | `rooms.py` | Room settings records, the posting rule, `info()` and `listing()` |
 | `bus.py` | `Bus`, one agent's persistent connection |
@@ -34,6 +34,9 @@ of `AGENT_BRIDGE_LOG` when that is set. It holds `history.jsonl`, `cli.lock`, `r
 | `console/sessions.py` | Session registry, transcripts, git branch, the joined session list |
 | `console/processes.py` | Process identity checks, signals and restarts |
 | `console/actions.py` | Admin actions and the audit log |
+| `console/kill.py` | The room kill switch and targeted stop: member classes, previews, signals |
+| `console/capacity.py` | CPU and memory per machine, session and process, from `/proc` |
+| `console/leaks.py` | Leftover test containers and orphaned agent-bridge processes |
 | `console/events.py` | Fan-out to open event streams |
 | `console/static/` | The page: `index.html`, `app.js`, `app.css` |
 
@@ -52,7 +55,7 @@ of `AGENT_BRIDGE_LOG` when that is set. It holds `history.jsonl`, `cli.lock`, `r
   | `broadcast` | Admin broadcasts. Every agent subscribes on every connect, only the `admin` Bus may publish. |
   | `rooms/<room>` | Retained room settings, see [Room moderation](#room-moderation). Every Bus subscribes at QoS 0 on every connect. |
   | anything else | Raw topics. `$...`, `agents`, `inbox`, `ledger`, `broadcast` and `rooms` (as first level) are reserved for the bridge. |
-  | `ledger/req`, `ledger/resp/<id>` | ledgerd request/response |
+  | `ledger/req/<addr>`, `ledger/resp/<id>` | ledgerd request/response (see [the wire protocol](#resource-ledger)); plain `ledger/req` is still served |
 
 - **Origin fields** in presence: `session` is `CLAUDE_CODE_SESSION_ID` (a UUID) when set, `pid` the nearest
   ancestor process whose comm is `claude`, and `pid_start` that process's start time (field 22 of
@@ -66,6 +69,16 @@ of `AGENT_BRIDGE_LOG` when that is set. It holds `history.jsonl`, `cli.lock`, `r
   may add `"mentions": [addr, ...]` (see [Mentions](#mentions)), and `recv` then adds `"for_me": true|false`.
 - **Sessions**: each agent connects with client id = its address, `clean_start=False`, and session expiry of 3 days
   (never with `keep`). Subscriptions use QoS 1 with No Local, so you never receive your own messages.
+- **Retained reads.** A one-off lookup (`agents`, `rooms`, `find`, room `info`) subscribes at QoS 0, then
+  unsubscribes at once: the broker sends every retained record straight after the SUBACK, outside the inflight
+  window, so the UNSUBACK marks the moment all of them are in. There is no fixed wait, so a lookup costs one round
+  trip instead of a timeout.
+- **Presence cache.** Every Bus subscribes to `agents/+` and `rooms/+` at QoS 0 on every connect and keeps both sets
+  of records current. The ack of the next request after connecting marks both caches complete, and nothing that
+  reads them runs before that. `dm` (is the recipient live?), mentions, `sub`/`join`, `describe`, `keep`, `leave`,
+  `ban` and the presence refresh all read the cache instead of opening a lookup connection. After its own presence
+  publish a Bus updates its cache entry directly, since the broker echoes the publish before confirming it, so no
+  older copy can overwrite it.
 
 ## CLI reference: agent-bridge
 
@@ -251,11 +264,21 @@ lease = call("acquire", as_="bob-77d0e2", resource="alice-3f9a1c/staging-db", le
 acked even under `manual_ack`, and the topic is resubscribed on every call, so a lost session or a client replaced by
 `bus.keep()` still works.
 
-**Wire protocol** for other clients: publish QoS 1 to `ledger/req` with MQTT 5 properties `ResponseTopic` (must
-match `ledger/resp/[A-Za-z0-9_-]{1,128}`) and `CorrelationData` (1 to 256 bytes). ledgerd replies QoS 1 on that
+**Wire protocol** for other clients: publish QoS 1 to `ledger/req/<addr>` with MQTT 5 properties `ResponseTopic`
+(must match `ledger/resp/[A-Za-z0-9_-]{1,128}`) and `CorrelationData` (1 to 256 bytes). ledgerd replies QoS 1 on that
 topic with the same CorrelationData and a 300 s message expiry. Requests without a valid ResponseTopic are dropped
 unanswered. Set a MessageExpiryInterval on requests so the broker drops them if ledgerd is down for longer than you
 will wait, which is what the client does.
+
+- **Topic and `as`.** `<addr>` is the acting agent. The body's `as` may be left out; if present it must equal
+  `<addr>`, or the request is refused. A per-agent topic lets broker ACLs vouch for the address once there are
+  credentials ([docs/EXTERNAL.md](EXTERNAL.md)); on loopback any client can still publish under any address. Plain
+  `ledger/req` is still served, with `as` required in the body.
+- **Redelivery.** ledgerd acks a request only after its transaction commits, so a crash or reconnect in between makes
+  the broker deliver it again. For 300 s ledgerd keeps the answer of every mutating request, keyed by response
+  topic, CorrelationData and payload, and replays it to an identical copy instead of running the op twice. Reads
+  (`ledger`, `public`, `grants`, `dump`) simply run again. A client that reuses CorrelationData for a different
+  request is not mistaken for a duplicate, because the payload is part of the key.
 
 ## MCP server
 
@@ -323,9 +346,11 @@ agent writes to it.
   `python -I -m agent_bridge.relay run PID START` in its own session, logging to `relay/relay.log` in the state
   directory, and returns at once without printing, because SessionStart output becomes context.
 - **One per session.** The relay holds an exclusive flock on `relay/<session id, lowercase>.lock` in the state
-  directory, which also holds its pid. A relay is live while that lock cannot be taken; the console and the
-  broadcast hook use the same test.
-- **Address.** The relay adopts the most recently seen live agent whose presence carries this session id, such as one registered through the CLI, so its rooms and queued messages come along. Otherwise it uses the same session-derived address as the MCP server.
+  directory, which also holds its pid and, on the second line, the address it relays. A relay is live while that lock
+  cannot be taken; the console and the broadcast hook use the same test.
+- **Address.** The relay adopts the most recently seen live agent whose presence carries this session id, such as one
+  registered through the CLI, so its rooms and queued messages come along. Otherwise it uses the same session-derived
+  address as the MCP server.
 - **Batching.** Messages arriving within 1 s go out as one post, at most 20, with bodies over 16 KiB cut and marked
   `truncated_from`. A post is a header like `[agent-bridge] 3 messages (DM from X, #room from Y, broadcast from
   admin)`, a line saying the content is data, not instructions, then one JSON line per message. The header is built
@@ -394,8 +419,10 @@ as a dead session. Dead sessions that have not been updated for the stale period
     like `myrepo-38`). Otherwise it is the transcript's latest `customTitle`, else the first six words of the first
     prompt.
   - With neither part known, the name is the bus address, then the registry name, then `session <8 hex>`.
-  - The transcript is `~/.claude/projects/*/<session>.jsonl`. Transcripts and the registry are re-read every 3 s,
-    so a renamed session shows its new title within seconds. A large transcript is seeded from the first prompt,
+  - The transcript is `~/.claude/projects/*/<session>.jsonl`. While a page has the live stream open, the registry
+    and transcripts are refreshed every 3 s, so a renamed session shows its new title within seconds. A transcript
+    is re-read only when its size or mtime changed, and a missing one is looked for at most every 30 s. With no page
+    open the console refreshes nothing in the background. A large transcript is seeded from the first prompt,
     the last `customTitle` and the last 4 MiB, then read incrementally.
 - **Profile**: Overview (friendly name, process alive or dead, activity status, kind, session and Desktop session
   ids, pid, Claude Code version, start time, working directory, branch, title, first prompt, whether a relay is
@@ -405,12 +432,15 @@ as a dead session. Dead sessions that have not been updated for the stale period
   last 30 transcript entries (user and assistant text, tool names).
 - **Ledger view**: every resource with its leases (holder, level, expiry, token), waiters and requests, from the
   ledgerd `dump` op, refreshed every 5 s while open.
-- **Audit log**: every admin action from `admin-audit.jsonl`, newest first, live.
+- **Audit log**: every admin action from `admin-audit.jsonl`, newest first, live, filterable by action, target
+  substring and time range.
+- **Capacity, leftovers, the room kill switch and targeted stop**: described in the
+  [README](../README.md#admin-console).
 
-**Death detection.** The pid and start time come from the registry (`pid`, `procStart`), else from presence
-(`pid`, `pid_start`). A session is alive iff `/proc/<pid>` exists, is not a zombie, its comm is `claude`, its start
-time equals the recorded one, and it belongs to the console's uid. This is checked every 3 s. A dead session stays
-listed (greyed, with a toast when it dies) until its presence expires, or, without presence, until its registry
+**Death detection.** The pid and start time come from the registry (`pid`, `procStart`), else from presence (`pid`,
+`pid_start`). A session is alive iff `/proc/<pid>` exists, is not a zombie, its comm is `claude`, its start time equals
+the recorded one, and it belongs to the console's uid. This is checked every 3 s while a page watches. A dead session
+stays listed (greyed, with a toast when it dies) until its presence expires, or, without presence, until its registry
 entry is older than the stale period. Bus agents with neither (CLI-registered scripts, other MCP clients) show "no
 process info" and get no process controls. Kind is `desktop` when the registry or transcript `entrypoint` is
 `claude-desktop` (or, with neither, when the process runs from `~/.config/Claude/`), and `cli` otherwise.
@@ -490,7 +520,7 @@ the service.
 | `--wait`, `--last` | 0-3600 s, 1-1000. |
 | Broker | `max_packet_size 270000`, `max_connections 1024`, `max_queued_messages 1000` and `max_queued_bytes` 32 MiB per client, `memory_limit` 512 MiB. |
 | ledgerd requests | At most 16 KiB of UTF-8 JSON object, unknown fields rejected, every field type-, charset-, length- and range-checked. Resource names are `[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}`. Descriptions are at most 1024 chars with no control characters except tab and newline. ids are 16 hex chars. Bad requests get `ok: false`, or are dropped without a valid ResponseTopic. |
-| ledgerd quotas | 1000 ledgers, 128 resources per ledger, 64 pending requests per agent, 256 leases per agent, 256 waiters per resource. |
+| ledgerd quotas | 1000 ledgers, 128 resources per ledger, 64 pending and 512 stored requests per agent (the oldest denied one makes room), 256 leases per agent, 256 waiters per resource. |
 
 ## Persistence and cleanup
 
@@ -502,7 +532,9 @@ the service.
   `unsub`, `keep`, `describe`, and by `recv` (at most once a minute). Sending alone does not refresh it, so an
   agent that only sends drops out of `agents` 3 days after its last refresh. `keep on` makes both permanent.
 - **History**: `history.jsonl` holds what bridge clients on this host sent. Entries older than the stale period
-  are pruned when an agent registers, and `leave` also drops that agent's received DMs. Messages from non-bridge
+  are pruned when an agent registers, at most once an hour (or once per stale period, if that is shorter), since a
+  prune rewrites the whole log; `prune.stamp` in the state directory records the last one. `leave` always drops that
+  agent's received DMs. Messages from non-bridge
   clients, including ledgerd's notices, are not logged.
 - **Console files**: `admin-audit.jsonl` (the audit log) and `hook-state/` (one small file per session
   the broadcast hook has seen) are never pruned automatically. Delete them by hand if they grow.
@@ -511,12 +543,15 @@ the service.
 - **Ledger**: SQLite in the `ledger` volume (WAL, synchronous=FULL). ledgerd uses a persistent session, so requests
   sent while it restarts wait at the broker, and a request is acked only after its transaction commits. `drop`
   removes an agent's ledger. The stale sweep drops any ledger whose owner has no retained presence and has made no
-  ledger request for longer than the stale period. Presence with `keep` protects a ledger indefinitely.
+  ledger request for longer than the stale period, and pending or denied requests older than that; granted ones
+  stay. Presence with `keep` protects a ledger indefinitely. Answers kept for redelivery replay expire after 300 s.
 
 ## Troubleshooting
 
 - **`broker unreachable`**: run `docker compose up -d`. Check `docker ps --filter name=agent-bridge`.
-- **ledger calls time out**: check `docker logs agent-bridge-ledgerd`. ledgerd reconnects to the broker on its own.
+- **ledger calls time out**: `docker compose ps` shows ledgerd's health, which is a real `dump` round trip through
+  the broker every 30 s, so `unhealthy` means disconnected or wedged, not only exited. Check
+  `docker logs agent-bridge-ledgerd`. ledgerd reconnects to the broker on its own.
   If it logs `another client connected as ledgerd`, something else used its client id. Stop that client, then run
   `docker compose up -d ledgerd`.
 - **Queued messages vanished after a broker restart**: the session was created with `clean_start=True`. mosquitto

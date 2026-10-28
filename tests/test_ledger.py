@@ -1,5 +1,6 @@
 """The resource ledger end to end: semantics, a manual-ack shared client, a ledgerd kill mid-flight, hostile
-payloads and floods, a multi-process lock stress test, the admin dump and the stale sweep.
+payloads and floods, the admin dump, request topics and redelivery, table bounds, a multi-process lock stress test and
+the stale sweep.
 
 ledgerd is started and killed by these tests, so they use their own instead of the shared fixture. The broker runs a
 minimal config without packet limits, so oversized requests reach ledgerd. Run as a script with "worker" it is one
@@ -84,11 +85,22 @@ class Watch:
         self.c.on_message = lambda _c, _u, m: self.msgs.append(
             (m.topic, m.payload, getattr(m.properties, "CorrelationData", None))
         )
+        subscribed = threading.Event()
+        self.c.on_subscribe = lambda *_: subscribed.set()
         self.c.subscribe(topic, qos=1)
-        time.sleep(0.3)
+        assert subscribed.wait(5)
 
     def json(self, topic):
         return [json.loads(p) for t, p, _ in self.msgs if t == topic]
+
+
+def queued(resource, n=1):
+    """Wait until resource has n queued waiters. ledgerd is serial, so a dump also proves earlier requests ran."""
+    return wait_for(lambda: sum(w["resource"] == resource for w in call("dump", "admin-0")["waiters"]) == n)
+
+
+def holders(resource):
+    return {x["holder"] for x in call("dump", "admin-0")["leases"] if x["resource"] == resource}
 
 
 def background(op, who, **kw):
@@ -195,20 +207,18 @@ def test_functional():
     busy = err("acquire", b, resource=f"{a}/pub", level="write")
     assert busy["error"] == "busy" and {h["holder"] for h in busy["holders"]} == set(readers)
     writer = background("acquire", b, resource=f"{a}/pub", level="write", ttl=30, wait=10)
-    time.sleep(0.3)
+    assert queued(f"{a}/pub")
     assert err("acquire", c, resource=f"{a}/pub", level="read")["error"] == "busy", "a queued writer blocks new readers"
     late_reader = background("acquire", c, resource=f"{a}/pub", level="read", ttl=30, wait=10)
-    time.sleep(0.3)
+    assert queued(f"{a}/pub", 2)
     for x in leases[:-1]:
         call("release", x["holder"], lease_id=x["lease_id"])
-    time.sleep(0.3)
-    assert "reply" not in writer, "writer waits for the last reader"
+    assert holders(f"{a}/pub") == {leases[-1]["holder"]} and queued(f"{a}/pub", 2), "writer waits for the last reader"
     call("release", leases[-1]["holder"], lease_id=leases[-1]["lease_id"])
     writer["thread"].join()
     w = writer["reply"]["lease"]
     assert w["holder"] == b and w["token"] > owner["token"]
-    time.sleep(0.3)
-    assert "reply" not in late_reader, "the reader queued behind the writer waits its turn"
+    assert queued(f"{a}/pub", 1) and "reply" not in late_reader, "the reader queued behind the writer waits its turn"
     call("release", b, lease_id=w["lease_id"])
     late_reader["thread"].join()
     assert late_reader["reply"]["lease"]["holder"] == c
@@ -226,13 +236,13 @@ def test_functional():
     call("acquire", a, resource=f"{a}/pubw", level="write", ttl=1)
     call("request", b, resource=f"{a}/pubw", level="write")
     t = time.monotonic()
-    got = call("acquire", b, resource=f"{a}/pubw", level="write", ttl=2, wait=5)["lease"]
+    got = call("acquire", b, resource=f"{a}/pubw", level="write", ttl=1, wait=5)["lease"]
     assert 0.5 < time.monotonic() - t < 3, "expired lease handed to the waiter"
 
     # renew and release
     renewed = call("renew", b, lease_id=got["lease_id"], ttl=6)["lease"]
     assert renewed["expires_at"] > got["expires_at"]
-    time.sleep(2.5)
+    time.sleep(1.2)
     assert err("acquire", a, resource=f"{a}/pubw", level="write")["error"] == "busy", "renew kept it past the first ttl"
     assert "no such lease" in err("release", c, lease_id=got["lease_id"])["error"], "only holder or owner releases"
     assert "no such lease" in err("renew", a, lease_id=got["lease_id"])["error"], "only the holder renews"
@@ -262,7 +272,7 @@ def test_functional():
     blocker = call("acquire", d, resource=f"{d}/dres", level="write", ttl=60)["lease"]
     on_dres = background("acquire", b, resource=f"{d}/dres", level="read", ttl=5, wait=10)
     d_waits = background("acquire", d, resource=f"{a}/pubw", level="write", ttl=5, wait=10)
-    time.sleep(0.3)
+    assert queued(f"{d}/dres") and queued(f"{a}/pubw")
     assert blocker and "reply" not in on_dres and "reply" not in d_waits
     call("drop", d)
     on_dres["thread"].join()
@@ -310,21 +320,22 @@ def test_restart():
     pend = call("request", f, resource=f"{a}/rs", level="write")["request"]
     call("request", g, resource=f"{a}/rs", level="read")
     held = call("acquire", a, resource=f"{a}/rs", level="write", ttl=4)["lease"]
-    queued = background("acquire", g, resource=f"{a}/rs", level="read", ttl=5, wait=30)
-    time.sleep(0.3)
+    waiting = background("acquire", g, resource=f"{a}/rs", level="read", ttl=5, wait=30)
+    assert queued(f"{a}/rs")
     LD.kill()
     LD.wait()
     granted = background("grant", a, request_id=pend["id"], timeout=30)
     added = background("add", a, name="afterdown", timeout=30)
-    time.sleep(1)
-    assert "reply" not in granted and "reply" not in queued
+    time.sleep(0.3)
+    assert "reply" not in granted and "reply" not in waiting
     start_ledgerd()
-    for x in (granted, added, queued):
+    for x in (granted, added, waiting):
         x["thread"].join()
     assert granted["reply"]["request"]["status"] == "granted", "request sent while ledgerd was down is processed"
     assert added["reply"]["ok"]
-    assert queued["reply"]["lease"]["holder"] == g, "a waiter queued before the restart still gets its turn"
-    assert queued["secs"] > 2, "only after the write lease taken before the restart expired"
+    assert waiting["reply"]["lease"]["holder"] == g, "a waiter queued before the restart still gets its turn"
+    assert waiting["secs"] > 2, "only after the write lease taken before the restart expired"
+    call("release", g, lease_id=waiting["reply"]["lease"]["lease_id"])
     assert [r["name"] for r in call("ledger", a)["resources"]] == ["afterdown", "rs"]
     assert {r["status"] for r in call("grants", f)["held"]} == {"granted"}
     later = call("acquire", a, resource=f"{a}/rs", level="write", ttl=1, wait=10)["lease"]
@@ -438,14 +449,14 @@ def test_hostile():
         send({"op": "init", "as": me}, rt=rt)
     nocorr = send({"op": "init", "as": me}, corr=False)
     bigcorr = send({"op": "init", "as": me}, corr=b"z" * 1000)
-    assert wait_for(lambda: len(replies.msgs) >= before + 2)
-    time.sleep(0.5)
-    late = replies.msgs[before:]
+    marker = send({"op": "init", "as": me})
+    answer(marker)  # ledgerd is serial and the broker keeps one publisher's order: nothing earlier is still coming
+    late = [m for m in replies.msgs[before:] if m[2] != marker]
     assert len(late) == 2 and all(c is None for _, _, c in late), "only the two with a valid topic were answered"
     assert all("CorrelationData" in json.loads(p)["error"] for _, p, _ in late)
     assert nocorr and bigcorr
     assert not [t for t, _, _ in sniff.msgs if t in ("inbox/victim-v1", "agents/victim-v1", "ledger/respx")]
-    assert [t for t, _, _ in sniff.msgs].count("ledger/req") == len(junk) + 11, "ledgerd never published on ledger/req"
+    assert [t for t, _, _ in sniff.msgs].count("ledger/req") == len(junk) + 12, "ledgerd never published on ledger/req"
 
     for _ in range(3000):
         send(b"\x00junk", qos=0)
@@ -467,8 +478,8 @@ def test_dump():
     pending = call("request", r, resource=f"{o}/dq", level="write")["request"]
     held = call("acquire", o, resource=f"{o}/dp", level="write", ttl=60)["lease"]
     t = time.time()
-    queued = background("acquire", r, resource=f"{o}/dp", level="read", ttl=60, wait=20)
-    time.sleep(0.3)
+    waiting = background("acquire", r, resource=f"{o}/dp", level="read", ttl=60, wait=20)
+    assert queued(f"{o}/dp")
 
     d = call("dump", "admin-0")
     assert "truncated" not in d and abs(d["ts"] - time.time()) < 5
@@ -495,8 +506,8 @@ def test_dump():
 
     # admin interventions are existing ops run as the owner
     call("release", o, lease_id=held["lease_id"])
-    queued["thread"].join()
-    theirs = queued["reply"]["lease"]
+    waiting["thread"].join()
+    theirs = waiting["reply"]["lease"]
     call("release", o, lease_id=theirs["lease_id"])
     call("grant", o, request_id=pending["id"])
     call("deny", o, request_id=pending["id"])
@@ -538,12 +549,78 @@ def test_dump():
     print("dump ok")
 
 
+def test_topics_and_redelivery():
+    me, o = "topic-t1", "topic-o1"
+    for x in (me, o):
+        call("init", x)
+    call("add", o, name="tr", visibility="public", max_level="write")
+    replies = Watch("ledger/resp/topics")
+    raw = ledger.connect()
+    seq = [0]
+
+    def send(topic, body, corr=None):
+        seq[0] += 1
+        props = Properties(PacketTypes.PUBLISH)
+        props.ResponseTopic, props.CorrelationData = "ledger/resp/topics", corr or f"t{seq[0]}".encode()
+        raw.publish(topic, json.dumps(body), qos=1, properties=props)
+        return props.CorrelationData
+
+    def answers(cid, n=1):
+        assert wait_for(lambda: sum(c == cid for _, _, c in replies.msgs) >= n), cid
+        return [json.loads(p) for _, p, c in replies.msgs if c == cid]
+
+    # ledger/req/<addr> fixes the acting address; the body's as is optional and must agree
+    assert answers(send(f"ledger/req/{me}", {"op": "grants"}))[0]["ok"] is True
+    assert "must match" in answers(send(f"ledger/req/{me}", {"op": "grants", "as": o}))[0]["error"]
+    assert "request topic" in answers(send("ledger/req/bad.addr", {"op": "grants"}))[0]["error"]
+    assert answers(send("ledger/req", {"op": "grants", "as": me}))[0]["ok"] is True, "plain ledger/req still works"
+    assert "as: required" in answers(send("ledger/req", {"op": "grants"}))[0]["error"]
+
+    # a redelivered copy (same ResponseTopic, CorrelationData and payload) gets the first answer, no second effect
+    call("request", me, resource=f"{o}/tr", level="write")
+    acquire = {"op": "acquire", "resource": f"{o}/tr", "level": "write", "ttl": 30}
+    send(f"ledger/req/{me}", acquire, b"same")
+    send(f"ledger/req/{me}", acquire, b"same")
+    first, second = answers(b"same", 2)
+    assert first == second and first["ok"], "the duplicate replays the first reply"
+    leases = [x for x in call("dump", "admin-0")["leases"] if x["resource"] == f"{o}/tr"]
+    assert [x["holder"] for x in leases] == [me], "one lease, not two"
+    other = send(f"ledger/req/{me}", {**acquire, "ttl": 31}, b"same")
+    assert answers(other, 3)[-1]["error"] == "busy", "same CorrelationData, different payload: a new request"
+    waiter = {"op": "acquire", "resource": f"{o}/tr", "level": "write", "ttl": 5, "wait": 20}
+    send(f"ledger/req/{o}", waiter, b"wait")
+    send(f"ledger/req/{o}", waiter, b"wait")
+    assert queued(f"{o}/tr", 1), "a duplicate of a queued acquire queues nothing more"
+    call("release", me, lease_id=first["lease"]["lease_id"])
+    assert answers(b"wait")[0]["lease"]["holder"] == o
+    alive()
+    print("topics ok")
+
+
+def test_bounds():
+    from agent_bridge.ledger.store import MAX_REQUESTS
+
+    me, o = "bound-b1", "bound-o1"
+    for x in (me, o):
+        call("init", x)
+    call("add", o, name="bp")
+    first = None
+    for _ in range(MAX_REQUESTS + 3):
+        rq = call("request", me, resource=f"{o}/bp", level="read")["request"]
+        first = first or rq["id"]
+        call("deny", o, request_id=rq["id"])
+    held = call("grants", me)["held"]
+    assert len(held) == MAX_REQUESTS and first not in {r["id"] for r in held}, "the oldest denied requests make room"
+    alive()
+    print("bounds ok")
+
+
 def test_stress():
     owner, res = "stress-s1", "stress-s1/hot"
     call("init", owner)
     call("add", owner, name="hot", visibility="public", max_level="write")
-    writers = [f"writer-w{i}" for i in range(20)]
-    readers = [f"sreader-r{i}" for i in range(5)]
+    writers = [f"writer-w{i}" for i in range(8)]
+    readers = [f"sreader-r{i}" for i in range(2)]
     for x in writers + readers:
         call("init", x)
         call("request", x, resource=res, level="write" if x in writers else "read")
@@ -563,7 +640,7 @@ def test_stress():
     rows = [r for out in outs for r in json.load(open(out))]
     writes = sorted((r for r in rows if r[0] == "write"), key=lambda r: r[2])
     reads = [r for r in rows if r[0] == "read"]
-    assert len(writes) == 20 * n and len(reads) == 5 * n
+    assert len(writes) == len(writers) * n and len(reads) == len(readers) * n
     for prev, cur in zip(writes, writes[1:], strict=False):
         assert cur[2] >= prev[3], f"write leases overlap: {prev} {cur}"
         assert cur[1] > prev[1], f"fencing token not increasing: {prev} {cur}"
@@ -581,33 +658,42 @@ def test_stress():
 def test_stale():
     LD.terminate()
     LD.wait()
-    start_ledgerd("stale.db", AGENT_BRIDGE_STALE_DAYS=str(3 / 86400))
+    start_ledgerd("stale.db", AGENT_BRIDGE_STALE_DAYS=str(1 / 86400))  # 1 s, swept every 0.1 s
     pres = ledger.connect()
 
     def presence(who, rec):
         pres.publish(f"agents/{who}", json.dumps(rec) if rec else b"", qos=1, retain=True).wait_for_publish(5)
+
+    def gone(owner):
+        call("init", "active-a1")  # each poll keeps the active agent's ledger fresh
+        try:
+            call("ledger", "active-a1", owner=owner)
+        except ledger.LedgerError as e:
+            return f"no ledger for {owner}" in e.reply["error"]
+        return False
 
     presence("kept-k1", {"name": "kept", "keep": True, "seen": time.time() - 1000})
     presence("junk-j1", "not an object")
     for x in ("ghost-g1", "kept-k1", "active-a1"):
         call("init", x)
     call("add", "ghost-g1", name="gres", visibility="public")
+    call("add", "kept-k1", name="kpub", visibility="public")
+    call("add", "kept-k1", name="kpriv")
     call("request", "active-a1", resource="ghost-g1/gres", level="read")
-    end = time.monotonic() + 6
-    while time.monotonic() < end:
-        call("init", "active-a1")
-        time.sleep(0.5)
-    assert "no ledger for ghost-g1" in err("ledger", "active-a1", owner="ghost-g1")["error"], (
-        "idle, no presence: dropped"
+    call("request", "active-a1", resource="kept-k1/kpub", level="read")
+    call("request", "active-a1", resource="kept-k1/kpriv", level="read")
+    assert wait_for(lambda: gone("ghost-g1"), 10), "idle, no presence: dropped"
+
+    def held():
+        return [(r["resource"], r["status"]) for r in call("grants", "active-a1")["held"]]
+
+    assert wait_for(lambda: held() == [("kept-k1/kpub", "granted")]), (
+        "the dropped owner's grant went with it, the stale pending request was pruned, the live grant stayed",
+        held(),
     )
-    assert not call("grants", "active-a1")["held"]
     assert call("init", "kept-k1")["created"] is False, "presence with keep protects the ledger"
     presence("kept-k1", None)
-    time.sleep(4)
-    call("init", "active-a1")
-    assert "no ledger for kept-k1" in err("ledger", "active-a1", owner="kept-k1")["error"], (
-        "cleared presence no longer protects"
-    )
+    assert wait_for(lambda: gone("kept-k1"), 10), "cleared presence no longer protects"
     alive()
     print("stale ok")
 

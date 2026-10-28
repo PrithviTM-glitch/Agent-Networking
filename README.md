@@ -19,7 +19,7 @@ loopback. It is a single-user tool: read [the security model](#security-model-an
                           +----------+-----------+
                           |  mosquitto           |  sessions, queues, retained presence
                           +----------+-----------+
-                                     |  ledger/req -> ledger/resp/<client>
+                                     |  ledger/req/<addr> -> ledger/resp/<client>
                           +----------+-----------+
                           |  ledgerd             |  the only writer of ledgers, grants and leases (SQLite)
                           +----------------------+
@@ -32,7 +32,7 @@ loopback. It is a single-user tool: read [the security model](#security-model-an
 |---|---|
 | mosquitto | The broker. Keeps each agent's persistent session, queues QoS 1 messages for offline agents, holds retained presence. |
 | `agent-bridge` | The CLI, and the `Bus` class it is built on: one persistent MQTT connection per agent, client id = address. |
-| `agent-bridge-ledgerd` | The resource ledger service, run by Docker Compose. It answers MQTT 5 request/response on `ledger/req`. |
+| `agent-bridge-ledgerd` | The resource ledger service, run by Docker Compose. It answers MQTT 5 request/response on `ledger/req/<addr>`. |
 | `agent-bridge-mcp` | An MCP server that puts a Claude Code session on the bus with its own ledger. |
 | `agent-bridge-relay-hook` | A SessionStart hook that starts a relay, which delivers bus messages straight into the session's conversation. |
 | `agent-bridge-broadcast-hook` | A prompt hook that shows admin broadcasts to every Claude Code session, on the bus or not. |
@@ -46,17 +46,24 @@ The protocol, the Python API, the full CLI reference, the ledger model and the i
 
 You need Linux (the console and the relay read `/proc`), Docker with Compose, and [uv](https://docs.astral.sh/uv/).
 
-Start the broker and ledgerd from the repository root:
-
-```bash
-docker compose up -d --build
-```
-
 Install the commands for your user. They land in `~/.local/bin`:
 
 ```bash
-uv tool install .
+uv tool install git+https://github.com/PrithviTM-glitch/Agent-Networking
 ```
+
+`uv tool upgrade agent-bridge` updates them later. The broker and ledgerd run from a clone of the repository:
+
+```bash
+git clone https://github.com/PrithviTM-glitch/Agent-Networking
+```
+
+```bash
+cd Agent-Networking && docker compose up -d --build
+```
+
+`docker compose ps` shows ledgerd as `healthy` once a request has made the round trip through the broker. From a
+clone, `uv tool install .` installs the same commands from your checkout.
 
 Register two agents. Each `register` prints the new address, for example `alice-3f9a1c`:
 
@@ -101,7 +108,7 @@ session gets a fixed address derived from its session id and project folder, and
 resume. Text written by other agents comes back marked `UNTRUSTED DATA`.
 
 The repository's `.mcp.json` registers it for sessions started in this folder. To add it for every session on the
-machine after `uv tool install .`:
+machine, once the commands are installed:
 
 ```bash
 claude mcp add --scope user bridge -- agent-bridge-mcp
@@ -113,7 +120,7 @@ below.
 ## Claude Code hooks
 
 Nothing installs these for you. Add them to `~/.claude/settings.json` (every session on the machine) or a project's
-`.claude/settings.json`, merging into an existing `"hooks"` object. Both commands come from `uv tool install .`; with
+`.claude/settings.json`, merging into an existing `"hooks"` object. Both commands come from `uv tool install`; with
 another install, use the absolute path of the command.
 
 ```json
@@ -181,9 +188,9 @@ class and exact action and a typed confirmation of the room name. It sends SIGTE
 By default it stops only subagents; killing whole Claude sessions is an extra checkbox. The members are classified
 like this:
 
-- **Session agent**: the primary agent of its session. That is the address the session's live relay holds (the
-  second line of `data/relay/<session>.lock`), else the address ending in `-<hash of the session>`, else the only
-  live agent carrying that session. Claude Code's session registry must also list that session with the same pid
+- **Session agent**: the primary agent of its session. That is the address the session's live relay holds (the second
+  line of `relay/<session>.lock` in the state directory), else the address ending in `-<hash of the session>`, else the
+  only live agent carrying that session. Claude Code's session registry must also list that session with the same pid
   and start time. With "kill whole sessions" ticked, its claude process is signalled, which ends the session; the
   preview says so and names every other agent that dies with it.
 - **Subagent**: `"kind": "subagent"` or a `parent` field, no `session`, or any other agent carrying a session that
@@ -235,7 +242,9 @@ This is a single-user, single-machine tool. The model is that every local proces
   [docs/EXTERNAL.md](docs/EXTERNAL.md).
 - **Self-asserted identity.** `"from"` in messages and `as` in ledger requests are whatever the sender says. Any
   local process can read any inbox, post as any agent, fake presence, act on another agent's ledger, read ledger
-  replies on `ledger/resp/#`, or connect as `ledgerd` and take its session over.
+  replies on `ledger/resp/#`, or connect as `ledgerd` and take its session over. Ledger requests travel on
+  `ledger/req/<addr>` and ledgerd refuses any whose `as` differs from that address, so per-agent broker ACLs could
+  later vouch for it; on loopback today nothing stops a client from publishing under another address.
 - **Reserved namespaces.** `agents/`, `inbox/`, `ledger/`, `broadcast` and `$` topics belong to the bridge: raw
   `pub`/`sub` refuse them, and a subscription filter cannot start with a wildcard. The name and address `admin` (any
   case) belong to the console, and only its Bus may broadcast.
@@ -254,9 +263,11 @@ This is a single-user, single-machine tool. The model is that every local proces
   nothing runs through a shell. The token stops other web pages and accidents, not a local process: anything running
   as your user can read it, and anything that can write the history log can fake a broadcast for the hook.
 - **Delivery.** QoS 1 and at least once. The broker queues at most 1000 messages or 32 MiB per offline client. If
-  ledgerd crashes between commit and ack, that request runs twice; the worst case is a stray lease that expires.
+  ledgerd crashes or reconnects between commit and ack, the broker redelivers the request; for 300 s ledgerd
+  replays the first answer to such a copy instead of running it again, so a redelivery does not take a second lease.
 - **Expiry.** An agent idle for 3 days (`AGENT_BRIDGE_STALE_DAYS`) loses its session, presence and, without
-  presence, its ledger, unless it set `keep`.
+  presence, its ledger, unless it set `keep`. Pending and denied ledger requests older than that are pruned; granted
+  ones stay.
 
 ## Configuration
 
@@ -291,17 +302,32 @@ uv run pytest
 
 The tests are end to end. They need Docker: a session fixture runs a disposable `eclipse-mosquitto:2.0.22`
 container on a free port (never the one on 1883), each test module gets a fresh broker and state directory, and
-ledgerd, the console, the relay and the MCP server run as real processes against it. A full run takes about three
-minutes. CI runs the same on GitHub Actions (`.github/workflows/ci.yml`).
+ledgerd, the console, the relay and the MCP server run as real processes against it. A full run takes about two and a
+half minutes.
+
+- **One run at a time.** Each run holds `$XDG_RUNTIME_DIR/agent-bridge-tests-<uid>.lock`. A second run on the
+  machine prints `waiting for another agent-bridge test run (pid N) to finish` and starts when the first ends, so
+  parallel sessions never stack test suites.
+- **No leftover brokers.** Test containers carry the label `agent-bridge-test.uid=<uid>` and are removed when the run
+  exits, including on Ctrl-C, SIGTERM and SIGHUP. A run that was SIGKILLed leaves its container behind; the next run
+  removes it before starting.
+- **Other implementations.** `AGENT_BRIDGE_BIN` points the tests at another directory of `agent-bridge*` commands,
+  and `AGENT_BRIDGE_LEDGERD` at another ledgerd command line.
+
+CI (`.github/workflows/ci.yml`, GitHub Actions on ubuntu-24.04) runs ruff, the suite, and a package job that builds
+the wheel, installs it into a clean environment and checks every command, import and packaged console file.
 
 | Module | Covers |
 |---|---|
-| `tests/test_bus.py` | The CLI and the Bus: delivery, rooms, takeover, stable addresses, a broker restart, expiry, hostile payloads and presence, the admin reservation, broadcasts, bad arguments |
+| `tests/test_bus.py` | The CLI and the Bus: delivery, rooms, takeover, stable addresses, a broker restart, the presence cache, hourly pruning, expiry, hostile payloads and presence, subagents and write-once origin, the admin reservation, broadcasts, bad arguments |
 | `tests/test_rooms.py` | Room moderation: open and announce rooms, mute, kick and ban, non-moderators refused, admin override, spoofed posts dropped, announcements, the CLI and MCP surfaces |
-| `tests/test_ledger.py` | Ledger semantics, a manual-ack shared client, a ledgerd kill mid-flight, hostile requests and floods, a 25-process lock stress test, the admin dump, the stale sweep |
+| `tests/test_mentions.py` | @mentions: resolution when sending, validation when receiving, `for_me` in `recv` |
+| `tests/test_ledger.py` | Ledger semantics, a manual-ack shared client, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, quotas, a 25-process lock stress test, the admin dump, the stale sweep |
 | `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice |
-| `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process, and its coexistence with the MCP server |
-| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the audit log, the broadcast hook |
+| `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, adopting a CLI-registered agent, mentions waking only the mentioned agent |
+| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, audit filters, the broadcast hook |
+
+<!-- Rust implementation: section to come from the Rust port. -->
 
 ## Contributing
 

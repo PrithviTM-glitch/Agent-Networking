@@ -4,6 +4,7 @@ Ledger is the only writer of ledgers, grants and leases. The service feeds it re
 updates one at a time, in order; that serialization is the whole concurrency guarantee.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -23,6 +24,9 @@ MAX_CORR = 256
 MAX_REPLY = 240_000
 MAX_TTL, MAX_WAIT = 3600, 300
 MAX_LEDGERS, MAX_RESOURCES, MAX_PENDING, MAX_LEASES, MAX_WAITERS = 1000, 128, 64, 256, 256
+MAX_REQUESTS = 512  # stored requests per holder, any status
+DEDUPE_S = 300  # how long a mutating request's answer is kept to replay to a redelivered copy
+READ_ONLY = {"ledger", "public", "grants", "dump"}
 LEVELS = {"read": 1, "write": 2}
 ADDR = r"[A-Za-z0-9_-]{1,64}"
 NAME = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"
@@ -44,6 +48,7 @@ CREATE TABLE IF NOT EXISTS waiters(seq INTEGER PRIMARY KEY AUTOINCREMENT, resour
   holder TEXT NOT NULL, level TEXT NOT NULL, ttl REAL NOT NULL, deadline REAL NOT NULL, topic TEXT NOT NULL,
   corr BLOB);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS replies(key BLOB PRIMARY KEY, body TEXT, ts REAL NOT NULL);
 INSERT OR IGNORE INTO meta VALUES ('fence', 0);
 CREATE INDEX IF NOT EXISTS resources_owner ON resources(owner);
 CREATE INDEX IF NOT EXISTS requests_resource ON requests(resource, holder);
@@ -52,6 +57,7 @@ CREATE INDEX IF NOT EXISTS requests_owner ON requests(owner);
 CREATE INDEX IF NOT EXISTS leases_resource ON leases(resource);
 CREATE INDEX IF NOT EXISTS leases_holder ON leases(holder);
 CREATE INDEX IF NOT EXISTS waiters_resource ON waiters(resource, seq);
+CREATE INDEX IF NOT EXISTS replies_ts ON replies(ts);
 """
 
 
@@ -154,7 +160,8 @@ class Ledger:
 
     # requests
 
-    def handle(self, payload, topic, corr):
+    def handle(self, payload, topic, corr, via=None):
+        """One request; via is the <addr> of a ledger/req/<addr> topic, None for plain ledger/req."""
         if not isinstance(topic, str) or not RESP.fullmatch(topic):
             return log("dropped request without a ResponseTopic under ledger/resp/")
         if not isinstance(corr, bytes) or len(corr) > MAX_CORR:
@@ -168,8 +175,8 @@ class Ledger:
                 req = json.loads(payload.decode("utf-8"))
             except (ValueError, RecursionError):
                 raise Bad("payload must be UTF-8 JSON") from None
-            op, me, args = parse(req)
-            body = self.run(self.dispatch, op, me, args, topic, corr)
+            op, me, args = parse(req, via)
+            body = self.run(self.serve, op, me, args, topic, corr, payload)
         except Bad as e:
             body = {"ok": False, "error": str(e)}
         except Exception:
@@ -181,6 +188,19 @@ class Ledger:
     def reply_now(self, topic, corr, body):
         self.reply(topic, corr, body)
         self.flush()
+
+    def serve(self, op, me, args, topic, corr, payload):
+        """dispatch, once: a redelivered copy of a mutating request (ledgerd crashed or reconnected before acking it)
+        gets the first answer again instead of a second lease or request. The key includes the payload, so a client
+        that reuses CorrelationData for different requests is not mistaken for a duplicate."""
+        if op in READ_ONLY:
+            return self.dispatch(op, me, args, topic, corr)
+        key = hashlib.sha256(b"\0".join((topic.encode(), corr, payload))).digest()
+        if row := self.one("SELECT body FROM replies WHERE key=?", key):
+            return None if row["body"] is None else json.loads(row["body"])
+        body = self.dispatch(op, me, args, topic, corr)
+        self.q("INSERT INTO replies VALUES (?, ?, ?)", key, None if body is None else json.dumps(body), time.time())
+        return body
 
     def dispatch(self, op, me, args, topic, corr):
         now = time.time()
@@ -277,6 +297,12 @@ class Ledger:
             ):
                 return {"request": dict(row)}
         auto = res["visibility"] == "public" and LEVELS[level] <= LEVELS[res["max_level"]]
+        stored = "SELECT count(*) FROM requests WHERE holder=?"
+        if self.one(stored, me)[0] >= MAX_REQUESTS:
+            self.q("DELETE FROM requests WHERE id=(SELECT id FROM requests WHERE holder=? AND status='denied' "
+                   "ORDER BY ts LIMIT 1)", me)  # fmt: skip
+            if self.one(stored, me)[0] >= MAX_REQUESTS:
+                raise Bad(f"at most {MAX_REQUESTS} requests per agent")
         if (
             not auto
             and self.one("SELECT count(*) FROM requests WHERE holder=? AND status='pending'", me)[0] >= MAX_PENDING
@@ -505,6 +531,7 @@ class Ledger:
 
     def tick(self):
         now = time.time()
+        self.q("DELETE FROM replies WHERE ts<?", now - DEDUPE_S)
         for r in self.q("SELECT DISTINCT resource FROM leases WHERE expires<=?", now).fetchall():
             self.q("DELETE FROM leases WHERE resource=? AND expires<=?", r[0], now)
             self.pump(r[0])
@@ -518,6 +545,8 @@ class Ledger:
             self.swept = now
             cutoff = now - STALE_S
             self.q("DELETE FROM presence WHERE keep=0 AND seen<?", cutoff)
+            # Granted requests are live permissions and stay; undecided and denied ones go once stale.
+            self.q("DELETE FROM requests WHERE status IN ('pending', 'denied') AND ts<?", cutoff)
             for r in self.q(
                 "SELECT owner FROM ledgers WHERE seen<? AND owner NOT IN (SELECT addr FROM presence)", cutoff
             ).fetchall():
@@ -586,7 +615,8 @@ OPS = {
 }
 
 
-def parse(req):
+def parse(req, via=None):
+    """op, acting address and checked fields; via, from a ledger/req/<addr> topic, fixes the address."""
     if not isinstance(req, dict):
         raise Bad("request must be a JSON object")
     op = req.get("op")
@@ -596,7 +626,11 @@ def parse(req):
     extra = [k[:32] for k in req if k not in fields and k not in ("op", "as")]
     if extra:
         raise Bad(f"unknown fields for {op}: {', '.join(extra[:5])}")
-    if "as" not in req:
+    if via is not None:
+        addr("request topic address", via)
+        if req.get("as", via) != via:
+            raise Bad(f"as: must match the request topic ledger/req/{via}")
+    elif "as" not in req:
         raise Bad("as: required")
     args = {}
     for key, (check, default) in fields.items():
@@ -606,4 +640,4 @@ def parse(req):
             raise Bad(f"{key}: required")
         else:
             args[key] = default
-    return op, addr("as", req["as"]), args
+    return op, via if via is not None else addr("as", req["as"]), args

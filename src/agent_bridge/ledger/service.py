@@ -1,8 +1,8 @@
 """ledgerd: serves the resource ledger over MQTT 5 request/response.
 
-Requests on ledger/req, JSON {"op": ..., "as": "<addr>", ...} with ResponseTopic (under ledger/resp/) and
-CorrelationData. Every request, lease expiry and presence update is handled in order by the main thread, one at a
-time, each in its own SQLite transaction.
+Requests on ledger/req/<addr> (or plain ledger/req, where the body's "as" names the agent), JSON
+{"op": ..., "as": "<addr>", ...} with ResponseTopic (under ledger/resp/) and CorrelationData. Every request, lease
+expiry and presence update is handled in order by the main thread, one at a time, each in its own SQLite transaction.
 """
 
 import os
@@ -33,7 +33,7 @@ def main():
     def on_connect(c, _u, _f, rc, _p):
         if rc.is_failure:
             return log("connect refused", rc)
-        c.subscribe([("ledger/req", 1), ("agents/+", 1)])
+        c.subscribe([("ledger/req", 1), ("ledger/req/+", 1), ("agents/+", 1)])
         log(f"connected to {config.HOST}:{config.PORT}, db {DB}")
 
     def on_disconnect(_c, _u, _f, rc, _p):
@@ -87,8 +87,8 @@ def main():
             continue
         topic, payload, qos, mid, resp, corr = item
         try:
-            if topic == "ledger/req":
-                ledger.handle(payload, resp, corr)
+            if topic == "ledger/req" or topic.startswith("ledger/req/"):
+                ledger.handle(payload, resp, corr, topic[len("ledger/req/") :] or None)
             elif topic.startswith("agents/") and re.fullmatch(ADDR, topic[7:]):
                 ledger.run(ledger.presence, topic[7:], payload)
         except Exception:
