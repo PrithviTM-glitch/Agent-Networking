@@ -73,6 +73,7 @@ def snapshot():
             rows.append(
                 {
                     "key": v["key"],
+                    "session": v["session"] or v["parent"],
                     "friendly": v["friendly"],
                     "kind": v["kind"],
                     "pid": pid,

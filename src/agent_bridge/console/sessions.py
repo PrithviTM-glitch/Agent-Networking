@@ -324,6 +324,8 @@ def view(addr, rec, reg):
         "addr": addr,
         "session": session,
         "on_bus": rec is not None,
+        "parent": rec and rec.get("parent"),
+        "subagent": bool(rec and (rec.get("kind") == "subagent" or "parent" in rec)),
         "friendly": " · ".join(x for x in (short, task) if x) or fallback,
         "name": rec and rec["name"],
         "caps": rec["caps"] if rec else [],

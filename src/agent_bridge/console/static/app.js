@@ -82,13 +82,14 @@ function viewKey(v) {
 function go(v) {
   S.view = v;
   if (v.type === "chan") { delete S.unread[v.id]; delete S.atme[v.id]; }
-  if (v.type === "agent") { S.tab = "overview"; S.profile = null; loadProfile(); loadCapacity(); }
+  if (v.type === "agent") { S.tab = "overview"; S.profile = null; loadProfile(); loadCapacity(); loadUsage(); }
   if (v.type === "ledger") { S.ledger = null; loadLedger(); }
   if (v.type === "kill" || v.type === "stop") {
     S.kill = {signal: "terminate", sessions: false, preview: null, results: null, selected: new Set()};
     loadKillPreview();
   }
-  if (v.type === "capacity") loadCapacity();
+  if (v.type === "capacity") { loadCapacity(); loadUsage(); }
+  if (v.type === "chan" && v.id.startsWith("room:")) loadUsage();
   if (v.type === "leaks") { S.leaks = null; loadLeaks(); }
   if (v.type === "audit") loadAudit();
   $("nav").classList.remove("open");
@@ -228,8 +229,11 @@ function renderChannel(id, fresh) {
   if (room) {
     const r = roomInfo(room);
     sub = (r.mode === "announce" ? "announce only · " : "") + (r.moderators.length ? "moderators " + r.moderators.join(", ") + " · " : "") + sub;
+    const u = S.usage && S.usage.enabled && !S.usage.error && roomUsage(room);
+    if (u && u.known) sub = money(u.cost) + " · " + count(u.tokens) + " tokens over " + u.known + " of " + u.sessions + " sessions, last 30 days · " + sub;
   }
-  const tools = room ? [filter, button("Settings", () => go({type: "roomset", room})), button("Kill room…", () => go({type: "kill", room}), "danger")] : [];
+  const tools = room ? [filter, grafanaLink({"var-room": room}, "Grafana"), button("Settings", () => go({type: "roomset", room})),
+    button("Kill room…", () => go({type: "kill", room}), "danger")].filter(Boolean) : [];
   setTitle(label(id), sub, tools);
   body.replaceChildren();
   if (!list.length) body.append(el("div", "empty", atOnly ? "No messages mention admin." : "No messages yet."));
@@ -384,7 +388,7 @@ function renderOverview(body, a) {
     field(dl, "Rooms", a.rooms.join(", "));
     field(dl, "Topics", a.topics.join(", "), true);
   }
-  body.append(add(card, dl), resourcesCard(a), controls(a));
+  body.append(add(card, dl), resourcesCard(a), usageCard(a), controls(a));
 }
 function controls(a) {
   const card = add(el("div", "card"), el("h4", null, "Process control"));
@@ -624,8 +628,10 @@ function renderCapacity() {
   card.append(el("div", null, "load " + (m.load ? m.load.join(" · ") : "—") + " on " + m.cpus + " cores · memory " +
     bytes(used) + " used of " + bytes(m.mem_total) + (c.first ? " · CPU appears from the next sample" : "")));
   body.append(card);
-  body.append(table("Claude sessions, by CPU (each with everything it started)", ["Session", "Kind", "CPU", "Memory", "Processes"],
-    c.sessions.map(r => [sessionLink(r.key), r.kind || "—", num(pct(r.cpu)), num(bytes(r.rss)), num(r.procs)])));
+  const costCol = S.usage && S.usage.enabled;
+  body.append(table("Claude sessions, by CPU (each with everything it started)", ["Session", "Kind", "CPU", "Memory", "Processes", ...(costCol ? ["Cost"] : [])],
+    c.sessions.map(r => [sessionLink(r.key), r.kind || "—", num(pct(r.cpu)), num(bytes(r.rss)), num(r.procs),
+      ...(costCol ? [num(money(usageOf(r.session)?.cost))] : [])])));
   body.append(table("Top processes on the machine", ["PID", "Command", "CPU", "Memory", "Belongs to"], procRows(c.top, true)));
   body.scrollTop = top;
 }
@@ -640,6 +646,64 @@ function resourcesCard(a) {
   t.classList.remove("card");
   card.append(t);
   return card;
+}
+
+// Claude usage from Prometheus (optional)
+
+async function loadUsage() {
+  try { S.usage = await api("/api/usage"); } catch (e) { S.usage = {enabled: true, error: e.message, sessions: {}}; }
+  const v = S.view.type;
+  if (v === "capacity") renderCapacity();
+  else if (v === "chan" && S.view.id.startsWith("room:")) renderChannel(S.view.id);
+  else if (v === "agent" && S.tab === "overview" && $("usage")) {
+    const a = byKey(S.view.key);
+    if (a) $("usage").replaceWith(usageCard(a));
+  }
+}
+function money(v) { return v == null ? "—" : "$" + v.toLocaleString([], {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+function count(v) {
+  if (v == null) return "—";
+  return v >= 1e9 ? (v / 1e9).toFixed(1) + "B" : v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e4 ? (v / 1e3).toFixed(0) + "k" : String(Math.round(v));
+}
+function hours(s) { return s == null ? "—" : s >= 3600 ? (s / 3600).toFixed(1) + " h" : Math.round(s / 60) + " min"; }
+function sum(o) { return Object.values(o || {}).reduce((a, b) => a + b, 0); }
+function grafanaLink(q, text) {
+  const g = S.usage && S.usage.grafana;
+  if (!g) return null;
+  const l = el("a", "btn", text || "Open in Grafana");
+  l.href = g + "/d/agent-bridge?" + new URLSearchParams(q);
+  l.target = "_blank"; l.rel = "noopener noreferrer";
+  return l;
+}
+function usageOf(sid) { return sid && S.usage && S.usage.sessions ? S.usage.sessions[sid] : null; }
+function usageCard(a) {
+  const card = add(el("div", "card"), el("h4", null, "Claude usage"));
+  card.id = "usage";
+  const u = S.usage, sid = a.session || a.parent;
+  if (!u) { card.append(el("div", "muted", "Loading…")); return card; }
+  if (!u.enabled) { card.append(el("div", "muted", u.hint)); return card; }
+  if (u.error) card.append(el("div", "muted", u.error));
+  if (!sid) { card.append(el("div", "muted", "No Claude session is known for this agent.")); return card; }
+  const x = usageOf(sid);
+  if (!x) { card.append(el("div", "muted", "No usage recorded for session " + sid + " in the last 30 days.")); }
+  else {
+    const dl = el("dl");
+    field(dl, "Cost", money(x.cost) + (a.parent ? " (its parent session's total)" : ""));
+    field(dl, "Tokens", count(sum(x.tokens)) + " · " + Object.entries(x.tokens).map(([k, v]) => k + " " + count(v)).join(", "));
+    field(dl, "Active time", hours(sum(x.active)) + (Object.keys(x.active).length ? " · " + Object.entries(x.active).map(([k, v]) => k + " " + hours(v)).join(", ") : ""));
+    field(dl, "Lines", "+" + count(x.lines.added || 0) + " / −" + count(x.lines.removed || 0));
+    field(dl, "Commits, PRs", count(x.commits) + ", " + count(x.prs));
+    card.append(dl);
+  }
+  const g = grafanaLink({"var-session": sid});
+  if (g) card.append(add(el("div", "act"), g));
+  return card;
+}
+function roomUsage(room) {
+  const sids = new Set(S.agents.filter(a => a.rooms.includes(room)).map(a => a.session || a.parent).filter(Boolean));
+  let cost = 0, tokens = 0, known = 0;
+  for (const sid of sids) { const x = usageOf(sid); if (x) { cost += x.cost; tokens += sum(x.tokens); known++; } }
+  return {sessions: sids.size, known, cost, tokens};
 }
 
 // leftovers: test containers and orphaned processes
@@ -916,6 +980,10 @@ function boot() {
     else if (S.view.type === "ledger") loadLedger();
   }, 5000);
   setInterval(() => { if (S.view.type === "capacity") loadCapacity(); }, 3000);
+  setInterval(() => {
+    const v = S.view;
+    if (v.type === "capacity" || (v.type === "agent" && S.tab === "overview") || (v.type === "chan" && v.id.startsWith("room:"))) loadUsage();
+  }, 60000);
   setInterval(() => { if (S.view.type === "leaks") loadLeaks(); }, 10000);
   setInterval(() => { if (S.view.type === "chan") renderNav(); }, 30000);
   if (!S.token) { showLogin(); return; }

@@ -229,6 +229,71 @@ the page says why.
 
 **Audit log.** Filters by action, by target substring and by time range. Targets link to their agent or room.
 
+**Claude usage and Grafana (optional).** Two environment variables turn this on, independently of each other:
+- `AGENT_BRIDGE_PROMETHEUS_URL`, a Prometheus that receives Claude Code's OpenTelemetry metrics, adds a "Claude
+  usage" card to profiles: cost, tokens by type, active time, lines added and removed, commits and PRs. It also adds
+  a cost column to Capacity, and usage totals over a room's members' sessions. A session's totals sum each of its
+  series' highest value in the last 30 days, so a counter that restarts within one series is undercounted. Queries
+  run only while a page asks, are cached for a minute, time out after 3 s, and fail soft with the reason shown.
+- `AGENT_BRIDGE_GRAFANA_URL` adds "Open in Grafana" links to `/d/agent-bridge?var-session=<id>` and
+  `?var-room=<room>`.
+
+**Metrics.** `GET /metrics` serves Prometheus text format for any Prometheus on the host to scrape. Like the page,
+it is loopback-only and Host-checked; being read-only, it needs no token. The console pushes nothing anywhere: a
+scrape job for `127.0.0.1:10000` is all it takes, and while the console is down the scrape shows `up == 0`. Grafana
+joins rely on three info gauges, each with value 1:
+- `agent_bridge_session{session_id, name, addr, kind}`, exactly one per session, for joining names onto
+  `claude_code_*` metrics by `session_id`;
+- `agent_bridge_agent{session_id, addr, name, kind}`, one per bus agent, where a subagent carries its parent's
+  session;
+- `agent_bridge_membership{session_id, addr, name, room}`, one per agent and room.
+
+The "Agent bridge" dashboard (uid `agent-bridge`) uses them, from scrape job `agent-bridge-console`, to show cost and
+tokens per agent and per room, spend and token timelines per session, and a top-sessions table with names. The
+registry holds:
+- **sessions and agents:** the info gauges, `agent_bridge_agent_alive`, `agent_bridge_agents{state,on_bus}`;
+- **rooms:** `agent_bridge_room_{members,moderators,announce,muted,banned}`;
+- **relays:** `agent_bridge_session_relay`, `agent_bridge_relays_live`;
+- **per-session processes:** `agent_bridge_session_{cpu_percent,memory_bytes,processes}`;
+- **the ledger:** `agent_bridge_ledgers`, `agent_bridge_ledger_{resources,requests,leases,waiters}`;
+- **the audit log:** `agent_bridge_audit_entries{action,outcome}`;
+- **leftovers:** `agent_bridge_leftover_{containers,processes,cleanup_paused}`;
+- **the console process:** `agent_bridge_console_{cpu_seconds_total,memory_bytes,threads,open_fds,uptime_seconds,stream_clients,broker_connected}`;
+- **the machine:** `agent_bridge_machine_{load,cpus,memory_bytes}`;
+- **the broker:** `agent_bridge_broker_*`, mosquitto's `$SYS` statistics re-exported: clients, messages, bytes,
+  publish counts, load averages, retained messages, subscriptions, the message store, uptime and version. Heap
+  appears only on brokers built with memory tracking. mosquitto publishes `$SYS` every `sys_interval`, 10 s by
+  default, so `config/mosquitto.conf` needs nothing.
+
+Claude cost and tokens are deliberately not in the registry: Claude Code exports them itself, and re-exporting them
+into the same Prometheus would count them twice. Labels carry names and ids, never message text. A source that
+fails is skipped and flagged as `agent_bridge_scrape_error{source}`. Leftovers (a docker call) are read at most
+every 30 s.
+
+**Monitoring is optional.** The bridge needs nothing from a monitoring stack. Every integration stays off until its
+variable is set (`AGENT_BRIDGE_PROMETHEUS_URL`, `AGENT_BRIDGE_GRAFANA_URL`) or something scrapes `/metrics`, and
+failures only leave numbers out. Nothing in this repository depends on a particular collector, Prometheus or Grafana
+deployment, nor they on it. The "Agent bridge" Grafana dashboard lives with the monitoring stack. Without the
+bridge it still shows Claude Code usage, with sessions by id and the room panels reading "No agent bridge data".
+
+**Headless and the admin CLI.** `agent-bridge-console --headless` runs the API, `/metrics` and the admin identity
+without serving the page. `agent-bridge-admin` drives a running console (headless or not) through that API. It reads
+the token file and sends the same Host, Origin and token headers as the page, so its actions are checked and audited
+the same way. It never connects to the broker itself, and if no console is running it says how to start one.
+Output is one JSON object per line; errors are one line with exit status 1.
+
+| Command | Does |
+|---|---|
+| `status`, `capacity`, `leftovers`, `agents`, `rooms`, `room ROOM` | Read the console's state |
+| `say ROOM TEXT`, `dm ADDR TEXT`, `broadcast TEXT` | Post as `admin` |
+| `mute`/`unmute`/`kick`/`ban`/`unban ROOM ADDR`, `mod add\|remove ROOM ADDR`, `room-set ROOM [--mode open\|announce] [--rules TEXT]` | Moderate a room |
+| `kill-room ROOM [--confirm ROOM] [--sessions] [--signal terminate\|kill] [--only A,B]` | Preview a room kill, or do it with `--confirm` |
+| `stop-agent ADDR [--confirm ADDR] [--sessions] [--signal ...]` | The same for one agent |
+| `signal TARGET interrupt\|terminate\|kill [--session]` | Signal a live session by address, or by session id |
+| `cleanup container NAME`, `cleanup process PID START` | Remove a leftover listed by `leftovers` |
+| `audit [--action A] [--target T] [--since 6h] [--until T] [--last N]` | Audit entries, oldest first |
+| `metrics` | Print `/metrics` |
+
 **Idle cost.** The console refreshes the registry, transcripts and liveness only while a page has the live stream
 open. It re-reads a transcript only when its size or mtime changed, and looks for a missing transcript at most every
 30 s. Capacity and leftovers are computed only when asked for.

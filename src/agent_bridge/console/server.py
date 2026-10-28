@@ -1,5 +1,6 @@
 """HTTP for the console: static page, token-protected JSON API and the live event stream."""
 
+import argparse
 import json
 import os
 import queue
@@ -10,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 from .. import config, rooms
 from ..history import dms
 from ..validation import BridgeError
-from . import actions, admin, auth, capacity, events, kill, leaks, processes, sessions
+from . import actions, admin, auth, capacity, events, kill, leaks, metrics, processes, sessions, usage
 from .processes import Refused
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -77,16 +78,25 @@ READS = {
     "/api/capacity": lambda _q: capacity.snapshot(),
     "/api/leaks": lambda _q: leaks.report(),
     "/api/audit": audit,
+    "/api/usage": lambda _q: usage.snapshot(),
 }
 
 
 class Handler(BaseHTTPRequestHandler):
     token = None
+    headless = False
 
     def do_GET(self):
         url = urlsplit(self.path)
         if not auth.host_ok(self.headers):
             return self.send_error(403)
+        if url.path == "/metrics":
+            # Read-only and loopback-only like the page itself, so a scraper needs no token.
+            return self.reply(
+                200, metrics.exposition(metrics.collect()).encode(), "text/plain; version=0.0.4; charset=utf-8"
+            )
+        if url.path in STATIC and self.headless:
+            return self.json(404, {"error": "headless console: no web page, use the API or agent-bridge-admin"})
         if url.path in STATIC:
             name, ctype = STATIC[url.path]
             with open(os.path.join(STATIC_DIR, name), "rb") as f:
@@ -181,13 +191,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    Handler.token = auth.load_token()
+    p = argparse.ArgumentParser(description="The agent bus admin console on 127.0.0.1 (MONITOR_PORT, default 10000).")
+    p.add_argument("--headless", action="store_true", help="serve the API and /metrics only, no web page")
+    a = p.parse_args()
+    Handler.token, Handler.headless = auth.load_token(), a.headless
     server = ThreadingHTTPServer(("127.0.0.1", auth.PORT), Handler)
     admin.observe()
     for fn in (admin.hold_admin, sessions.watch):
         threading.Thread(target=fn, daemon=True).start()
-    print(
-        f"admin console for broker {config.HOST}:{config.PORT}\nlogin: http://127.0.0.1:{auth.PORT}/#token={Handler.token}",
-        flush=True,
-    )
+    print(f"admin console for broker {config.HOST}:{config.PORT}", flush=True)
+    if a.headless:
+        print(
+            f"headless: API on http://127.0.0.1:{auth.PORT}/api, token in {auth.TOKEN_FILE}; use agent-bridge-admin",
+            flush=True,
+        )
+    else:
+        print(f"login: http://127.0.0.1:{auth.PORT}/#token={Handler.token}", flush=True)
     server.serve_forever()

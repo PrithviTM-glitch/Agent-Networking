@@ -6,15 +6,19 @@ log and the broadcast hook. The tests are one scenario in file order."""
 import contextlib
 import fcntl
 import http.client
+import http.server
 import json
 import os
+import re
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 
 import pytest
@@ -158,6 +162,41 @@ ASSISTANT = json.dumps(
 )
 
 
+USAGE = {
+    "claude_code_cost_usage_USD_total": [({}, 12.5)],
+    "claude_code_token_usage_tokens_total": [({"type": "input"}, 1200), ({"type": "output"}, 3400)],
+    "claude_code_active_time_seconds_total": [({"type": "user"}, 600), ({"type": "cli"}, 1800)],
+    "claude_code_lines_of_code_count_total": [({"type": "added"}, 120), ({"type": "removed"}, 7)],
+    "claude_code_commit_count_total": [({}, 2)],
+    "claude_code_pull_request_count_total": [({}, 1)],
+}
+fake = {"queries": []}
+
+
+class FakePrometheus(http.server.BaseHTTPRequestHandler):
+    """Answers /api/v1/query with USAGE for session S1, whatever the aggregation."""
+
+    def do_GET(self):
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)["query"][0]
+        fake["queries"].append(q)
+        metric = next((m for m in USAGE if m in q), None)
+        rows = [{"metric": {"session_id": S1, **labels}, "value": [time.time(), str(v)]} for labels, v in USAGE[metric]]
+        body = json.dumps({"status": "success", "data": {"resultType": "vector", "result": rows}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+
+def fake_server(handler):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
 def fixtures():
     os.makedirs(FAKE_BIN)
     os.makedirs(PROJ)
@@ -216,7 +255,14 @@ def console(ledgerd, state_dir):
     fixtures()
     state["c"] = ledger.connect()
     env = {k: v for k, v in os.environ.items() if k not in ("XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR")}
-    env.update(HOME=HOME, PATH=f"{FAKE_BIN}:{os.environ['PATH']}", MONITOR_PORT=str(WEB))
+    prom = fake_server(FakePrometheus)
+    env.update(
+        HOME=HOME,
+        PATH=f"{FAKE_BIN}:{os.environ['PATH']}",
+        MONITOR_PORT=str(WEB),
+        AGENT_BRIDGE_PROMETHEUS_URL=f"http://127.0.0.1:{prom.server_port}",
+        AGENT_BRIDGE_GRAFANA_URL="http://grafana.test:3000",
+    )
     with open(os.path.join(TMP, "monitor.err"), "w") as err:
         state["mon"] = mon = subprocess.Popen([CONSOLE], env=env, stdout=subprocess.PIPE, stderr=err, text=True)
     mon.stdout.readline()
@@ -233,6 +279,7 @@ def console(ledgerd, state_dir):
             os.kill(pid, signal.SIGKILL)
     state["mon"].kill()
     state["mon"].wait()
+    prom.shutdown()
     state["c"].disconnect()
     state["c"].loop_stop()
     shutil.rmtree(TMP, ignore_errors=True)
@@ -992,6 +1039,245 @@ def test_audit_filters():
     assert recent and all(e["action"] == "room/kill" for e in recent)
     assert req("GET", "/api/audit?since=yesterday")[0] == 400
     assert req("GET", "/api/audit", token=None)[0] == 401
+
+
+def scraped(name):
+    """The console's current /metrics samples for name, as label dicts with the value under "="."""
+    return [labels | {"=": value} for labels, value in series(scrape()[2]).get(name, [])]
+
+
+def test_usage():
+    from agent_bridge.console import usage
+
+    code, u = req("GET", "/api/usage")
+    assert code == 200 and u["enabled"] and u["error"] is None and u["grafana"] == "http://grafana.test:3000", u
+    x = u["sessions"][S1]
+    assert x == {
+        "cost": 12.5,
+        "tokens": {"input": 1200, "output": 3400},
+        "active": {"user": 600, "cli": 1800},
+        "lines": {"added": 120, "removed": 7},
+        "commits": 2,
+        "prs": 1,
+    }, x
+    asked = len(fake["queries"])
+    assert asked == 6 and all("max_over_time(" in q and "[30d]" in q for q in fake["queries"]), fake["queries"]
+    assert req("GET", "/api/usage")[1]["sessions"][S1]["cost"] == 12.5 and len(fake["queries"]) == asked, "cached"
+    assert req("GET", "/api/usage", token=None)[0] == 401
+
+    # The room join for Grafana: a session agent in a room, and a subagent of the same session in it too.
+    presence("join-1", session=S1, topics=["room/joined", "room/other"])
+    presence("join-sub", kind="subagent", parent=S1, topics=["room/joined"])
+    want = {("join-1", "joined", S1), ("join-1", "other", S1), ("join-sub", "joined", S1)}
+
+    def memberships():
+        return {(p["addr"], p.get("room"), p.get("session_id")) for p in scraped("agent_bridge_membership")}
+
+    assert wait_for(lambda: want <= memberships(), 15), memberships()
+    assert {p["="] for p in scraped("agent_bridge_membership")} == {1}
+    named = [p for p in scraped("agent_bridge_session") if p["session_id"] == S1]
+    assert len(named) == 1 and named[0]["addr"] == "join-1" and named[0]["name"], named
+    agents = {p["addr"]: p for p in scraped("agent_bridge_agent")}
+    assert agents["join-sub"]["kind"] == "subagent" and agents["join-sub"]["session_id"] == S1, agents["join-sub"]
+
+    # Fail soft, and off when unset, checked in this process.
+    real = usage.PROMETHEUS, usage.state["snap"]
+    try:
+        usage.PROMETHEUS, usage.state["snap"] = f"http://127.0.0.1:{free_port()}", None
+        s = usage.snapshot()
+        assert s["enabled"] and s["error"].startswith("Prometheus at") and s["sessions"] == {}, s
+        usage.PROMETHEUS, usage.state["snap"] = None, None
+        s = usage.snapshot()
+        assert not s["enabled"] and "AGENT_BRIDGE_PROMETHEUS_URL" in s["hint"] and s["sessions"] == {}, s
+    finally:
+        usage.PROMETHEUS, usage.state["snap"] = real
+
+
+SAMPLE = re.compile(r'([a-z_]+)(\{(?:[a-z_]+="(?:[^"\\]|\\.)*",?)*\})? (-?[0-9.e+-]+|NaN)')
+
+
+def scrape(**kw):
+    c = http.client.HTTPConnection("127.0.0.1", kw.pop("port", WEB), timeout=30)
+    c.request("GET", "/metrics", headers={"Host": kw.pop("host", HOST)})
+    r = c.getresponse()
+    return r.status, r.getheader("Content-Type"), r.read().decode()
+
+
+def series(text):
+    """name -> list of (labels dict, value) from Prometheus text, checking every line's syntax."""
+    out = {}
+    for line in text.splitlines():
+        if line.startswith("# HELP ") or line.startswith("# TYPE "):
+            continue
+        m = SAMPLE.fullmatch(line)
+        assert m, f"bad exposition line: {line!r}"
+        labels = dict(re.findall(r'([a-z_]+)="((?:[^"\\]|\\.)*)"', m[2] or ""))
+        out.setdefault(m[1], []).append((labels, float(m[3])))
+    return out
+
+
+def test_metrics():
+    code, ctype, text = scrape()
+    assert code == 200 and ctype.startswith("text/plain; version=0.0.4"), (code, ctype)
+    assert scrape(host="evil.example:1")[0] == 403, "the Host check covers /metrics too"
+    assert "# TYPE agent_bridge_console_cpu_seconds_total counter" in text
+    s = wait_for(lambda: (x := series(scrape()[2])) and "agent_bridge_broker_clients" in x and x, 20)
+    assert s, "the broker's $SYS statistics never arrived"
+    states = {lab["state"] for lab, _ in s["agent_bridge_broker_clients"]}
+    assert {"connected", "total"} <= states and any(lab.get("version") for lab, _ in s["agent_bridge_broker_info"]), s
+    assert any(lab == {"kind": "messages_received", "window": "1min"} for lab, _ in s["agent_bridge_broker_load"])
+    assert s["agent_bridge_machine_cpus"][0][1] >= 1 and len(s["agent_bridge_machine_load"]) == 3
+    assert s["agent_bridge_console_open_fds"][0][1] > 0 and s["agent_bridge_console_threads"][0][1] >= 3
+    assert any(lab.get("addr") == "join-1" and lab.get("room") == "joined" for lab, _ in s["agent_bridge_membership"])
+    assert any(lab["room"] == "set" for lab, _ in s["agent_bridge_room_members"])
+    assert any(lab.get("action") == "send" for lab, _ in s["agent_bridge_audit_entries"])
+    assert "agent_bridge_ledgers" in s and "agent_bridge_leftover_containers" in s, sorted(s)
+    assert "agent_bridge_scrape_error" not in s, s.get("agent_bridge_scrape_error")
+    sids = [lab["session_id"] for lab, _ in s["agent_bridge_session"]]
+    assert len(sids) == len(set(sids)), "one agent_bridge_session series per session"
+    assert "hello room" not in text and "please look" not in text, "no message text in metrics"
+    assert not any(k.startswith("claude_code") for k in s), "Claude's own metrics are not re-exported"
+
+
+def test_headless():
+    port, broker_port = free_port(), free_port()
+    env = {k: v for k, v in os.environ.items() if k not in ("XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR")}
+    # No broker on its port: the console keeps retrying the bus while its HTTP side works, without ever touching
+    # the test broker's admin identity.
+    env.update(HOME=HOME, MONITOR_PORT=str(port), AGENT_BRIDGE_PORT=str(broker_port))
+    with open(os.path.join(TMP, "headless.err"), "w") as err:
+        p = subprocess.Popen([CONSOLE, "--headless"], env=env, stdout=subprocess.PIPE, stderr=err, text=True)
+    procs.append(p)
+    p.stdout.readline()
+    line = p.stdout.readline()
+    assert line.startswith(f"headless: API on http://127.0.0.1:{port}/api") and state["token"] not in line, line
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    for path in ("/", "/app.js", "/app.css"):
+        c.request("GET", path, headers={"Host": f"127.0.0.1:{port}"})
+        r = c.getresponse()
+        r.read()
+        assert r.status == 404, (path, r.status)
+    c.request("GET", "/api/state", headers={"Host": f"127.0.0.1:{port}", "X-Admin-Token": state["token"]})
+    r = c.getresponse()
+    assert r.status == 200 and json.loads(r.read())["connected"] is False
+    code, _, text = scrape(port=port, host=f"127.0.0.1:{port}")
+    assert code == 200 and "agent_bridge_console_broker_connected 0" in text
+    p.kill()
+    p.wait()
+
+
+def admin_cli(*args, home=None, port=None):
+    env = {k: v for k, v in os.environ.items() if k not in ("XDG_CONFIG_HOME",)}
+    env.update(HOME=home or HOME, MONITOR_PORT=str(port or WEB))
+    r = subprocess.run(
+        [sys.executable, "-m", "agent_bridge.console.cli", *args], env=env, capture_output=True, text=True, timeout=60
+    )
+    return (
+        r.returncode,
+        [json.loads(line) for line in r.stdout.splitlines()] if args[0] != "metrics" else r.stdout,
+        r.stderr,
+    )
+
+
+def cli_ok(*args):
+    code, out, err = admin_cli(*args)
+    assert code == 0, (args, code, err)
+    return out
+
+
+def test_admin_cli():
+    imports = subprocess.run(
+        [sys.executable, "-c", "import sys, agent_bridge.console.cli; print(sorted(sys.modules))"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "paho" not in imports and "agent_bridge.bus" not in imports, "the CLI must never open a bus of its own"
+
+    [st] = cli_ok("status")
+    assert st["connected"] is True and st["on_bus"] >= 3 and st["sessions"] >= st["on_bus"], st
+    addrs = {a["addr"] for a in cli_ok("agents")}
+    assert {"admin", "bob-1"} <= addrs, addrs
+    seen = []
+    w = ledger.connect()
+    w.on_message = lambda _c, _u, m: seen.append((m.topic, json.loads(m.payload)))
+    w.subscribe("room/cli-room", qos=1)
+    w.subscribe("broadcast", qos=1)
+    presence("cli-mod-a1b2c3", topics=["room/cli-room"])
+    claude, start, by, _ = fake_session(("cli-sub",))
+    presence("cli-sub", topics=["room/cli-room"], pid=claude.pid, pid_start=start)
+    assert wait_for(lambda: agent("cli-mod-a1b2c3") and agent("cli-sub"))
+    time.sleep(0.3)
+    assert cli_ok("say", "cli-room", "hello from the cli") == [{"ok": True, "result": "sent"}]
+    cli_ok("broadcast", "cli broadcast")
+    assert wait_for(
+        lambda: (
+            {(t, m["body"]) for t, m in seen}
+            >= {("room/cli-room", "hello from the cli"), ("broadcast", "cli broadcast")}
+        )
+    )
+    assert all(m["from"] == "admin" for _, m in seen)
+    cli_ok("room-set", "cli-room", "--mode", "announce", "--rules", "be brief")
+    cli_ok("mod", "add", "cli-room", "cli-mod-a1b2c3")
+    cli_ok("mute", "cli-room", "cli-sub")
+    [info] = cli_ok("room", "cli-room")
+    assert info["mode"] == "announce" and info["moderators"] == ["cli-mod-a1b2c3"] and info["muted"] == ["cli-sub"], (
+        info
+    )
+    assert sorted(info["members"]) == ["cli-mod-a1b2c3", "cli-sub"], info
+    cli_ok("unmute", "cli-room", "cli-sub")
+    assert any(r["room"] == "cli-room" and r["mode"] == "announce" for r in cli_ok("rooms"))
+
+    code, out, err = admin_cli("kill-room", "cli-room")
+    assert code == 0 and "preview only: add --confirm cli-room" in err, err
+    assert {t["preview"]["addr"]: t["preview"]["class"] for t in out} == {
+        "cli-mod-a1b2c3": "unverifiable",
+        "cli-sub": "subagent",
+    }
+    assert not dead(by["cli-sub"]), "a preview changes nothing"
+    out = cli_ok("kill-room", "cli-room", "--confirm", "cli-room", "--only", "cli-sub")
+    assert out[0]["target"]["addr"] == "cli-sub" and out[0]["target"]["result"].startswith(
+        "subagent stopped: signalled"
+    ), out
+    assert out[-1]["result"].endswith("1 selected: 1 subagent"), out
+    assert wait_for(lambda: dead(by["cli-sub"])) and claude.poll() is None
+    code, out, err = admin_cli("stop-agent", "cli-mod-a1b2c3")
+    assert code == 0 and out[0]["preview"]["class"] == "unverifiable" and "--confirm cli-mod-a1b2c3" in err
+    out = cli_ok("stop-agent", "cli-mod-a1b2c3", "--confirm", "cli-mod-a1b2c3")
+    assert out[-1]["result"] == "unverifiable: wiped the agent", out
+    assert wait_for(lambda: not agent("cli-mod-a1b2c3"))
+
+    kills = cli_ok("audit", "--action", "room/kill", "--since", "10m")
+    assert (
+        kills
+        and all(e["action"] == "room/kill" for e in kills)
+        and any(e["target"] == "cli-room:cli-sub" for e in kills)
+    )
+    assert cli_ok("audit", "--since", str(time.time() + 100)) == []
+    [machine, *_] = cli_ok("capacity")
+    assert machine["machine"]["cpus"] >= 1
+    assert "busy" in cli_ok("leftovers")[0]
+    code, text, _ = admin_cli("metrics")
+    assert code == 0 and "agent_bridge_console_uptime_seconds" in text
+
+    # One-line errors and a non-zero exit.
+    code, out, err = admin_cli("say", "bad room", "x")
+    assert code == 1 and out == [] and err.strip().startswith("bad room") and err.count("\n") == 1, err
+    code, _, err = admin_cli("status", port=free_port())
+    assert code == 1 and "no admin console on 127.0.0.1:" in err and "agent-bridge-console" in err, err
+    code, _, err = admin_cli("status", home=tempfile.mkdtemp())
+    assert code == 1 and "no admin token at" in err, err
+    code, _, err = admin_cli("audit", "--since", "yesterday")
+    assert code == 1 and "bad time" in err, err
+    code, _, err = admin_cli("cleanup", "process", "12")
+    assert code == 1 and "PID START" in err, err
+    log = [json.loads(x) for x in open(os.path.join(DATA, "admin-audit.jsonl"))]
+    assert any(e["action"] == "room/settings" and e["target"] == "room:cli-room" for e in log), (
+        "CLI actions are audited"
+    )
+    w.disconnect()
+    w.loop_stop()
+    kill_tree(claude.pid)
 
 
 def test_audits():

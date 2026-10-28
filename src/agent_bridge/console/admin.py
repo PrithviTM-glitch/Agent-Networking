@@ -19,15 +19,21 @@ from .processes import Refused
 BACKLOG = 2000
 held = {"bus": None}
 settings = {}  # room -> its moderation record as rooms.view shows it, from the retained rooms/<room> topics
+broker = {}  # $SYS topic -> its latest text, the broker's own statistics (mosquitto publishes every sys_interval)
 
 
 def _on_connect(c, *_):
     sessions.clear_presence()
-    c.subscribe("#", qos=0)
+    broker.clear()
+    # "#" never matches $SYS topics, so the broker's statistics need a subscription of their own.
+    c.subscribe([("#", 0), ("$SYS/#", 0)])
 
 
 def _on_message(_c, _u, m):
-    if m.topic.startswith("agents/"):
+    if m.topic.startswith("$SYS/"):
+        if (m.topic in broker or len(broker) < 500) and len(m.payload) < 200:
+            broker[m.topic] = m.payload.decode(errors="replace")
+    elif m.topic.startswith("agents/"):
         sessions.set_presence(m.topic[7:], m.payload and parse_presence(m.payload))
         sessions.push_agents()
     elif m.topic.startswith("rooms/"):

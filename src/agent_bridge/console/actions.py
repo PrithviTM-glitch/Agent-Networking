@@ -233,6 +233,24 @@ def audit_query(action=None, target=None, since=None, until=None, limit=AUDIT_SH
     return {"entries": list(out), "actions": sorted(ACTION_NAMES)}
 
 
+def audit_counts():
+    """action -> (entries, of which refused or failed), over the whole audit log."""
+    counts = collections.defaultdict(lambda: [0, 0])
+    try:
+        with open(AUDIT, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    c = counts[str(e["action"])[:64]]
+                except (ValueError, KeyError, TypeError):
+                    continue
+                c[0] += 1
+                c[1] += str(e.get("result", "")).startswith(("refused", "error"))
+    except FileNotFoundError:
+        pass
+    return dict(counts)
+
+
 def audit_tail():
     try:
         with open(AUDIT, encoding="utf-8", errors="replace") as f:
