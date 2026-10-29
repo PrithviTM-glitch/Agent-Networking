@@ -447,7 +447,8 @@ def test_presence_cache_resets_on_reconnect(api):
     )
     stamps = _other_process(api, code).split()
     t1 = time.monotonic()
-    # Queued in a's session while it is away, the marker can only reach a over its new connection: a has reconnected.
+    # The marker reaches a after the clear on a's one stream, or over a connection that began after the wipe: either
+    # way a's cache reflects the wipe.
     peer.dm(a.addr, "marker")
     marker = _heard(a, 15, lambda m: m["body"] == "marker")
     t2 = time.monotonic()
@@ -455,7 +456,7 @@ def test_presence_cache_resets_on_reconnect(api):
     timeline = {
         "subprocess": [f"{n} +{float(t) - t0:.3f}" for n, t in zip(stamps[::2], stamps[1::2], strict=True)],
         "returned": f"+{t1 - t0:.3f}",
-        "marker": f"+{t2 - t0:.3f}" if marker else "never",
+        "marker": f"+{t2 - t0:.3f}" if any(m["body"] == "marker" for m in marker) else "never",
         "ghost still retained": ghost.addr in (retained := {x["addr"] for x in presence.agents()}),
         "retained agents": len(retained),
     }

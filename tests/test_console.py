@@ -1333,6 +1333,23 @@ def test_audits():
     print("audit ok")
 
 
+def test_ledger_no_reply_wording(monkeypatch):
+    """A release or deny whose reply never came may still have been applied, so the console says so; a read does not."""
+    from agent_bridge.console import admin
+    from agent_bridge.errors import LedgerError
+
+    class Lost:
+        def ledger(self, op, as_, **fields):
+            raise LedgerError({"ok": False, "error": "no reply from ledgerd within 5s, is it running?"})
+
+    monkeypatch.setitem(admin.held, "bus", Lost())
+    for op, applied in (("release", True), ("deny", True), ("dump", False)):
+        with pytest.raises(admin.Refused) as e:
+            admin.ledger_call(op, "admin")
+        assert str(e.value).startswith("ledger: no reply from ledgerd within 5s"), e.value
+        assert ("it may still have been applied, check the ledger view" in str(e.value)) == applied, (op, e.value)
+
+
 def test_native_only_imports():
     """The console and the MCP server run on the native core: importing them loads no paho and none of the Python bus,
     presence, rooms, ledger or history clients, so those can be deleted without touching either."""

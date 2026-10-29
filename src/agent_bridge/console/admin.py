@@ -7,12 +7,13 @@ import threading
 import time
 
 from .. import _native
-from ..errors import HistoryError
+from ..errors import HistoryError, LedgerError
 from ..validation import ADMIN
 from . import events, sessions
 from .processes import ERRORS, Refused
 
 BACKLOG = 2000
+MUTATING = ("release", "deny")  # the ledger ops the console's actions apply
 SYS_MAX = 500  # $SYS topics kept: mosquitto publishes about 60, so this only bounds a hostile flood
 held = {"bus": None}
 settings = {}  # room -> its moderation record as rooms_view shows it, from the retained rooms/<room> topics
@@ -95,7 +96,12 @@ def ledger_call(op, as_, **fields):
             return bus.ledger(op, as_, **fields)
         return _native.ledger_call(op, as_, **fields)
     except ERRORS as e:
-        raise Refused(f"ledger: {' '.join(str(e).split())}") from None
+        why = " ".join(str(e).split())
+        if op in MUTATING and isinstance(e, LedgerError) and why.startswith("no reply"):
+            # The request may have reached ledgerd and only its reply been lost, e.g. to another console that took
+            # the admin identity mid-call.
+            why += "; it may still have been applied, check the ledger view"
+        raise Refused(f"ledger: {why}") from None
 
 
 def dump():

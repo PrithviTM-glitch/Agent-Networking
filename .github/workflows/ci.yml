@@ -87,7 +87,8 @@ jobs:
       - run: docker run --rm --entrypoint python agent-bridge-ci:python -I -c 'import agent_bridge._native, agent_bridge.history.service, agent_bridge.ledger.service'
       - run: docker build -t agent-bridge-ci:rust rust
   interop:
-    # Python and Rust agents on one broker, the Rust tests that need Docker.
+    # Python and Rust side by side: the Rust tests that need Docker, and the parity tests that hand one database
+    # between the Python and Rust services (they skip unless AGENT_BRIDGE_HISTORYD / AGENT_BRIDGE_LEDGERD point at Rust).
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -98,3 +99,8 @@ jobs:
       - run: docker pull eclipse-mosquitto:2.0.22
       - run: uv sync --frozen
       - run: cargo test --manifest-path rust/Cargo.toml --workspace -- --ignored
+      - run: cargo build --release --manifest-path rust/Cargo.toml -p agent-bridge-historyd -p agent-bridge-ledgerd
+      - run: uv run --no-sync pytest -p no:cacheprovider tests/test_history_parity.py tests/test_ledger_parity.py
+        env:
+          AGENT_BRIDGE_HISTORYD: ${{ github.workspace }}/rust/target/release/agent-bridge-historyd
+          AGENT_BRIDGE_LEDGERD: ${{ github.workspace }}/rust/target/release/agent-bridge-ledgerd

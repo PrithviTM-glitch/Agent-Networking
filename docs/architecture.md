@@ -246,7 +246,10 @@ is refused with an error naming it. `@` glued to a word (`alice@example.com`) is
 ## History service
 
 `agent-bridge-historyd` is the only writer of message history, one store for every bridge client on the machine.
-Bridge clients no longer write `history.jsonl`; sending never depends on historyd.
+Bridge clients no longer write `history.jsonl`; sending never depends on historyd. It exists twice: the Python
+reference (`src/agent_bridge/history/`), which Compose runs, and a Rust port (`rust/crates/historyd`) with the same
+schema, row digests and replies, so either can take over the other's `history.db` (see the README's
+[Rust implementation](../README.md#rust-implementation) section). Everything below holds for both.
 
 - **Recording.** It subscribes to `#` with No Local and retain handling 2 (a reconnect does not replay retained
   records), keeps `room/...`, `inbox/...`, `broadcast` and raw topics, and ignores every other reserved level and
@@ -545,7 +548,9 @@ as a dead session. Dead sessions that have not been updated for the stale period
   given and held, pending requests, leases with expiry and fencing token, waiters). Every session gets Activity, the
   last 30 transcript entries (user and assistant text, tool names).
 - **Ledger view**: every resource with its leases (holder, level, expiry, token), waiters and requests, from the
-  ledgerd `dump` op, refreshed every 5 s while open.
+  ledgerd `dump` op, refreshed every 5 s while open. Releasing a lease or revoking a grant acts as the resource's
+  owner; if ledgerd's reply never arrives, the result says the action may still have been applied, so check the view
+  (retrying is safe: a second release finds no lease, a second deny changes nothing).
 - **Audit log**: every admin action from `admin-audit.jsonl`, newest first, live, filterable by action, target
   substring and time range.
 - **Capacity, leftovers, the room kill switch and targeted stop**: described in the

@@ -105,13 +105,25 @@ pub fn show(value: &str) -> String {
 
 /// show() for a decoded JSON value, as Python would print it.
 pub fn show_value(value: &Value) -> String {
-    let repr = match value {
+    py_repr_value(value).chars().take(60).collect()
+}
+
+/// Python's repr() of what json.loads made of value.
+fn py_repr_value(value: &Value) -> String {
+    let join = |items: Vec<String>| items.join(", ");
+    match value {
         Value::String(s) => py_repr(s),
         Value::Null => "None".into(),
         Value::Bool(b) => if *b { "True" } else { "False" }.into(),
-        other => crate::json::dumps(other),
-    };
-    repr.chars().take(60).collect()
+        Value::Number(n) => match n.as_f64() {
+            Some(f) if n.is_f64() => crate::json::float_repr(f),
+            _ => n.to_string(),
+        },
+        Value::Array(a) => format!("[{}]", join(a.iter().map(py_repr_value).collect())),
+        Value::Object(o) => {
+            format!("{{{}}}", join(o.iter().map(|(k, v)| format!("{}: {}", py_repr(k), py_repr_value(v))).collect()))
+        }
+    }
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -138,7 +150,7 @@ pub fn check_ident_cap<'a>(value: &'a str, what: &str, cap: usize) -> Result<&'a
     }
 }
 
-fn check_ident_value(value: &Value, what: &str) -> Result<String> {
+pub fn check_ident_value(value: &Value, what: &str) -> Result<String> {
     match value.as_str() {
         Some(s) => check_ident(s, what).map(str::to_owned),
         None => fail(format!("bad {what} {}: use 1-{ID_MAX} ASCII letters, digits, _ or -", show_value(value))),
@@ -204,7 +216,7 @@ pub fn check_rules_value(value: &Value, cap: usize) -> Result<String> {
     check_text_value(value, "rules", cap)
 }
 
-fn py_type(value: &Value) -> &'static str {
+pub fn py_type(value: &Value) -> &'static str {
     match value {
         Value::Null => "NoneType",
         Value::Bool(_) => "bool",
@@ -317,6 +329,16 @@ mod tests {
             "address 'Admin' is reserved for the admin console"
         );
         assert!(not_admin(None, "address").is_ok());
+    }
+
+    #[test]
+    fn values_show_as_python_reprs() {
+        assert_eq!(
+            show_value(&json!(["r", 1, null, true, 2.5, {"k": "it's"}])),
+            r#"['r', 1, None, True, 2.5, {'k': "it's"}]"#
+        );
+        assert_eq!(show_value(&json!(1e16)), "1e+16");
+        assert_eq!(show_value(&json!(["x".repeat(70)])).chars().count(), 60);
     }
 
     #[test]
