@@ -395,6 +395,16 @@ impl Bus {
         self.shared.lock().rooms.get(room).cloned()
     }
 
+    /// addr's presence record as this connection's cache holds it, once connected (for tests of the cache itself).
+    pub fn cached_agent(&self, addr: &str) -> Result<Option<Map>> {
+        self.seen(addr)
+    }
+
+    /// room's settings record as this connection's cache holds it right now.
+    pub fn cached_room(&self, room: &str) -> Option<Map> {
+        self.room_rec(room)
+    }
+
     fn announce(&self, room: &str, verb: &str) -> Result<()> {
         if rooms::refusal(self.room_rec(room).as_ref(), &self.addr).is_some() {
             return Ok(());

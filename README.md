@@ -66,7 +66,7 @@ historyd run in Rust, and the admin console and the MCP server run on the Rust c
 | `agent-bridge-admin` | The console's API from the shell | Python |
 | `agent-bridge-ledgerd` | The resource ledger service (Compose runs the Rust one) | Rust, Python (rollback) |
 | `agent-bridge-historyd` | The history service (Compose runs the Rust one) | Rust, Python (rollback) |
-| `agent-bridge-ledger` | Raw ledger requests, for scripts | Python |
+| `agent-bridge-ledger` / `agent-bridge ledger-raw` | Raw ledger requests, for scripts | Python / Rust |
 
 The protocol, the Python API, the full CLI reference, the ledger model and the internals of each part are in
 [docs/architecture.md](docs/architecture.md). Connecting agents beyond one machine, and authentication, are planned
@@ -90,8 +90,11 @@ Both carry messages, but they are for different things.
 ## Quick start
 
 You need Linux (the console and the relay read `/proc`), Docker with Compose, [uv](https://docs.astral.sh/uv/), and,
-until prebuilt wheels are published, a Rust toolchain of 1.85 or newer ([rustup](https://rustup.rs/)): the package
-contains a Rust extension that every install compiles, which takes a minute or two the first time.
+to install from the repository, a Rust toolchain of 1.85 or newer ([rustup](https://rustup.rs/)): the package contains
+a Rust extension that a source install compiles, which takes a minute or two the first time. The wheels attached to
+each [release](https://github.com/PrithviTM-glitch/Agent-Networking/releases)
+are prebuilt for x86_64 and aarch64 Linux and need no toolchain: `uv tool install` takes the downloaded wheel file in
+place of the git URL.
 
 Install the commands for your user. They land in `~/.local/bin`:
 
@@ -471,6 +474,15 @@ container on a free port (never the one on 1883), each test module gets a fresh 
 ledgerd, historyd, the console, the relay and the MCP server run as real processes against it. A full run takes about
 three minutes.
 
+The release gate builds the wheel, installs it into a fresh Python 3.12 virtualenv, runs the full suite against the
+installed wheel three times in a row, then the Rust tests including the ones that need Docker (those also need
+`uv sync`), and stops at the first failure. Everything it builds goes in a temp directory. `GATE_RUNS` and
+`GATE_PYTHON` change the run count and the Python version.
+
+```bash
+scripts/gate.sh
+```
+
 - **One run at a time.** Each run holds `$XDG_RUNTIME_DIR/agent-bridge-tests-<uid>.lock`. A second run on the
   machine prints `waiting for another agent-bridge test run (pid N) to finish` and starts when the first ends.
 - **No leftover brokers.** Test containers carry the label `agent-bridge-test.uid=<uid>` and are removed when the run
@@ -484,9 +496,9 @@ three minutes.
   `agent_bridge._native`, through the public API and the wire only: no call stalls behind a blocked one, concurrent
   joins keep every room, a closed Bus never takes the session back from its next owner, ledger replies never fill a
   Bus's receive window, leave drops the ledger (also with ledgerd down), `wait_arrival` wakes once per new arrival,
-  forged history requests are refused, and wrong-typed input to every entry point is a one-line `BridgeError` with the
-  same message in both. The run ends with a "bus behaviours" summary of the named behaviours the cutover to Rust must
-  keep.
+  forged history requests are refused, and wrong-typed input to every entry point, or text with a lone surrogate, is a
+  one-line `BridgeError` with the same message in both. The run ends with a "bus behaviours" summary of the named
+  behaviours the cutover to Rust must keep.
 
 | Module | Covers |
 |---|---|
@@ -495,14 +507,16 @@ three minutes.
 | `tests/test_mentions.py` | @mentions: resolution when sending, validation when receiving, `for_me` in `recv` |
 | `tests/test_history.py` | historyd: recording and queries, redelivered messages stored once, the one-time import, drop of one's own inbox only, pruning and caps, hostile requests, the schema-version refusal, restart persistence, health, arguments that start nothing, the reserved level |
 | `tests/test_history_takeover.py` | A second historyd on one broker takes the session over and the first exits instead of taking it back (a module of its own, since every historyd shares the client id) |
+| `tests/test_history_golden.py` | A fixed corpus of messages and requests replayed against `AGENT_BRIDGE_HISTORYD` gets the Python reference's replies byte for byte (`tests/golden/historyd.json`); the documented divergences (NaN echo, nesting depth, integers over 4300 digits) carry the Rust reply as an override. `AGENT_BRIDGE_GOLDEN=write` regenerates the file while the reference exists |
 | `tests/test_history_parity.py` | The Python historyd and `AGENT_BRIDGE_HISTORYD` taking turns on one database: nothing stored twice, every reply (queries, refusals, truncation, CorrelationData and ResponseTopic handling) byte for byte the same; skipped when `AGENT_BRIDGE_HISTORYD` is the Python one |
 | `tests/test_ledger_takeover.py` | A second ledgerd on one broker takes the session over and the first exits instead of taking it back (a module of its own, since every ledgerd shares the client id) |
+| `tests/test_ledger_golden.py` | A fixed script of 115 raw ledger requests (every op, every refusal text, busy and FIFO, fencing, redelivery replay, request topics, hostile input, dump truncation, drop) replayed against `AGENT_BRIDGE_LEDGERD`; the normalised replies (ids as R1/L1, timestamps as `<t>`, tokens from 1) must equal the Python ledgerd's in `tests/golden/ledgerd.jsonl`, apart from the Known differences; regenerate with `tests/golden/make_ledgerd.py` |
 | `tests/test_ledger_parity.py` | The Rust ledgerd and the Python one (the rollback) handing one `ledger.db` back and forth: the state reads the same both ways, a redelivered request is replayed from the other implementation's stored answer, a waiter queued under one is served by the other, fencing tokens keep growing, one schema row; skipped when `AGENT_BRIDGE_LEDGERD` is the Python one |
 | `tests/test_ledger.py` | Ledger semantics, a manual-ack shared client, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, quotas, a 10-process lock stress test, the admin dump, the stale sweep |
 | `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice, arguments refused before anything connects |
 | `tests/test_host.py` | The agent-framework adapter: the generic host, Claude Code's session and process detection, the inbox socket, a fake session registry (the `.key` files never opened), transcripts, kind detection |
 | `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, one channel notice per arrival across the relay taking the session and handing it back, adopting a CLI-registered agent, mentions waking only the mentioned agent |
-| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho or Python bus clients |
+| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho and none of the Python bus, CLI, relay, hooks, ledger or history modules |
 | `tests/test_conformance.py` | The checks above, once against the Python modules and once against `_native` |
 
 CI (`.github/workflows/ci.yml`, GitHub Actions) runs ruff; the Rust formatter, clippy and tests; builds manylinux wheels
@@ -523,7 +537,7 @@ opens the other's `ledger.db` and either historyd the other's `history.db`.
 | Crate | Builds |
 |---|---|
 | `crates/core` | The library: validation, protocol, identity, an MQTT 5 session layer on rumqttc's codec, presence, rooms and moderation, mentions, the Bus, the console's Observer, the relay's lock file, one request/response helper with the ledgerd and historyd clients on it, and `host` with the generic host and the `claude` adapter (session, process, inbox socket) |
-| `crates/cli` | `agent-bridge`: every CLI command, including `relay start\|stop\|status\|run`, and the Claude Code hooks as `hook broadcast` and `hook relay-start` |
+| `crates/cli` | `agent-bridge`: every CLI command, including `relay start\|stop\|status\|run`, the Claude Code hooks as `hook broadcast` and `hook relay-start`, and `ledger-raw`, which takes `agent-bridge-ledger`'s arguments and prints the same |
 | `crates/ledgerd` | `agent-bridge-ledgerd` |
 | `crates/historyd` | `agent-bridge-historyd` |
 | `crates/py` | `agent_bridge._native`, the core as a Python extension (PyO3, abi3 for Python 3.12+), built by maturin with the package: the Bus (with `wait_arrival` for arrival notices), the Observer, ledgerd and historyd calls, presence, rooms, relay and identity lookups, the validators and limits. It raises the exceptions of `agent_bridge.errors`, and bad input of any type gets the Python Bus's one-line `BridgeError`, never a `TypeError` |
@@ -571,8 +585,9 @@ Compose runs both services with `init: true`. As PID 1 on an empty image they wo
 would wait 10 s for the kill; docker-init forwards it and they stop at once, which is safe at any point: every request
 and message is one SQLite transaction, acked to the broker only after it commits.
 
-The Rust tests, then the ones that need Docker and `uv sync` (Python and Rust agents exchanging DMs, room messages
-and mentions on one broker, both CLIs printing the same lines and errors):
+The Rust tests, then the ones that need Docker and `uv sync` (Python and Rust agents exchanging DMs, room messages and
+mentions on one broker, both CLIs printing the same lines and errors, and the Rust CLI replaying the Python CLI's
+transcript frozen in `rust/crates/cli/tests/golden/cli.txt`):
 
 ```bash
 cargo test --manifest-path rust/Cargo.toml
@@ -595,18 +610,21 @@ Measured on one machine (median of 20 calls, the Python CLI from its virtualenv)
 Known differences: the CLI's argument errors are worded by clap instead of argparse (still one line and exit 1; ledgerd
 and historyd print argparse's); JSON nested deeper than 128 levels is refused where Python accepts a few thousand (it
 only matters in fields nobody reads, and in ledgerd's and historyd's error text: both refuse a request nested that deep,
-Rust with `payload must be UTF-8 JSON`); `leave` drops the ledger and the history at the same time, so it waits at most
-3 s when both services are down where Python waits 6 s; concurrent joins on one Bus never lose a room, where the Python
-Bus can; and an error that echoes a NaN or an infinity shows it as `{}` where Python shows `nan` or `inf` (what is
-accepted or refused is the same).
+Rust with `payload must be UTF-8 JSON`); an integer longer than 4300 digits is parsed where Python refuses the whole
+request with `payload must be UTF-8 JSON` (its integer limit), so ledgerd and historyd then name the first bad field
+instead (both refuse); `leave` drops the ledger and the history at the same time, so it waits at most 3 s when both
+services are down where Python waits 6 s; concurrent joins on one Bus never lose a room, where the Python Bus can; and
+an error that echoes a NaN or an infinity shows it as `{}` where Python shows `nan` or `inf` (what is accepted or
+refused is the same).
 
 ## Roadmap
 
 What exists is described above; this is what is planned and not built yet.
 
-- **Prebuilt wheels.** The release workflow is in place: a `v*` tag builds manylinux wheels and attaches them to a
-  GitHub Release, so installing will need no Rust toolchain. Publishing to PyPI is wired but off until the PyPI
-  project and its trusted publisher are set up. No release has been tagged yet.
+- **PyPI.** Releases are on GitHub: a `v*` tag builds manylinux wheels for x86_64 and aarch64 and attaches them,
+  with the sdist, to a [GitHub Release](https://github.com/PrithviTM-glitch/Agent-Networking/releases)
+  (v0.1.0 is the first). Publishing to PyPI is wired but off until the PyPI project and its trusted publisher are set
+  up.
 - **One Rust core.** The console and the MCP server already run on `agent_bridge._native` and import no paho; next the
   Python Bus, CLI, relay, ledger and history implementations are deleted. The gate is the full suite, including the
   conformance tests, passing three times against the installed wheel. The wheel will then also carry the native

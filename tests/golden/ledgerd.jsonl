@@ -1,0 +1,115 @@
+{"step": "init gold-o1", "reply": {"ok": true, "created": true, "owner": "gold-o1", "since": "<t>"}}
+{"step": "init gold-r1", "reply": {"ok": true, "created": true, "owner": "gold-r1", "since": "<t>"}}
+{"step": "init gold-w1", "reply": {"ok": true, "created": true, "owner": "gold-w1", "since": "<t>"}}
+{"step": "init gold-h1", "reply": {"ok": true, "created": true, "owner": "gold-h1", "since": "<t>"}}
+{"step": "init again", "reply": {"ok": true, "created": false, "owner": "gold-o1", "since": "<t>"}}
+{"step": "ledger before init", "reply": {"ok": false, "error": "no ledger for gold-none0, call init first"}}
+{"step": "add pub", "reply": {"ok": true, "resource": {"id": "gold-o1/pub", "owner": "gold-o1", "name": "pub", "description": "shared", "visibility": "public", "max_level": "write", "created": "<t>", "updated": "<t>"}}}
+{"step": "add priv", "reply": {"ok": true, "resource": {"id": "gold-o1/priv", "owner": "gold-o1", "name": "priv", "description": "secret", "visibility": "private", "max_level": "read", "created": "<t>", "updated": "<t>"}}}
+{"step": "add again", "reply": {"ok": false, "error": "gold-o1/pub exists, use update"}}
+{"step": "ledger own", "reply": {"ok": true, "owner": "gold-o1", "resources": [{"id": "gold-o1/priv", "owner": "gold-o1", "name": "priv", "description": "secret", "visibility": "private", "max_level": "read", "created": "<t>", "updated": "<t>"}, {"id": "gold-o1/pub", "owner": "gold-o1", "name": "pub", "description": "shared", "visibility": "public", "max_level": "write", "created": "<t>", "updated": "<t>"}]}}
+{"step": "ledger other", "reply": {"ok": true, "owner": "gold-o1", "resources": [{"id": "gold-o1/pub", "owner": "gold-o1", "name": "pub", "description": "shared", "visibility": "public", "max_level": "write", "created": "<t>", "updated": "<t>"}]}}
+{"step": "public", "reply": {"ok": true, "resources": [{"id": "gold-o1/pub", "owner": "gold-o1", "name": "pub", "description": "shared", "visibility": "public", "max_level": "write", "created": "<t>", "updated": "<t>"}]}}
+{"step": "update visibility", "reply": {"ok": true, "resource": {"id": "gold-o1/priv", "owner": "gold-o1", "name": "priv", "description": "secret", "visibility": "public", "max_level": "read", "created": "<t>", "updated": "<t>"}}}
+{"step": "update nothing", "reply": {"ok": false, "error": "nothing to update: give description, visibility or max_level"}}
+{"step": "update not owner", "reply": {"ok": false, "error": "no such resource: gold-r1/priv"}}
+{"step": "update back", "reply": {"ok": true, "resource": {"id": "gold-o1/priv", "owner": "gold-o1", "name": "priv", "description": "still", "visibility": "private", "max_level": "read", "created": "<t>", "updated": "<t>"}}}
+{"step": "add tmp", "reply": {"ok": true, "resource": {"id": "gold-o1/tmp", "owner": "gold-o1", "name": "tmp", "description": "", "visibility": "private", "max_level": "read", "created": "<t>", "updated": "<t>"}}}
+{"step": "remove tmp", "reply": {"ok": true}}
+{"step": "remove again", "reply": {"ok": false, "error": "no such resource: gold-o1/tmp"}}
+{"step": "request auto", "reply": {"ok": true, "request": {"id": "R1", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}}}
+{"step": "request auto again", "reply": {"ok": true, "request": {"id": "R1", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}}}
+{"step": "request pending", "reply": {"ok": true, "request": {"id": "R2", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "pending", "ts": "<t>"}}}
+{"step": "request pending again", "reply": {"ok": true, "request": {"id": "R2", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "pending", "ts": "<t>"}}}
+{"step": "grant not owner", "reply": {"ok": false, "error": "no such request: R2"}}
+{"step": "grant", "reply": {"ok": true, "request": {"id": "R2", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}}}
+{"step": "request to deny", "reply": {"ok": true, "request": {"id": "R3", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-w1", "level": "write", "status": "pending", "ts": "<t>"}}}
+{"step": "deny", "reply": {"ok": true, "request": {"id": "R3", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-w1", "level": "write", "status": "denied", "ts": "<t>"}}}
+{"step": "request own", "reply": {"ok": false, "error": "you own this resource, owners always hold write"}}
+{"step": "grants holder", "reply": {"ok": true, "held": [{"id": "R1", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}, {"id": "R2", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}], "asked": []}}
+{"step": "grants owner", "reply": {"ok": true, "held": [], "asked": [{"id": "R1", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}, {"id": "R2", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}, {"id": "R3", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-w1", "level": "write", "status": "denied", "ts": "<t>"}]}}
+{"step": "acquire without grant", "reply": {"ok": false, "error": "no read grant on gold-o1/priv, request it first"}}
+{"step": "acquire read", "reply": {"ok": true, "lease": {"lease_id": "L1", "resource": "gold-o1/pub", "holder": "gold-r1", "level": "read", "expires_at": "<t>"}}}
+{"step": "request write", "reply": {"ok": true, "request": {"id": "R4", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-w1", "level": "write", "status": "granted", "ts": "<t>"}}}
+{"step": "acquire busy", "reply": {"ok": false, "error": "busy", "holders": [{"holder": "gold-r1", "level": "read", "expires_at": "<t>"}]}}
+{"step": "dump with waiter", "reply": {"ok": true, "ledgers": [{"owner": "gold-h1", "since": "<t>", "last_seen": "<t>"}, {"owner": "gold-o1", "since": "<t>", "last_seen": "<t>"}, {"owner": "gold-r1", "since": "<t>", "last_seen": "<t>"}, {"owner": "gold-w1", "since": "<t>", "last_seen": "<t>"}], "resources": [{"id": "gold-o1/priv", "owner": "gold-o1", "name": "priv", "description": "still", "visibility": "private", "max_level": "read", "created": "<t>", "updated": "<t>"}, {"id": "gold-o1/pub", "owner": "gold-o1", "name": "pub", "description": "shared", "visibility": "public", "max_level": "write", "created": "<t>", "updated": "<t>"}], "requests": [{"id": "R4", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-w1", "level": "write", "status": "granted", "ts": "<t>"}, {"id": "R3", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-w1", "level": "write", "status": "denied", "ts": "<t>"}, {"id": "R2", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}, {"id": "R1", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}], "leases": [{"lease_id": "L1", "resource": "gold-o1/pub", "holder": "gold-r1", "level": "read", "expires_at": "<t>"}], "waiters": [{"resource": "gold-o1/pub", "holder": "gold-w1", "level": "write", "queued_at": "<t>", "deadline": "<t>"}], "ts": "<t>"}}
+{"step": "renew", "reply": {"ok": true, "lease": {"lease_id": "L1", "resource": "gold-o1/pub", "holder": "gold-r1", "level": "read", "expires_at": "<t>"}}}
+{"step": "renew not holder", "reply": {"ok": false, "error": "no such lease: L1 (it may have expired)"}}
+{"step": "release not holder", "reply": {"ok": false, "error": "no such lease: L1 (it may have expired)"}}
+{"step": "release read", "reply": {"ok": true}}
+{"step": "waiter served", "reply": {"ok": true, "lease": {"lease_id": "L2", "resource": "gold-o1/pub", "holder": "gold-w1", "level": "write", "expires_at": "<t>", "token": 1}}}
+{"step": "acquire behind writer", "reply": {"ok": false, "error": "busy", "holders": [{"holder": "gold-w1", "level": "write", "expires_at": "<t>"}]}}
+{"step": "owner breaks lease", "reply": {"ok": true}}
+{"step": "acquire owner write", "reply": {"ok": true, "lease": {"lease_id": "L3", "resource": "gold-o1/pub", "holder": "gold-o1", "level": "write", "expires_at": "<t>", "token": 2}}}
+{"step": "release owner write", "reply": {"ok": true}}
+{"step": "renew unknown", "reply": {"ok": false, "error": "no such lease: 0123456789abcdef (it may have expired)"}}
+{"step": "replay first", "reply": {"ok": true, "lease": {"lease_id": "L4", "resource": "gold-o1/pub", "holder": "gold-o1", "level": "write", "expires_at": "<t>", "token": 3}}}
+{"step": "replay copy", "reply": {"ok": true, "lease": {"lease_id": "L4", "resource": "gold-o1/pub", "holder": "gold-o1", "level": "write", "expires_at": "<t>", "token": 3}}}
+{"step": "release replayed", "reply": {"ok": true}}
+{"step": "topic ok", "reply": {"ok": true, "held": [], "asked": [{"id": "R1", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}, {"id": "R2", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}, {"id": "R3", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-w1", "level": "write", "status": "denied", "ts": "<t>"}, {"id": "R4", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-w1", "level": "write", "status": "granted", "ts": "<t>"}]}}
+{"step": "topic as mismatch", "reply": {"ok": false, "error": "as: must match the request topic ledger/req/gold-o1"}}
+{"step": "topic bad address", "reply": {"ok": false, "error": "request topic address: must match [A-Za-z0-9_-]{1,64}"}}
+{"step": "plain without as", "reply": {"ok": false, "error": "as: required"}}
+{"step": "no correlation", "reply": {"ok": false, "error": "CorrelationData of 1 to 256 bytes required"}}
+{"step": "correlation too long", "reply": {"ok": false, "error": "CorrelationData of 1 to 256 bytes required"}}
+{"step": "junk not json", "reply": {"ok": false, "error": "payload must be UTF-8 JSON"}}
+{"step": "junk not utf-8", "reply": {"ok": false, "error": "payload must be UTF-8 JSON"}}
+{"step": "junk empty", "reply": {"ok": false, "error": "payload must be UTF-8 JSON"}}
+{"step": "junk array", "reply": {"ok": false, "error": "request must be a JSON object"}}
+{"step": "junk string", "reply": {"ok": false, "error": "request must be a JSON object"}}
+{"step": "junk null", "reply": {"ok": false, "error": "request must be a JSON object"}}
+{"step": "junk number", "reply": {"ok": false, "error": "request must be a JSON object"}}
+{"step": "junk deep arrays", "reply": {"ok": false, "error": "payload must be UTF-8 JSON"}}
+{"step": "junk deep objects", "reply": {"ok": false, "error": "payload must be UTF-8 JSON"}}
+{"step": "junk one megabyte", "reply": {"ok": false, "error": "payload over 16384 bytes"}}
+{"step": "junk huge int", "reply": {"ok": false, "error": "payload must be UTF-8 JSON"}}
+{"step": "junk nan", "reply": {"ok": false, "error": "ttl: number between 1 and 3600"}}
+{"step": "junk infinity", "reply": {"ok": false, "error": "ttl: number between 1 and 3600"}}
+{"step": "junk overflow", "reply": {"ok": false, "error": "ttl: number between 1 and 3600"}}
+{"step": "junk depth 200", "reply": {"ok": false, "error": "unknown fields for init: x"}}
+{"step": "junk op int", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, drop, dump"}}
+{"step": "junk op null", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, drop, dump"}}
+{"step": "junk as missing", "reply": {"ok": false, "error": "as: required"}}
+{"step": "junk as slash", "reply": {"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}}
+{"step": "junk as empty", "reply": {"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}}
+{"step": "junk as long", "reply": {"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}}
+{"step": "junk as list", "reply": {"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}}
+{"step": "junk as unicode", "reply": {"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}}
+{"step": "junk as plus", "reply": {"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}}
+{"step": "junk extra field", "reply": {"ok": false, "error": "unknown fields for init: extra"}}
+{"step": "junk dunder op", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, drop, dump"}}
+{"step": "junk long op", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, drop, dump"}}
+{"step": "junk name slash", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
+{"step": "junk name hash", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
+{"step": "junk name empty", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
+{"step": "junk name dot", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
+{"step": "junk name int", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
+{"step": "junk name dict", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
+{"step": "junk description bell", "reply": {"ok": false, "error": "description: string up to 1024 chars, no control characters"}}
+{"step": "junk description surrogate", "reply": {"ok": false, "error": "description: string up to 1024 chars, no control characters"}}
+{"step": "junk description long", "reply": {"ok": false, "error": "description: string up to 1024 chars, no control characters"}}
+{"step": "junk visibility bad", "reply": {"ok": false, "error": "visibility: one of public, private"}}
+{"step": "junk level bad", "reply": {"ok": false, "error": "max_level: one of read, write"}}
+{"step": "junk level list", "reply": {"ok": false, "error": "max_level: one of read, write"}}
+{"step": "junk ttl string", "reply": {"ok": false, "error": "ttl: number between 1 and 3600"}}
+{"step": "junk ttl bool", "reply": {"ok": false, "error": "ttl: number between 1 and 3600"}}
+{"step": "junk ttl negative", "reply": {"ok": false, "error": "ttl: number between 1 and 3600"}}
+{"step": "junk ttl zero", "reply": {"ok": false, "error": "ttl: number between 1 and 3600"}}
+{"step": "junk ttl huge", "reply": {"ok": false, "error": "ttl: number between 1 and 3600"}}
+{"step": "junk wait huge", "reply": {"ok": false, "error": "wait: number between 0 and 300"}}
+{"step": "junk acquire level bad", "reply": {"ok": false, "error": "level: one of read, write"}}
+{"step": "junk resource dots", "reply": {"ok": false, "error": "resource: must match [A-Za-z0-9_-]{1,64}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
+{"step": "junk resource bare", "reply": {"ok": false, "error": "resource: must match [A-Za-z0-9_-]{1,64}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
+{"step": "junk lease id path", "reply": {"ok": false, "error": "lease_id: must match [0-9a-f]{16}"}}
+{"step": "junk lease id int", "reply": {"ok": false, "error": "lease_id: must match [0-9a-f]{16}"}}
+{"step": "junk request id bad", "reply": {"ok": false, "error": "request_id: must match [0-9a-f]{16}"}}
+{"step": "junk request id missing", "reply": {"ok": false, "error": "request_id: required"}}
+{"step": "junk owner long", "reply": {"ok": false, "error": "owner: must match [A-Za-z0-9_-]{1,64}"}}
+{"step": "junk null field", "reply": {"ok": false, "error": "unknown fields for init: x"}}
+{"step": "junk not inited", "reply": {"ok": false, "error": "no ledger for never-inited-0, call init first"}}
+{"step": "dump truncated", "reply": {"bytes": 223352, "sha256": "5673e9e9f8e217929883e7bc1464320dd48e8a5d20cb4006d81c327bf34b4849", "truncated": true}}
+{"step": "public too big", "reply": {"ok": false, "error": "reply over 240000 bytes"}}
+{"step": "drop", "reply": {"ok": true}}
+{"step": "ledger dropped", "reply": {"ok": false, "error": "no ledger for gold-w1"}}
+{"step": "grants after drop", "reply": {"ok": true, "held": [], "asked": [{"id": "R1", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}, {"id": "R2", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}]}}
+{"step": "dump final", "reply": {"ok": true, "ledgers": [{"owner": "gold-h1", "since": "<t>", "last_seen": "<t>"}, {"owner": "gold-o1", "since": "<t>", "last_seen": "<t>"}, {"owner": "gold-r1", "since": "<t>", "last_seen": "<t>"}], "resources": [{"id": "gold-o1/priv", "owner": "gold-o1", "name": "priv", "description": "still", "visibility": "private", "max_level": "read", "created": "<t>", "updated": "<t>"}, {"id": "gold-o1/pub", "owner": "gold-o1", "name": "pub", "description": "shared", "visibility": "public", "max_level": "write", "created": "<t>", "updated": "<t>"}], "requests": [{"id": "R2", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}, {"id": "R1", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}], "leases": [], "waiters": [], "ts": "<t>"}}

@@ -12,7 +12,7 @@ from ..validation import check_text, is_count, is_ident
 from . import admin, events, kill, leaks, processes, sessions
 from .processes import Refused
 
-AUDIT = os.path.join(os.path.dirname(os.path.abspath(config.LOG)), "admin-audit.jsonl")
+AUDIT = os.path.abspath(config.data_path("admin-audit.jsonl"))
 AUDIT_SHOWN = 300
 ID16 = re.compile(r"[0-9a-f]{16}")
 
@@ -24,11 +24,16 @@ def _id16(body, key):
 
 
 def _str(body, key, optional=False):
-    """A field the bus takes as a string: the native Bus raises a bare TypeError for anything else."""
+    """A field the bus takes as a string, refused here as one line rather than as a native TypeError, or a
+    UnicodeEncodeError for a lone surrogate (which a JSON \\ud800 escape produces)."""
     if (v := body.get(key)) is None and optional:
         return None
     if not isinstance(v, str):
         raise Refused(f"{key} must be a string, got {type(v).__name__}")
+    try:
+        v.encode()
+    except UnicodeEncodeError:
+        raise Refused(f"{key} is not valid UTF-8") from None
     return v
 
 

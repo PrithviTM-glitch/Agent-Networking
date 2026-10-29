@@ -1,0 +1,115 @@
+$ agent-bridge register alpha --caps x --addr alpha-000001
+exit 0
+alpha-000001
+$ agent-bridge register beta --addr beta-000002
+exit 0
+beta-000002
+$ agent-bridge dm alpha-000001 beta-000002 hi ✓
+exit 0
+$ agent-bridge recv beta-000002
+exit 0
+{"topic": "inbox/beta-000002", "from": "alpha-000001", "body": "hi \u2713", "ts": <t>}
+$ agent-bridge join alpha-000001 room1
+exit 0
+$ agent-bridge join beta-000002 room1
+exit 0
+$ agent-bridge say beta-000002 room1 @alpha-000001 hello
+exit 0
+$ agent-bridge recv alpha-000001
+exit 0
+{"topic": "room/room1", "from": "beta-000002", "body": "[joined #room1] beta", "ts": <t>}
+{"topic": "room/room1", "from": "beta-000002", "body": "@alpha-000001 hello", "ts": <t>, "mentions": ["alpha-000001"], "for_me": true}
+$ agent-bridge rooms
+exit 0
+{"room": "room1", "members": 2, "who": ["alpha-000001", "beta-000002"], "mode": "open", "moderators": []}
+$ agent-bridge room info room1
+exit 0
+{"room": "room1", "mode": "open", "moderators": [], "rules": "", "muted": [], "banned": []}
+$ agent-bridge history room1
+exit 0
+{"topic": "room/room1", "from": "alpha-000001", "body": "[joined #room1] alpha, caps: x", "ts": <t>}
+{"topic": "room/room1", "from": "beta-000002", "body": "[joined #room1] beta", "ts": <t>}
+{"topic": "room/room1", "from": "beta-000002", "body": "@alpha-000001 hello", "ts": <t>, "mentions": ["alpha-000001"]}
+$ agent-bridge dms beta-000002
+exit 0
+{"topic": "inbox/beta-000002", "from": "alpha-000001", "body": "hi \u2713", "ts": <t>}
+$ agent-bridge dms beta-000002 --with alpha-000001
+exit 0
+{"topic": "inbox/beta-000002", "from": "alpha-000001", "body": "hi \u2713", "ts": <t>}
+$ agent-bridge sub alpha-000001 t/x
+exit 0
+$ agent-bridge pub beta-000002 t/x raw text
+exit 0
+$ agent-bridge recv alpha-000001
+exit 0
+{"topic": "t/x", "from": "beta-000002", "body": "raw text", "ts": <t>}
+$ agent-bridge room set beta-000002 room1 --mode announce
+exit 1
+only admin or a moderator of #room1 may change it, admin names the first
+$ agent-bridge say beta-000002 room1 @nobody-x hi
+exit 1
+@nobody-x is neither a member of #room1 nor the name of one
+$ agent-bridge dm beta-000002 nobody-000000 x
+exit 1
+unknown address: nobody-000000
+$ agent-bridge register bad/name
+exit 1
+bad name 'bad/name': use 1-57 ASCII letters, digits, _ or -
+$ agent-bridge recv admin
+exit 1
+address 'admin' is reserved for the admin console
+$ agent-bridge pub beta-000002 inbox/x x
+exit 1
+topic 'inbox/x' is reserved: $, agents, inbox, ledger, broadcast, rooms, history belong to the bridge
+$ agent-bridge sub beta-000002 a/#/b
+exit 1
++ must be a whole level and # a whole last level
+$ agent-bridge history room1 --last 0
+exit 1
+last must be 1-1000
+$ agent-bridge dm beta-000002 alpha-000001 bell 
+exit 1
+text contains a control character other than tab, newline or CR
+$ agent-bridge ledger-raw init --as alpha-000001
+exit 0
+{"ok": true, "created": true, "owner": "alpha-000001", "since": <t>}
+$ agent-bridge ledger-raw add --as alpha-000001 --name r1 --description first --visibility public
+exit 0
+{"ok": true, "resource": {"id": "alpha-000001/r1", "owner": "alpha-000001", "name": "r1", "description": "first", "visibility": "public", "max_level": "read", "created": <t>, "updated": <t>}}
+$ agent-bridge ledger-raw init --as beta-000002
+exit 0
+{"ok": true, "created": true, "owner": "beta-000002", "since": <t>}
+$ agent-bridge ledger-raw public --as beta-000002
+exit 0
+{"ok": true, "resources": [{"id": "alpha-000001/r1", "owner": "alpha-000001", "name": "r1", "description": "first", "visibility": "public", "max_level": "read", "created": <t>, "updated": <t>}]}
+$ agent-bridge ledger-raw request --as beta-000002 --resource alpha-000001/r1 --level read
+exit 0
+{"ok": true, "request": {"id": "<id>", "resource": "alpha-000001/r1", "owner": "alpha-000001", "holder": "beta-000002", "level": "read", "status": "granted", "ts": <t>}}
+$ agent-bridge ledger-raw acquire --as beta-000002 --resource alpha-000001/r1 --level read --ttl 5
+exit 0
+{"ok": true, "lease": {"lease_id": "<id>", "resource": "alpha-000001/r1", "holder": "beta-000002", "level": "read", "expires_at": <t>}}
+$ agent-bridge ledger-raw bogus --as alpha-000001
+exit 1
+{"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, drop, dump"}
+$ agent-bridge ledger-raw add --as nobody-1 --name r2
+exit 1
+{"ok": false, "error": "no ledger for nobody-1, call init first"}
+$ agent-bridge ledger-raw init --as bad/addr
+exit 1
+{"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}
+$ agent-bridge ledger-raw
+exit 2
+usage: agent-bridge-ledger [-h] [--as ADDR] [--timeout TIMEOUT] op
+agent-bridge-ledger: error: the following arguments are required: op
+$ agent-bridge ledger-raw init --as alpha-000001 --name
+exit 2
+usage: agent-bridge-ledger [-h] [--as ADDR] [--timeout TIMEOUT] op
+agent-bridge-ledger: error: fields go as --name value pairs
+$ agent-bridge ledger-raw init --timeout soon
+exit 2
+usage: agent-bridge-ledger [-h] [--as ADDR] [--timeout TIMEOUT] op
+agent-bridge-ledger: error: argument --timeout: invalid float value: 'soon'
+$ agent-bridge leave beta-000002
+exit 0
+$ agent-bridge leave alpha-000001
+exit 0

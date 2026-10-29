@@ -364,6 +364,59 @@ def test_wrong_types_are_one_line_bridge_errors(api):
     assert not wrong, "\n".join(wrong)
 
 
+def test_lone_surrogates_are_one_line_errors(api):
+    """A str holding a lone surrogate (what a JSON "\\ud800" escape gives) is refused like any bad value: a one-line
+    BridgeError with the Python Bus's message, never UnicodeEncodeError, and a service field gets the service's own
+    refusal. The services echo the value differently (the Python historyd keeps \\ud800, the Rust one reads \\x00), so
+    that one case pins the message up to the value."""
+    s = "\ud800"
+    a, peer = api.Bus.register(f"sur{RUN}"), api.Bus.register(f"surpeer{RUN}")
+    agents.extend((a, peer))
+    room = f"sur{RUN}{id(api) % 997}"
+    a.join(room)
+    console = api.Bus.register("admin", addr="admin", keep=True, admin=True)
+    console.mod(room, "add", a.addr)
+    console.close()
+    assert wait_for(lambda: "moderator" not in _refusal(a.room_set, room, 5)[1], 10), "a never saw its moderator rights"
+
+    def bad(what, cap=64):
+        return f"bad {what} '\\ud800': use 1-{cap} ASCII letters, digits, _ or -"
+
+    cases = [
+        ("say text", a.say, (room, s), "BridgeError", "text is not valid UTF-8"),
+        ("say room", a.say, (s, "x"), "BridgeError", bad("room")),
+        ("dm text", a.dm, (peer.addr, s), "BridgeError", "text is not valid UTF-8"),
+        ("dm to", a.dm, (s, "x"), "BridgeError", bad("address")),
+        ("pub text", a.pub, ("t/x", s), "BridgeError", "text is not valid UTF-8"),
+        ("pub topic", a.pub, (s, "x"), "BridgeError", "topic is not valid UTF-8"),
+        ("sub", a.sub, (s,), "BridgeError", "topic is not valid UTF-8"),
+        ("join", a.join, (s,), "BridgeError", bad("room")),
+        ("describe name", a.describe, (s,), "BridgeError", bad("name")),
+        ("describe caps", a.describe, (None, [s]), "BridgeError", bad("cap")),
+        ("room_set rules", a.room_set, (room, None, s), "BridgeError", "rules is not valid UTF-8"),
+        ("mute", a.mute, (room, s), "BridgeError", bad("address")),
+        ("dms peer", a.dms, (s,), "BridgeError", bad("address")),
+        ("register name", api.Bus.register, (s,), "BridgeError", bad("name", 57)),
+        ("register addr", api.Bus.register, ("x", [], False, s), "BridgeError", bad("address")),
+        ("attach", api.attach, (s,), "BridgeError", bad("address")),
+        ("agents room", api.agents, (s,), "BridgeError", bad("room")),
+        ("room info", api.room_info, (s,), "BridgeError", bad("room")),
+        ("relay session", api.relay_held, (s,), "BridgeError", "bad session id '\\ud800': expected a UUID"),
+        ("ledger op", api.ledger_call, (s, a.addr), "LedgerError", "op: one of init, add,"),
+        ("ledger as", api.ledger_call, ("ledger", s), "LedgerError", "as: must match [A-Za-z0-9_-]{1,64}"),
+        ("ledger field", lambda: api.ledger_call("add", a.addr, name="r1", description=s), (), "LedgerError",
+         "description: string up to 1024 chars, no control characters"),
+        ("history op", api.history_call, (s,), "HistoryError", "history: op: one of room,"),
+        ("history field", lambda: api.history_call("room", room=s), (), "HistoryError", "history: room: bad room '"),
+    ]  # fmt: skip
+    wrong = []
+    for name, fn, args, kind_wanted, message in cases:
+        kind, text = _refusal(fn, *args)
+        if kind != kind_wanted or not text.startswith(message):
+            wrong.append(f"{name}: got {kind}: {text}")
+    assert not wrong, "\n".join(wrong)
+
+
 # bridge-core's named bus behaviours, each against both implementations. Another process acting as the same agent is
 # a separate Python process running the same implementation, so its origin is read from its own environment.
 

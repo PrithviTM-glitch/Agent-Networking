@@ -2,11 +2,15 @@
 //! live relay and holding its pid, then the address it relays for. The console, the hooks and the CLI read it here;
 //! the relay itself is the CLI's `relay run`.
 
-use crate::config;
 use crate::validation::{ID_MAX, Result, check_session, is_ident, os_error};
+use crate::{config, presence};
+use serde_json::Value;
 use std::fs::{File, TryLockError};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// quiet room messages kept for the next post that wakes the session
+pub const BACKLOG: usize = 50;
 
 pub fn lock_path(session: &str) -> Result<PathBuf> {
     config::data_path(&["relay", &format!("{}.lock", check_session(Some(session))?.to_lowercase())])
@@ -51,4 +55,17 @@ pub fn stop(session: &str, timeout: Duration) -> Result<bool> {
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(true)
+}
+
+/// The most recently seen live agent registered from this session (e.g. through the CLI), or None. Never a
+/// subagent's agent: that one belongs to the subagent, not to the session.
+pub fn session_agent(session: &str) -> Result<Option<String>> {
+    Ok(presence::agents(None)?
+        .into_iter()
+        .find(|a| {
+            a.get("session").and_then(Value::as_str).unwrap_or("").to_lowercase() == session.to_lowercase()
+                && !a.contains_key("parent")
+                && a.get("kind").is_none_or(|k| k != "subagent")
+        })
+        .and_then(|a| a["addr"].as_str().map(str::to_owned)))
 }

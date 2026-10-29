@@ -4,6 +4,7 @@
 mod args;
 mod commands;
 mod hooks;
+mod ledger_raw;
 mod relay;
 
 use clap::Parser;

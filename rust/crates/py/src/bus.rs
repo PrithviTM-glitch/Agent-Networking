@@ -9,7 +9,7 @@ use agent_bridge::bus;
 use agent_bridge::json::Map;
 use agent_bridge::validation::{ADMIN, Error, ID_MAX, NAME_MAX};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyString};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -159,6 +159,17 @@ impl Bus {
         dicts(py, &msgs)
     }
 
+    /// addr's presence record from this connection's cache (waiting until it is connected), or None.
+    fn cached_agent<'py>(&self, py: Python<'py>, addr: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let addr = text(addr, "address")?;
+        call(py, &self.0, move |b| b.cached_agent(&addr))?.map(|m| dict(py, &m)).transpose()
+    }
+
+    /// room's settings record from this connection's cache as it is now, or None.
+    fn cached_room<'py>(&self, py: Python<'py>, room: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.0.cached_room(&text(room, "room")?).map(|m| dict(py, &m)).transpose()
+    }
+
     fn pending(&self) -> usize {
         self.0.pending()
     }
@@ -204,12 +215,22 @@ impl Bus {
     ) -> PyResult<Bound<'py, PyDict>> {
         // In the Python Bus's order: nothing to change, then the room, then (once allowed) mode and rules.
         let json = |v: Option<&Bound<'py, PyAny>>| v.filter(|v| !v.is_none()).map(from_py).transpose();
-        let (mode, rules) = (json(mode)?, json(rules)?);
+        let rules_arg = rules;
+        let (mode, mut rules) = (json(mode)?, json(rules)?);
         if mode.is_none() && rules.is_none() {
             return Err(bridge(Error("nothing to change: give mode or rules".into())));
         }
         let room = ident(room, "room")?;
-        settings(py, &self.0, move |b| b.room_set(&room, mode, rules))
+        // Rules that are a str but not UTF-8 (lone surrogates) are refused where the rules check runs, after the
+        // rights and the mode: core refuses a list there, before anything is written, and the error is Python's.
+        let not_utf8 = rules_arg.is_some_and(|r| r.cast::<PyString>().is_ok_and(|s| s.to_str().is_err()));
+        if not_utf8 {
+            rules = Some(serde_json::Value::Array(Vec::new()));
+        }
+        settings(py, &self.0, move |b| match b.room_set(&room, mode, rules) {
+            Err(e) if not_utf8 && e.0.starts_with("rules ") => Err(Error("rules is not valid UTF-8".into())),
+            other => other,
+        })
     }
 
     #[pyo3(name = "mod")]

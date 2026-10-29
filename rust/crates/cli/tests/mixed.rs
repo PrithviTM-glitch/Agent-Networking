@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const RUST: &str = env!("CARGO_BIN_EXE_agent-bridge");
@@ -73,7 +74,9 @@ fn free_port() -> u16 {
 
 fn start() -> World {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().expect("the repository");
-    let tag = format!("{:x}", std::process::id() ^ Instant::now().elapsed().subsec_nanos());
+    // Unique per world: cargo runs this binary's tests in parallel, each with its own broker and temp dir.
+    static WORLDS: AtomicUsize = AtomicUsize::new(0);
+    let tag = format!("{:x}-{}", std::process::id(), WORLDS.fetch_add(1, Ordering::SeqCst));
     let dir = std::env::temp_dir().join(format!("agent-bridge-mixed-{tag}"));
     std::fs::create_dir_all(&dir).expect("a temp dir");
     let mut w = World {
@@ -170,4 +173,129 @@ fn python_and_rust_agents_talk() {
     w.rust(&["leave", rs]);
     w.py(&["leave", py]);
     assert_eq!(w.rust(&["agents"]), "");
+}
+
+/// Which CLI runs a scenario: the Python one (agent-bridge, agent-bridge-ledger) or the Rust one.
+#[derive(Clone, Copy)]
+enum Cli {
+    Python,
+    Rust,
+}
+
+/// Epoch seconds (ts, seen, created, expires ...) and 16-hex ledger ids, which differ from run to run.
+fn normal(text: &str) -> String {
+    let (b, mut out, mut i) = (text.as_bytes(), String::new(), 0);
+    while i < b.len() {
+        let digits = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+        let starts_word = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        if starts_word && digits == 10 && b[i] == b'1' {
+            let mut end = i + 10;
+            if b.get(end) == Some(&b'.') {
+                end += 1 + b[end + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+            }
+            out.push_str("<t>");
+            i = end;
+            continue;
+        }
+        let hex = b[i..].iter().take_while(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()).count();
+        if i > 0 && b[i - 1] == b'"' && hex == 16 && b.get(i + 16) == Some(&b'"') {
+            out.push_str("<id>");
+            i += 16;
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("a char");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// The scenario's commands; "ledger-raw" steps run agent-bridge-ledger on the Python side.
+fn steps() -> Vec<Vec<&'static str>> {
+    let (a, b) = ("alpha-000001", "beta-000002");
+    vec![
+        vec!["register", "alpha", "--caps", "x", "--addr", a],
+        vec!["register", "beta", "--addr", b],
+        vec!["dm", a, b, "hi ✓"],
+        vec!["recv", b],
+        vec!["join", a, "room1"],
+        vec!["join", b, "room1"],
+        vec!["say", b, "room1", "@alpha-000001 hello"],
+        vec!["recv", a],
+        vec!["rooms"],
+        vec!["room", "info", "room1"],
+        vec!["history", "room1"],
+        vec!["dms", b],
+        vec!["dms", b, "--with", a],
+        vec!["sub", a, "t/x"],
+        vec!["pub", b, "t/x", "raw text"],
+        vec!["recv", a],
+        vec!["room", "set", b, "room1", "--mode", "announce"],
+        vec!["say", b, "room1", "@nobody-x hi"],
+        vec!["dm", b, "nobody-000000", "x"],
+        vec!["register", "bad/name"],
+        vec!["recv", "admin"],
+        vec!["pub", b, "inbox/x", "x"],
+        vec!["sub", b, "a/#/b"],
+        vec!["history", "room1", "--last", "0"],
+        vec!["dm", b, a, "bell \x07"],
+        vec!["ledger-raw", "init", "--as", a],
+        vec!["ledger-raw", "add", "--as", a, "--name", "r1", "--description", "first", "--visibility", "public"],
+        vec!["ledger-raw", "init", "--as", b],
+        vec!["ledger-raw", "public", "--as", b],
+        vec!["ledger-raw", "request", "--as", b, "--resource", "alpha-000001/r1", "--level", "read"],
+        vec!["ledger-raw", "acquire", "--as", b, "--resource", "alpha-000001/r1", "--level", "read", "--ttl", "5"],
+        vec!["ledger-raw", "bogus", "--as", a],
+        vec!["ledger-raw", "add", "--as", "nobody-1", "--name", "r2"],
+        vec!["ledger-raw", "init", "--as", "bad/addr"],
+        vec!["ledger-raw"],
+        vec!["ledger-raw", "init", "--as", a, "--name"],
+        vec!["ledger-raw", "init", "--timeout", "soon"],
+        vec!["leave", b],
+        vec!["leave", a],
+    ]
+}
+
+impl World {
+    /// Each step as "$ agent-bridge <args>", its exit status, stdout and stderr, normalised.
+    fn transcript(&self, cli: Cli) -> String {
+        let mut out = String::new();
+        for args in steps() {
+            let output = match (cli, args.first()) {
+                (Cli::Python, Some(&"ledger-raw")) => self.run(&self.python.join("agent-bridge-ledger"), &args[1..]),
+                (Cli::Python, _) => self.run(&self.python.join("agent-bridge"), &args),
+                (Cli::Rust, _) => self.run(Path::new(RUST), &args),
+            };
+            out += &format!("$ agent-bridge {}\nexit {}\n", args.join(" "), output.status.code().unwrap_or(-1));
+            out += &String::from_utf8_lossy(&output.stdout);
+            out += &String::from_utf8_lossy(&output.stderr);
+        }
+        normal(&out)
+    }
+}
+
+/// The Python CLI's transcript, frozen in tests/golden/cli.txt (rewritten with AGENT_BRIDGE_WRITE_GOLDEN=1 while
+/// the Python CLI exists), and the Rust CLI's, which must equal it line for line.
+#[test]
+#[ignore = "needs Docker and the repository's virtualenv"]
+fn the_rust_cli_matches_the_python_transcript() {
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/cli.txt");
+    let python = start().transcript(Cli::Python);
+    if std::env::var_os("AGENT_BRIDGE_WRITE_GOLDEN").is_some() {
+        std::fs::create_dir_all(golden.parent().expect("a directory")).expect("the golden directory");
+        std::fs::write(&golden, &python).expect("the golden file");
+    }
+    let want = std::fs::read_to_string(&golden).expect("tests/golden/cli.txt");
+    for (cli, got) in [("python", python), ("rust", start().transcript(Cli::Rust))] {
+        for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
+            assert_eq!(g, w, "{cli} CLI, line {}", i + 1);
+        }
+        assert_eq!(got.lines().count(), want.lines().count(), "{cli} CLI: line count");
+    }
+}
+
+#[test]
+fn normalises_times_and_ids() {
+    let text = r#"{"ts": 1793294701.3971186, "id": "0123456789abcdef", "token": 3, "n": 12345678901}"#;
+    assert_eq!(normal(text), r#"{"ts": <t>, "id": "<id>", "token": 3, "n": 12345678901}"#);
 }

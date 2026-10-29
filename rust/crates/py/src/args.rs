@@ -38,9 +38,14 @@ pub fn ident(value: &Bound<'_, PyAny>, what: &str) -> PyResult<String> {
     ident_cap(value, what, ID_MAX)
 }
 
+/// A str that is valid UTF-8, else None: an identifier check shows anything else by its repr, lone surrogates included.
+fn utf8(value: &Bound<'_, PyAny>) -> Option<String> {
+    value.cast::<PyString>().ok().and_then(|s| s.to_str().ok().map(str::to_owned))
+}
+
 /// ident with check_ident's cap (57 for a register name without an address).
 pub fn ident_cap(value: &Bound<'_, PyAny>, what: &str, cap: usize) -> PyResult<String> {
-    match as_text(value, what)? {
+    match utf8(value) {
         Some(t) => Ok(t),
         None => {
             let shown: String = value.repr()?.to_str()?.chars().take(60).collect();
@@ -89,7 +94,7 @@ pub fn last(value: &Bound<'_, PyAny>) -> PyResult<i64> {
 
 /// A session id as check_session takes it.
 pub fn session(value: &Bound<'_, PyAny>) -> PyResult<String> {
-    match as_text(value, "session id")? {
+    match utf8(value) {
         Some(t) => Ok(t),
         None => {
             let shown: String = value.repr()?.to_str()?.chars().take(60).collect();

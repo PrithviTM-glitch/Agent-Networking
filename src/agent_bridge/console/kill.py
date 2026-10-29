@@ -7,8 +7,7 @@ A whole session is killed only through its primary agent, and only when the admi
 import os
 import signal
 
-from .. import _native, relay
-from ..identity import short_hash
+from .. import _native
 from ..validation import ADMIN, check_ident
 from . import processes, sessions
 from .processes import ERRORS, Refused
@@ -34,9 +33,9 @@ def bus_processes(claude_pid, addr, procs):
 def primary(session, group):
     """The session's own agent among group (the live agents carrying session): the one its relay holds, else the
     session-derived address, else the only one. None when that is ambiguous."""
-    if (held := relay.held(session)) in group:
+    if (held := _native.relay_held(session)) in group:
         return held
-    derived = [a for a in group if a.endswith(f"-{short_hash(session)}")]
+    derived = [a for a in group if a.endswith(f"-{_native.identity_short_hash(session)}")]
     if len(derived) == 1:
         return derived[0]
     return group[0] if len(group) == 1 else None

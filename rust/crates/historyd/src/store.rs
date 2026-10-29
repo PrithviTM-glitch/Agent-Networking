@@ -77,6 +77,9 @@ pub struct History {
     stale_s: f64,
     pruned: f64,
     since_trim: u32,
+    /// MAX_ROWS and MAX_BYTES; fields only so the tests can hold small caps
+    max_rows: i64,
+    max_bytes: i64,
 }
 
 /// Why History::open failed: a database another schema version wrote (refused before anything is written), or
@@ -124,7 +127,14 @@ impl History {
             Ok(())
         };
         setup().map_err(failed)?;
-        Ok(History { db, stale_s: stale_s as f64, pruned: 0.0, since_trim: 0 })
+        Ok(History {
+            db,
+            stale_s: stale_s as f64,
+            pruned: 0.0,
+            since_trim: 0,
+            max_rows: MAX_ROWS,
+            max_bytes: MAX_BYTES,
+        })
     }
 
     /// f in one transaction, rolled back if it fails.
@@ -201,13 +211,14 @@ impl History {
 
     fn trim(&mut self) -> rusqlite::Result<()> {
         self.since_trim = 0;
+        let (max_rows, max_bytes) = (self.max_rows, self.max_bytes);
         self.tx(|db| {
             loop {
                 let (rows, size): (i64, i64) =
                     db.query_row("SELECT count(*), coalesce(sum(length(body)), 0) FROM messages", [], |r| {
                         Ok((r.get(0)?, r.get(1)?))
                     })?;
-                if rows <= MAX_ROWS && size <= MAX_BYTES {
+                if rows <= max_rows && size <= max_bytes {
                     return Ok(());
                 }
                 db.execute("DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY id LIMIT 1000)", [])?;
@@ -452,6 +463,43 @@ mod tests {
         let db = Connection::open(&path).expect("reopens");
         let index = db.query_row("SELECT count(*) FROM sqlite_master WHERE name='messages_topic'", [], |r| r.get(0));
         assert_eq!(index, Ok(0), "nothing was written");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trims_to_the_row_and_byte_caps_oldest_first() {
+        let dir = temp("trim");
+        let mut h = History::open(&dir.join("h.db"), 86400).ok().expect("opens");
+        let count =
+            |h: &History| h.db.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0)).expect("counts");
+        let say = |h: &mut History, i: usize| {
+            let payload = json!({"from": "a-1", "body": format!("m{i:05}"), "ts": 1.0 + i as f64}).to_string();
+            h.record("room/r", payload.as_bytes()).expect("records");
+        };
+        // Every 1000th new row runs a trim; until then the caps are not checked.
+        h.max_rows = 1500;
+        for i in 0..1999 {
+            say(&mut h, i);
+        }
+        assert_eq!(count(&h), 1999, "the 1000th insert trimmed nothing (1000 rows), the next trim is at 2000");
+        say(&mut h, 1999);
+        assert_eq!(count(&h), 1000, "over 1500 rows, the oldest 1000 went");
+        let newest = ask(&mut h, r#"{"op": "room", "room": "r", "last": 1}"#, None);
+        assert_eq!(bodies(&newest), ["m01999"], "the newest are kept");
+        let oldest: String =
+            h.db.query_row("SELECT body FROM messages ORDER BY id LIMIT 1", [], |r| r.get(0)).expect("a row");
+        assert_eq!(oldest, "m01000");
+        // The byte cap: 1000 bodies of 6 bytes are 6000 bytes; at most 5000 drops the oldest 1000 again.
+        h.max_rows = MAX_ROWS;
+        h.max_bytes = 5000;
+        h.trim().expect("trims");
+        assert_eq!(count(&h), 0, "trim deletes in chunks of 1000, oldest first");
+        h.max_bytes = MAX_BYTES;
+        for i in 0..10 {
+            say(&mut h, 5000 + i);
+        }
+        h.trim().expect("trims");
+        assert_eq!(count(&h), 10, "within both caps nothing goes");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

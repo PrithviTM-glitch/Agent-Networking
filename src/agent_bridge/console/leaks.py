@@ -19,14 +19,16 @@ from . import admin, processes, sessions
 from .processes import Refused
 
 TEST_CONTAINER = re.compile(r"agent-bridge-test-[0-9a-f]{6}")
-KEEP = ("agent-bridge-mqtt", "agent-bridge-ledgerd")
+KEEP = ("agent-bridge-mqtt", "agent-bridge-ledgerd", "agent-bridge-historyd")
 TEST_LOCK = "test-runner"
 ENTRY_POINTS = {
     "agent-bridge",
     "agent-bridge-ledger",
     "agent-bridge-ledgerd",
+    "agent-bridge-historyd",
     "agent-bridge-mcp",
     "agent-bridge-console",
+    "agent-bridge-admin",
     "agent-bridge-relay-hook",
     "agent-bridge-broadcast-hook",
 }

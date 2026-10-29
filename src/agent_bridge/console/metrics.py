@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 
-from .. import relay
+from .. import _native
 from . import actions, admin, capacity, events, leaks, sessions
 
 CLK = os.sysconf("SC_CLK_TCK")
@@ -112,7 +112,7 @@ def _sessions(r):
         states[(state, v["on_bus"])] = states.get((state, v["on_bus"]), 0) + 1
         if sid:
             # One per session for name joins: the agent its relay holds, else a bus agent that is no subagent.
-            rank = (bool(v["addr"]) and v["addr"] == relay.held(sid), v["on_bus"] and not v["subagent"])
+            rank = (bool(v["addr"]) and v["addr"] == _native.relay_held(sid), v["on_bus"] and not v["subagent"])
             if sid not in best or rank > best[sid][0]:
                 best[sid] = (rank, {"session_id": sid, "name": v["friendly"], "addr": v["addr"], "kind": kind})
         if v["session"] and v["relay"] is not None and v["session"] not in relayed:

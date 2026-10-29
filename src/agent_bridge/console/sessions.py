@@ -10,9 +10,8 @@ import sys
 import threading
 import time
 
-from .. import config, host
+from .. import _native, config, host
 from ..protocol import ORIGIN
-from ..relay import live as relay_live
 from ..validation import ADMIN, UUID, check_ident, is_ident
 from . import events
 from .processes import Refused, verified
@@ -180,7 +179,7 @@ def view(addr, rec, reg):
         "desktop_id": reg and reg["desktop_id"],
         "started": reg and reg["started"],
         "in_registry": reg is not None,
-        "relay": relay_live(session) if session else None,
+        "relay": _native.relay_live(session) if session else None,
     }
 
 

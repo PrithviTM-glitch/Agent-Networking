@@ -15,7 +15,7 @@ legacy `history.jsonl`, which historyd imports once and never changes (message h
 | `_native` | The Rust extension, built by maturin from `rust/crates/py`; it grows into the whole bus core |
 | `errors.py` | `BridgeError`, `LedgerError` and `HistoryError`, defined once; `_native` raises these very classes |
 | `config.py` | Environment settings and the state directory |
-| `validation.py` | Limits and every input check (re-exports `BridgeError`) |
+| `validation.py` | Limits and every input check; those the native core also enforces are re-exported from `_native`, so they are defined once (also re-exports `BridgeError`) |
 | `protocol.py` | Reserved topics, presence records and message payloads, parsed as hostile input |
 | `host.py` | The agent-framework interface: this process's session, its session process, delivery into it, every session on the machine and their transcripts; the generic host when there is no framework |
 | `identity.py` | `/proc` reading, the session and process from the host, project names and session addresses |
@@ -178,6 +178,9 @@ server run on it today; the rest of the package moves to it before the Python im
   buffered), and
   `wait_arrival(timeout, after_seq=0) -> (pending, seq)`, which returns as soon as a message newer than `after_seq` is
   buffered and otherwise waits out its timeout, so unread messages never wake it twice. It replaces `on_arrival`.
+  `cached_agent(addr)` and `cached_room(room)` read the Bus's own presence and room caches (`None` when absent):
+  `cached_agent` first waits until the Bus is connected and its retained replay has arrived, `cached_room` reads the
+  cache as it is. They exist for tests that check the caches themselves; everything else should ask presence.
 - **Threads**: one Bus serves any number of threads, and every call that waits releases the GIL. No Python code ever
   runs on the Bus's reader thread.
 - **`Observer()`**: a read-only connection to every topic and `$SYS`, for the console. `next(timeout)` returns
@@ -185,12 +188,16 @@ server run on it today; the rest of the package moves to it before the Python im
   `("message", received_ts, message)`, `("sys", topic, text)` or `None`; service request/response traffic is filtered
   out. `dropped` counts events lost to a full queue.
 - **Functions**: `presence_agents/find/need/wipe`, `rooms_info/listing/view` and `ROOM_OPEN`,
-  `relay_lock_path/live/held/stop`, `identity_*`, `ledger_call(op, as_, timeout=None, **fields)` and `history_call`
-  on a connection of their own, the `check_*` validators, and the limits as constants (`BODY_MAX`, `TOPIC_MAX`, the
-  ledger's `MAX_REQUESTS`, `MAX_PENDING`, `MAX_TTL`, ...).
+  `relay_lock_path/live/held/stop`, `relay_session_agent(session)` (the agent a session's relay adopts),
+  `identity_*` (including `identity_read_proc(pid)`: `{comm, ppid, start}` or `None`), `ledger_call(op, as_,
+  timeout=None, **fields)` and `history_call` on a connection of their own, the `check_*` validators, and the limits
+  as constants (`BODY_MAX`, `TOPIC_MAX`, the room limits `RULES_MAX`, `MODS_MAX` and `LIST_MAX`, the relay's
+  `RELAY_BACKLOG`, the ledger's `MAX_REQUESTS`, `MAX_PENDING`, `MAX_TTL`, ...).
 - **Errors**: the very classes of `agent_bridge.errors`. Wrong-typed input anywhere is a one-line `BridgeError` with
-  the Python Bus's message; raw `ledger_call` and `history_call` pass their arguments to the service, whose
-  `LedgerError` or `HistoryError` comes back, as with the Python clients.
+  the Python Bus's message, and so is text no UTF-8 can carry (a lone surrogate from a JSON `\ud800` escape):
+  `<what> is not valid UTF-8` for text, the usual `bad <what>` message for identifiers. Raw `ledger_call` and
+  `history_call` pass their arguments to the service, whose `LedgerError` or `HistoryError` comes back, as with the
+  Python clients.
 - **Configuration** is read from the environment on every call, so a changed `AGENT_BRIDGE_PORT` or
   `AGENT_BRIDGE_LOG` takes effect at once; a bad value is a `BridgeError`, never an exit.
 
@@ -374,7 +381,8 @@ agent-bridge acquire bob-77d0e2 alice-3f9a1c/staging-db read --ttl 120 --wait 30
 ```
 
 `agent-bridge-ledger` is the raw client: `agent-bridge-ledger OP --as ADDR --field value ...` sends any op as-is
-(no implicit `init`), prints the reply and exits 1 when `ok` is false. From Python:
+(no implicit `init`), prints the reply and exits 1 when `ok` is false. The Rust CLI has the same as
+`agent-bridge ledger-raw OP --as ADDR --field value ...`, with the same arguments, output and exit codes. From Python:
 
 ```python
 from agent_bridge.ledger.client import call, LedgerError

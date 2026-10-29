@@ -347,6 +347,8 @@ def test_messaging():
     refused("/api/send", {"kind": "topic", "target": "broadcast", "text": "x"}, "reserved")
     refused("/api/send", {"kind": "room", "target": "ops", "text": "bell\x07"}, "control character")
     refused("/api/send", {"kind": "room", "target": "ops", "text": 5}, "must be a string")
+    refused("/api/send", {"kind": "room", "target": "ops", "text": "\ud800"}, "text is not valid UTF-8")
+    refused("/api/broadcast", {"text": "a\udfffb"}, "text is not valid UTF-8")
     refused("/api/send", {"kind": "shell", "target": "ops", "text": "x"}, "kind must be")
     refused("/api/send", {"kind": "room", "target": "ops", "text": "x" * 70000}, "limit")
     refused("/api/signal", {"addr": ["x"], "signal": "kill"}, "bad address")
@@ -1351,16 +1353,22 @@ def test_ledger_no_reply_wording(monkeypatch):
 
 
 def test_native_only_imports():
-    """The console and the MCP server run on the native core: importing them loads no paho and none of the Python bus,
-    presence, rooms, ledger or history clients, so those can be deleted without touching either."""
+    """The console and the MCP server run on the native core: importing them loads no paho and none of the modules the
+    cutover deletes (the Python bus, CLI, relay, hooks, ledger and history), so those go without touching either. What
+    stays besides _native: config, errors, host and the claude adapter, protocol and a slimmed validation."""
     banned = (
         "paho",
+        "agent_bridge.__main__",
         "agent_bridge.broker",
         "agent_bridge.bus",
+        "agent_bridge.cli",
+        "agent_bridge.identity",
         "agent_bridge.presence",
+        "agent_bridge.relay",
         "agent_bridge.rooms",
-        "agent_bridge.ledger.client",
-        "agent_bridge.history.client",
+        "agent_bridge.ledger",
+        "agent_bridge.history",
+        "agent_bridge.claude.hooks",
     )
     code = (
         "import sys, agent_bridge.console.server, agent_bridge.console.cli, agent_bridge.mcp_server\n"

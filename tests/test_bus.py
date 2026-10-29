@@ -295,7 +295,18 @@ def test_presence_cache(s, monkeypatch):
     assert presence.find(lib.addr)["keep"] is True and f"room/{room}" in presence.find(lib.addr)["topics"]
     run("keep", lib.addr, "off")
     run("leave", newcomer)
-    assert conftest.wait_for(lambda: lib._seen(newcomer) is None, 5), "a cleared record leaves the cache"
+    # Proof the clear has reached lib, not a timeout: the marker is sent after the wipe was confirmed, so on lib's one
+    # connection it comes after the clear; or lib was away (the keep took its session), and then its reconnect re-reads
+    # the retained records before _seen answers.
+    run("dm", s.a, lib.addr, "marker")
+    got = []
+    while not any(m["body"] == "marker" for m in got) and (batch := lib.recv(15)):
+        got += batch
+    assert any(m["body"] == "marker" for m in got), got
+    assert lib._seen(newcomer) is None, (
+        "a cleared record leaves the cache",
+        {"retained": presence.find(newcomer), "cached": lib._agents.get(newcomer), "up": lib._up.is_set()},
+    )
     with pytest.raises(BridgeError, match="unknown address"):
         lib.dm(newcomer, "gone")
     lib.part(room)

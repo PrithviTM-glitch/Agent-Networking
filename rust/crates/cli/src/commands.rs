@@ -171,6 +171,7 @@ pub fn run(cmd: Cmd) -> Result<()> {
             crate::hooks::relay_start();
             Ok(())
         }
+        Cmd::LedgerRaw { args } => std::process::exit(crate::ledger_raw::run(&args)),
         Cmd::Add { addr, name, details: d } => {
             ledger_op(&addr, "add", &[[("name", Some(name.into()))].as_slice(), &details(&d)].concat())
         }

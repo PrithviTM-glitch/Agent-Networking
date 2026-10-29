@@ -7,7 +7,7 @@ mod convert;
 mod errors;
 mod observer;
 
-use agent_bridge::{identity, ledger, presence, relay, rooms, validation as v};
+use agent_bridge::{host, identity, ledger, presence, relay, rooms, validation as v};
 use convert::{dict, dicts, from_py};
 use errors::bridge;
 use pyo3::prelude::*;
@@ -45,11 +45,7 @@ fn not_admin(value: Option<String>, what: &str) -> PyResult<Option<String>> {
 #[pyfunction]
 #[pyo3(signature = (value, what="text", cap=v::BODY_MAX))]
 fn check_text(value: &Bound<'_, PyAny>, what: &str, cap: usize) -> PyResult<String> {
-    let json = from_py(value)?;
-    match json {
-        serde_json::Value::String(s) => v::check_text(&s, what, cap).map(str::to_owned).map_err(bridge),
-        _ => Err(bridge(v::Error(format!("{what} must be a string, got {}", value.get_type().name()?)))),
-    }
+    v::check_text(&args::text(value, what)?, what, cap).map(str::to_owned).map_err(bridge)
 }
 
 #[pyfunction]
@@ -155,6 +151,24 @@ fn relay_stop(py: Python<'_>, session: &Bound<'_, PyAny>, timeout: f64) -> PyRes
     let session = args::session(session)?;
     let wait = Duration::from_secs_f64(timeout.clamp(0.0, 3600.0));
     py.detach(move || relay::stop(&session, wait)).map_err(bridge)
+}
+
+/// The agent a relay for session would adopt (relay.session_agent), or None.
+#[pyfunction]
+fn relay_session_agent(py: Python<'_>, session: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    let session = args::session(session)?;
+    py.detach(move || relay::session_agent(&session)).map_err(bridge)
+}
+
+/// comm, ppid and start time in clock ticks of a live process, or None.
+#[pyfunction]
+fn identity_read_proc(py: Python<'_>, pid: i64) -> PyResult<Option<Bound<'_, PyDict>>> {
+    let Some(p) = host::stat(pid) else { return Ok(None) };
+    let d = PyDict::new(py);
+    d.set_item("comm", p.comm)?;
+    d.set_item("ppid", p.ppid)?;
+    d.set_item("start", p.start)?;
+    Ok(Some(d))
 }
 
 #[pyfunction]
@@ -269,10 +283,16 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rooms_listing, m)?)?;
     m.add_function(wrap_pyfunction!(rooms_view, m)?)?;
     m.add("ROOM_OPEN", dict(py, &rooms::open())?)?;
+    m.add("RULES_MAX", rooms::RULES_MAX)?;
+    m.add("MODS_MAX", rooms::MODS_MAX)?;
+    m.add("LIST_MAX", rooms::LIST_MAX)?;
+    m.add("RELAY_BACKLOG", relay::BACKLOG)?;
     m.add_function(wrap_pyfunction!(relay_lock_path, m)?)?;
     m.add_function(wrap_pyfunction!(relay_live, m)?)?;
     m.add_function(wrap_pyfunction!(relay_held, m)?)?;
     m.add_function(wrap_pyfunction!(relay_stop, m)?)?;
+    m.add_function(wrap_pyfunction!(relay_session_agent, m)?)?;
+    m.add_function(wrap_pyfunction!(identity_read_proc, m)?)?;
     m.add_function(wrap_pyfunction!(identity_session_address, m)?)?;
     m.add_function(wrap_pyfunction!(identity_short_hash, m)?)?;
     m.add_function(wrap_pyfunction!(identity_project_name, m)?)?;

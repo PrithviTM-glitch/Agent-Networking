@@ -5,22 +5,33 @@ suffix), at most 32 caps. Text: at most 64 KiB of UTF-8; tab, newline and CR are
 (C0, DEL, C1) is refused. Raw topics: at most 256 bytes of UTF-8, no control characters, never starting with $ or the
 reserved levels agents, inbox, ledger, broadcast, rooms and history. + and # work only in subscription filters, as
 whole levels, # only last, and not as the first level.
+
+The limits and the checks the native core also enforces are its own, re-exported here so there is one definition. The
+rest are kept in Python: UUID and is_count (host-side helpers with no native counterpart), not_admin (the native one
+raises TypeError for a non-string, where callers rely on the later check's one-line BridgeError), and the checks only
+the Python bus modules use.
 """
 
 import re
 
+from . import _native
 from .errors import BridgeError  # noqa: F401  defined once, with the other errors, raised by _native too
 
-ID_MAX, NAME_MAX = 64, 57
-CAPS_MAX, TOPICS_MAX, TOPIC_MAX, MENTIONS_MAX = 32, 100, 256, 32
-BODY_MAX = 64 * 1024
-WAIT_MAX, LAST_MAX = 3600, 1000
-RESERVED = ("agents", "inbox", "ledger", "broadcast", "rooms", "history")
-SERVICES = ("ledger", "history")  # the services' request/response levels: RPC traffic, never shown as messages
-ADMIN = "admin"
-IDENT = re.compile(r"[A-Za-z0-9_-]+")
-CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-BODY_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+ID_MAX, NAME_MAX = _native.ID_MAX, _native.NAME_MAX
+CAPS_MAX, TOPICS_MAX, TOPIC_MAX, MENTIONS_MAX = (
+    _native.CAPS_MAX,
+    _native.TOPICS_MAX,
+    _native.TOPIC_MAX,
+    _native.MENTIONS_MAX,
+)
+BODY_MAX = _native.BODY_MAX
+WAIT_MAX, LAST_MAX = _native.WAIT_MAX, _native.LAST_MAX
+RESERVED = tuple(_native.RESERVED)  # tuples, as str.startswith needs
+SERVICES = tuple(_native.SERVICES)  # the services' request/response levels: RPC traffic, never shown as messages
+ADMIN = _native.ADMIN
+check_ident, is_ident, check_topic = _native.check_ident, _native.is_ident, _native.check_topic
+check_caps, check_wait, check_last = _native.check_caps, _native.check_wait, _native.check_last
+check_text, check_session = _native.check_text, _native.check_session
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
@@ -28,18 +39,8 @@ def show(value):
     return repr(value)[:60]
 
 
-def is_ident(value, cap=ID_MAX):
-    return isinstance(value, str) and len(value) <= cap and IDENT.fullmatch(value) is not None
-
-
 def is_count(value, cap):
     return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= cap
-
-
-def check_ident(value, what="name", cap=ID_MAX):
-    if not is_ident(value, cap):
-        raise BridgeError(f"bad {what} {show(value)}: use 1-{cap} ASCII letters, digits, _ or -")
-    return value
 
 
 def not_admin(value, what):
@@ -48,73 +49,10 @@ def not_admin(value, what):
     return value
 
 
-def check_session(value):
-    if not isinstance(value, str) or not UUID.fullmatch(value):
-        raise BridgeError(f"bad session id {show(value)}: expected a UUID")
-    return value
-
-
-def _utf8_len(value, what):
-    if not isinstance(value, str):
-        raise BridgeError(f"{what} must be a string, got {type(value).__name__}")
-    try:
-        return len(value.encode())
-    except UnicodeEncodeError:
-        raise BridgeError(f"{what} is not valid UTF-8") from None
-
-
-def check_text(value, what="text", cap=BODY_MAX):
-    if (size := _utf8_len(value, what)) > cap:
-        raise BridgeError(f"{what} is {size} bytes, the limit is {cap}")
-    if BODY_CTRL.search(value):
-        raise BridgeError(f"{what} contains a control character other than tab, newline or CR")
-    return value
-
-
-def check_topic(value, filter=False):
-    """A raw topic (or with filter=True a subscription filter) outside the bridge's reserved namespaces."""
-    if not (size := _utf8_len(value, "topic")) or size > TOPIC_MAX:
-        raise BridgeError(f"topic must be 1-{TOPIC_MAX} bytes")
-    if CTRL.search(value):
-        raise BridgeError("topic contains a control character")
-    levels = value.split("/")
-    if value.startswith("$") or levels[0] in RESERVED:
-        raise BridgeError(f"topic {show(value)} is reserved: $, {', '.join(RESERVED)} belong to the bridge")
-    if not filter:
-        if "+" in value or "#" in value:
-            raise BridgeError("+ and # are wildcards, they only work in sub")
-    elif levels[0] in ("+", "#"):
-        raise BridgeError("a filter's first level must be literal, a wildcard there would reach reserved topics")
-    elif any(
-        ("#" in level and (level != "#" or i < len(levels) - 1)) or ("+" in level and level != "+")
-        for i, level in enumerate(levels)
-    ):
-        raise BridgeError("+ must be a whole level and # a whole last level")
-    return value
-
-
-def check_caps(values):
-    if not isinstance(values, (list, tuple)) or len(values) > CAPS_MAX:
-        raise BridgeError(f"caps must be a list of at most {CAPS_MAX}")
-    return [check_ident(c, "cap") for c in values]
-
-
 def check_mentions(values):
     if not isinstance(values, list) or not values or len(values) > MENTIONS_MAX:
         raise BridgeError(f"mentions must be a list of 1-{MENTIONS_MAX} addresses")
     return sorted({check_ident(v, "address") for v in values})
-
-
-def check_wait(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= WAIT_MAX:
-        raise BridgeError(f"wait must be 0-{WAIT_MAX} seconds")
-    return value
-
-
-def check_last(value):
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= LAST_MAX:
-        raise BridgeError(f"last must be 1-{LAST_MAX}")
-    return value
 
 
 def check_ts(value):

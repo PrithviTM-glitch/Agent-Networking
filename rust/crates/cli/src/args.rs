@@ -234,6 +234,13 @@ pub enum Cmd {
     },
     /// a Claude Code hook: broadcast or relay-start. It prints nothing on failure and always exits 0
     Hook { which: Hook },
+    /// one raw ledgerd request: OP [--as ADDR] [--timeout S] [--FIELD VALUE ...], the reply as JSON (the same as
+    /// agent-bridge-ledger)
+    #[command(name = "ledger-raw", disable_help_flag = true)]
+    LedgerRaw {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<String>,
+    },
     /// ledger: add a resource you own
     Add {
         #[arg(value_name = "MY_ADDR")]
