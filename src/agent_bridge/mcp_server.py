@@ -9,6 +9,7 @@ this server then publishes over a connection of its own and recv points at the r
 The bus, ledger and history all go through the native core (agent_bridge._native); nothing here imports paho.
 """
 
+import argparse
 import asyncio
 import functools
 import json
@@ -497,6 +498,13 @@ async def _serve():
 
 
 def main():
+    # Parsed first, so --help or a stray argument never starts a server that takes this session's agent over.
+    argparse.ArgumentParser(
+        prog="agent-bridge-mcp",
+        description="stdio MCP server that puts a Claude Code session on the agent bus. Claude Code starts it "
+        "(claude mcp add --scope user bridge -- agent-bridge-mcp); it takes no arguments.",
+        allow_abbrev=False,
+    ).parse_args()
     anyio.run(_serve)
 
 

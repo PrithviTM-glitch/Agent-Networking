@@ -11,10 +11,14 @@ services:
       - data:/mosquitto/data
   ledgerd:
     # The Rust ledgerd (rust/Dockerfile); agent-bridge-ledgerd:2 is the Python one, built from the root Dockerfile.
-    build: rust
+    build:
+      context: rust
+      target: ledgerd
     image: agent-bridge-ledgerd:rust
     container_name: agent-bridge-ledgerd
     restart: unless-stopped
+    # PID 1 ignores SIGTERM without a handler; docker-init forwards it, so a stop takes no 10 s timeout.
+    init: true
     environment:
       AGENT_BRIDGE_HOST: mosquitto
       LEDGER_DB: /data/ledger.db
@@ -31,12 +35,14 @@ services:
     depends_on:
       - mosquitto
   historyd:
-    # The Python historyd from the root Dockerfile, the reference until the Rust port lands.
-    build: .
-    image: agent-bridge-historyd:1
+    # The Rust historyd (rust/Dockerfile); agent-bridge-historyd:1 is the Python one, built from the root Dockerfile.
+    build:
+      context: rust
+      target: historyd
+    image: agent-bridge-historyd:rust
     container_name: agent-bridge-historyd
     restart: unless-stopped
-    command: ["agent-bridge-historyd"]
+    init: true
     environment:
       AGENT_BRIDGE_HOST: mosquitto
       HISTORY_DB: /data/history.db
@@ -47,7 +53,7 @@ services:
       - ${HOME}/.local/state/agent-bridge:/import:ro
     healthcheck:
       # A round trip through the broker, so it fails when historyd is disconnected or wedged, not just when it exits.
-      test: ["CMD", "agent-bridge-historyd", "--health"]
+      test: ["CMD", "/agent-bridge-historyd", "--health"]
       interval: 30s
       timeout: 10s
       retries: 3

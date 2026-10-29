@@ -111,6 +111,21 @@ def test_migration_imports_once_and_keeps_the_file(h, tmp_path):
     assert h.migrate(str(tmp_path / "missing.jsonl")) == 0
 
 
+def test_schema_version_is_written_and_checked(h, tmp_path):
+    """Either historyd writes schema 1; one that knows only 1 refuses a database migrated past it, so an older image
+    used as a rollback cannot damage a newer database."""
+    path = str(tmp_path / "h.db")
+    assert [tuple(r) for r in h.q("SELECT key, value FROM meta WHERE key='schema'")] == [("schema", "1")]
+    History(path, h.replies).db.close()  # reopening keeps the one row
+    h.db.execute("UPDATE meta SET value='2' WHERE key='schema'")
+    h.db.execute("DROP INDEX messages_received")  # as a migration might
+    h.db.commit()
+    with pytest.raises(store.SchemaError, match=r"has history schema 2; this historyd knows 1"):
+        History(path, h.replies)
+    indexes = {r[0] for r in h.q("SELECT name FROM sqlite_master WHERE type='index'")}
+    assert "messages_received" not in indexes, "refused before writing anything"
+
+
 def test_pruning_follows_receive_time_and_caps(h, monkeypatch):
     now = time.time()
     h.record("room/r", msg("al-1", "far future ts", ts=9_999_999_999.0), now=now - config.STALE_S - 10)
@@ -260,6 +275,26 @@ def test_restart_keeps_history_and_catches_up(svc):
         svc_proc.wait()
     health = subprocess.run([*HISTORYD, "--health"], capture_output=True, text=True, timeout=30)
     assert health.returncode != 0 and "historyd" in health.stderr
+
+
+def test_arguments_start_nothing(tmp_path):
+    """Only no arguments runs the service: --help prints usage and any other argument is refused, both before anything
+    connects or opens a database, so a stray flag cannot start a second historyd against the live defaults."""
+    db = tmp_path / "history.db"
+    env = {
+        **os.environ,
+        "HISTORY_DB": str(db),
+        "HISTORY_IMPORT": str(tmp_path / "none.jsonl"),
+        "AGENT_BRIDGE_PORT": "1",
+    }
+    shown = subprocess.run([*HISTORYD, "--help"], env=env, capture_output=True, text=True, timeout=30)
+    assert shown.returncode == 0 and shown.stdout.startswith("usage: agent-bridge-historyd"), shown
+    for args in (["--bogus"], ["--hea"], ["--health", "x"], ["serve"]):
+        refused = subprocess.run([*HISTORYD, *args], env=env, capture_output=True, text=True, timeout=30)
+        assert refused.returncode == 2 and refused.stderr.startswith("usage: agent-bridge-historyd"), (args, refused)
+        last = refused.stderr.splitlines()[-1]
+        assert last.startswith("agent-bridge-historyd: error: unrecognized arguments: "), (args, last)
+    assert not db.exists(), "no database was opened"
 
 
 def test_history_is_a_reserved_level():

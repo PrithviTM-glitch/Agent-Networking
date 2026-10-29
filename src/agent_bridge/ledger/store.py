@@ -27,6 +27,7 @@ MAX_LEDGERS, MAX_RESOURCES, MAX_PENDING, MAX_LEASES, MAX_WAITERS = 1000, 128, 64
 MAX_REQUESTS = 512  # stored requests per holder, any status
 DEDUPE_S = 300  # how long a mutating request's answer is kept to replay to a redelivered copy
 READ_ONLY = {"ledger", "public", "grants", "dump"}
+SCHEMA_VERSION = 1  # the meta 'schema' row; the Rust ledgerd writes the same
 LEVELS = {"read": 1, "write": 2}
 ADDR = r"[A-Za-z0-9_-]{1,64}"
 NAME = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS waiters(seq INTEGER PRIMARY KEY AUTOINCREMENT, resour
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS replies(key BLOB PRIMARY KEY, body TEXT, ts REAL NOT NULL);
 INSERT OR IGNORE INTO meta VALUES ('fence', 0);
+INSERT OR IGNORE INTO meta VALUES ('schema', 1);
 CREATE INDEX IF NOT EXISTS resources_owner ON resources(owner);
 CREATE INDEX IF NOT EXISTS requests_resource ON requests(resource, holder);
 CREATE INDEX IF NOT EXISTS requests_holder ON requests(holder);
@@ -114,6 +116,11 @@ class Ledger:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
+        # The Rust and the Python ledgerd share ledger.db; refuse a schema this code doesn't know before writing
+        # anything, so a rollback can never touch a database a newer ledgerd has migrated.
+        known = self.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'")
+        if known and (row := self.one("SELECT value FROM meta WHERE key='schema'")) and row[0] != SCHEMA_VERSION:
+            raise SystemExit(f"ledger.db has schema {row[0]}; this ledgerd knows {SCHEMA_VERSION}")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(SCHEMA)

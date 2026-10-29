@@ -46,8 +46,11 @@ jobs:
                      agent-bridge-console agent-bridge-admin agent-bridge-relay-hook agent-bridge-broadcast-hook; do
             test -x "/tmp/wheel-env/bin/$cmd" || { echo "missing $cmd"; exit 1; }
           done
-          /tmp/wheel-env/bin/agent-bridge --help > /dev/null
-          /tmp/wheel-env/bin/agent-bridge-ledger --help > /dev/null
+          # Every command with arguments must answer --help without starting anything (the hooks read stdin instead).
+          for cmd in agent-bridge agent-bridge-ledger agent-bridge-ledgerd agent-bridge-historyd agent-bridge-mcp \
+                     agent-bridge-console agent-bridge-admin; do
+            timeout 10 "/tmp/wheel-env/bin/$cmd" --help < /dev/null > /dev/null || { echo "$cmd --help failed"; exit 1; }
+          done
           /tmp/wheel-env/bin/python -I -c '
           import importlib, importlib.metadata, pathlib
           import agent_bridge._native as native
@@ -79,13 +82,19 @@ jobs:
           uv pip install --python .venv-wheel/bin/python dist/*.whl pytest==9.1.1 paho-mqtt==2.1.0
       - run: .venv-wheel/bin/python -m pytest -p no:cacheprovider
   docker:
-    # The service images Compose builds: the Python one from the root Dockerfile, the Rust ledgerd from rust/.
+    # The service images: the Rust ledgerd and historyd Compose builds from rust/, and the Python rollback image from
+    # the root Dockerfile. Each service answers --help without a network.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - run: docker build --target ledgerd -t agent-bridge-ci:ledgerd rust
+      - run: docker run --rm --network none agent-bridge-ci:ledgerd /agent-bridge-ledgerd --help
+      - run: docker build --target historyd -t agent-bridge-ci:historyd rust
+      - run: docker run --rm --network none agent-bridge-ci:historyd /agent-bridge-historyd --help
       - run: docker build -t agent-bridge-ci:python .
       - run: docker run --rm --entrypoint python agent-bridge-ci:python -I -c 'import agent_bridge._native, agent_bridge.history.service, agent_bridge.ledger.service'
-      - run: docker build -t agent-bridge-ci:rust rust
+      - run: docker run --rm --network none agent-bridge-ci:python agent-bridge-ledgerd --help
+      - run: docker run --rm --network none agent-bridge-ci:python agent-bridge-historyd --help
   interop:
     # Python and Rust side by side: the Rust tests that need Docker, and the parity tests that hand one database
     # between the Python and Rust services (they skip unless AGENT_BRIDGE_HISTORYD / AGENT_BRIDGE_LEDGERD point at Rust).

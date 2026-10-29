@@ -17,6 +17,7 @@ pub mod protocol;
 pub mod relay;
 pub mod request;
 pub mod rooms;
+pub mod service;
 pub mod stamp;
 pub mod validation;
 

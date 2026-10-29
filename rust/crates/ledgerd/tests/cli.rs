@@ -7,6 +7,15 @@ use std::time::{Duration, Instant};
 
 const LEDGERD: &str = env!("CARGO_BIN_EXE_agent-bridge-ledgerd");
 
+/// A container removed when the test ends, failed assertions included.
+struct Removed(String);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
+    }
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).expect("a free port")
 }
@@ -52,13 +61,19 @@ fn arguments_never_start_the_service() {
     for help in ["--help", "-h"] {
         let out = run(port, &dir, &[help], Duration::from_secs(3));
         assert_eq!(out.status.code(), Some(0));
-        assert!(String::from_utf8_lossy(&out.stdout).starts_with("usage: agent-bridge-ledgerd [--health]"));
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("usage: agent-bridge-ledgerd [-h] [--health]\n"));
     }
-    for bad in [&["--bogus"][..], &["--health", "now"], &["serve"]] {
+    // argparse's (allow_abbrev=False) usage line, error line and status, as the Python ledgerd prints them
+    for (bad, extra) in
+        [(&["--bogus"][..], "--bogus"), (&["--health", "now"], "now"), (&["serve"], "serve"), (&["--hea"], "--hea")]
+    {
         let out = run(port, &dir, bad, Duration::from_secs(3));
-        assert_eq!(out.status.code(), Some(1), "{bad:?}");
+        assert_eq!(out.status.code(), Some(2), "{bad:?}");
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.ends_with(&format!("agent-bridge-ledgerd: unrecognized arguments: {}\n", bad.join(" "))), "{err}");
+        let want = format!(
+            "usage: agent-bridge-ledgerd [-h] [--health]\nagent-bridge-ledgerd: error: unrecognized arguments: {extra}\n"
+        );
+        assert_eq!(err, want);
     }
     // Nothing listens on port: the probe fails at once instead of retrying like the service would.
     let out = run(port, &dir, &["--health"], Duration::from_secs(8));
@@ -70,7 +85,7 @@ fn arguments_never_start_the_service() {
 
 #[test]
 #[ignore = "needs Docker"]
-fn health_answers_from_a_running_ledgerd() {
+fn health_answers_and_a_second_ledgerd_takes_over() {
     let (port, dir) = (free_port(), temp_dir("health"));
     let name = format!("agent-bridge-ledgerd-health-{}", std::process::id());
     let conf = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/mosquitto.conf");
@@ -81,7 +96,8 @@ fn health_answers_from_a_running_ledgerd() {
         .output()
         .expect("docker runs");
     assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
-    let mut service = ledgerd(port, &dir, &[]).stderr(Stdio::null()).spawn().expect("ledgerd runs");
+    let _broker = Removed(name);
+    let first = ledgerd(port, &dir, &[]).spawn().expect("ledgerd runs");
     let deadline = Instant::now() + Duration::from_secs(15);
     let healthy = loop {
         let ok = run(port, &dir, &["--health"], Duration::from_secs(12)).status.code() == Some(0);
@@ -90,12 +106,17 @@ fn health_answers_from_a_running_ledgerd() {
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let _ = service.kill();
-    let _ = service.wait();
+    // The broker ends the first one's session with e0 01 8e (reason 142, no properties): it steps aside.
+    let mut second = ledgerd(port, &dir, &[]).stderr(Stdio::null()).spawn().expect("ledgerd runs");
+    let stepped_aside = finishes(first, Duration::from_secs(10));
+    let _ = second.kill();
+    let _ = second.wait();
     let after = run(port, &dir, &["--health"], Duration::from_secs(12));
-    let _ = Command::new("docker").args(["rm", "-f", &name]).output();
     let _ = std::fs::remove_dir_all(dir);
     assert!(healthy, "a running ledgerd answers the probe");
+    assert_eq!(stepped_aside.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&stepped_aside.stderr);
+    assert!(err.ends_with("another client connected as ledgerd, exiting\n"), "{err}");
     assert_eq!(after.status.code(), Some(1), "no ledgerd, no answer");
     assert!(String::from_utf8_lossy(&after.stderr).contains("no reply from ledgerd within 5s"));
 }

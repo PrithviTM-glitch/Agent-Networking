@@ -14,6 +14,7 @@ mod store;
 use agent_bridge::config;
 use agent_bridge::mqtt::{Conn, Handler, Message, Options, filter};
 use agent_bridge::protocol::NEVER;
+use agent_bridge::service::{Mode, mode};
 use rumqttc::v5::mqttbytes::v5::{PublishProperties, RetainForwardRule};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -79,30 +80,36 @@ impl Handler for Service {
 
 fn main() {
     let argv: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
-    match args::mode(&argv) {
-        args::Mode::Serve => {}
-        args::Mode::Health => {
+    match mode("agent-bridge-historyd", &argv) {
+        Mode::Serve => {}
+        Mode::Health => {
             config_or_exit();
             std::process::exit(args::health());
         }
-        args::Mode::Help => {
+        Mode::Help => {
             print!("{}", args::USAGE);
             return;
         }
-        args::Mode::Bad(message) => {
-            eprint!("{}", args::USAGE);
-            eprintln!("agent-bridge-historyd: {message}");
-            std::process::exit(1);
+        Mode::Bad(text) => {
+            eprint!("{text}");
+            std::process::exit(2);
         }
     }
     let cfg = config_or_exit();
     let env_path = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
     let db = env_path("HISTORY_DB").unwrap_or_else(|| cfg.state_dir.join("history.db"));
     let import = env_path("HISTORY_IMPORT").unwrap_or_else(|| cfg.log.clone());
-    let mut history = History::open(&db, cfg.stale_s).unwrap_or_else(|e| {
-        eprintln!("cannot open the history at {}: {e}", db.display());
-        std::process::exit(1);
-    });
+    let mut history = match History::open(&db, cfg.stale_s) {
+        Ok(history) => history,
+        Err(store::Open::Schema(e)) => {
+            eprintln!("historyd: {e}");
+            std::process::exit(1);
+        }
+        Err(store::Open::Failed(e)) => {
+            eprintln!("cannot open the history at {}: {e}", db.display());
+            std::process::exit(1);
+        }
+    };
     let (tx, rx) = channel();
     let service = Arc::new(Service {
         tx: Mutex::new(tx),

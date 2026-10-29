@@ -27,6 +27,7 @@ from ..validation import (
 )
 from . import read_log
 
+SCHEMA_VERSION = 1  # meta row "schema"; a historyd refuses a database whose version it does not know
 MAX_PAYLOAD = 16384
 MAX_CORR = 256
 # Under config/mosquitto.conf max_packet_size 270000: a bigger publish would get historyd disconnected.
@@ -46,6 +47,10 @@ CREATE INDEX IF NOT EXISTS messages_topic ON messages(topic, id);
 CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender, id);
 CREATE INDEX IF NOT EXISTS messages_received ON messages(received);
 """
+
+
+class SchemaError(Exception):
+    """The database was written by a historyd with another schema version; opening it could damage it."""
 
 
 class Bad(Exception):
@@ -132,8 +137,16 @@ class History:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
+        # Checked before anything is written: a database another version migrated is left exactly as it is.
+        if self.q("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
+            row = self.q("SELECT value FROM meta WHERE key='schema'").fetchone()
+            if row is not None and str(row[0]) != str(SCHEMA_VERSION):
+                self.db.close()
+                raise SchemaError(f"{path} has history schema {row[0]}; this historyd knows {SCHEMA_VERSION}")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        with self.db:
+            self.q("INSERT OR IGNORE INTO meta VALUES ('schema', ?)", str(SCHEMA_VERSION))
         self.publish = publish
         self.pruned = 0.0
         self.since_trim = 0

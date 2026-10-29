@@ -11,6 +11,7 @@ import json
 import os
 import random
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -696,6 +697,53 @@ def test_stale():
     assert wait_for(lambda: gone("kept-k1"), 10), "cleared presence no longer protects"
     alive()
     print("stale ok")
+
+
+def test_the_python_ledgerd_refuses_a_newer_schema():
+    """The Python ledgerd (the rollback) writes schema 1 and refuses to open a ledger.db a newer ledgerd migrated,
+    before writing anything to it. Python-only, so it runs whatever AGENT_BRIDGE_LEDGERD names."""
+    from agent_bridge.ledger.store import Ledger
+
+    db = os.path.join(tempfile.mkdtemp(), "ledger.db")
+    Ledger(db, lambda *_: None).db.close()
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT value FROM meta WHERE key='schema'").fetchall() == [(1,)]
+        conn.execute("UPDATE meta SET value=2 WHERE key='schema'")
+        conn.execute("DROP INDEX resources_owner")  # opening it would recreate this, so it shows a write
+    service = subprocess.run(
+        [sys.executable, "-m", "agent_bridge.ledger.service"],
+        env={**os.environ, "LEDGER_DB": db},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert service.returncode == 1 and "ledger.db has schema 2; this ledgerd knows 1" in service.stderr, service
+    with sqlite3.connect(db) as conn:
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='resources_owner'").fetchall(), "it wrote"
+
+
+def test_arguments_start_nothing():
+    """Only no arguments runs the Python ledgerd: --help and refused arguments exit before a connection or the
+    database is opened, so a stray flag can never start a second ledgerd on the live defaults."""
+    db = os.path.join(tempfile.mkdtemp(), "ledger.db")
+    env = {**os.environ, "LEDGER_DB": db, "AGENT_BRIDGE_PORT": "1"}  # nothing listens there
+    for args, code, out, err in (
+        (["--help"], 0, "usage: agent-bridge-ledgerd", ""),
+        (["-h"], 0, "usage: agent-bridge-ledgerd", ""),
+        (["--bogus"], 2, "", "agent-bridge-ledgerd: error: unrecognized arguments: --bogus"),
+        (["--health", "x"], 2, "", "unrecognized arguments: x"),
+        (["--hea"], 2, "", "unrecognized arguments: --hea"),  # no abbreviations, as in the Rust ledgerd
+        (["--health"], 1, "", "agent-bridge-ledgerd: unhealthy: broker unreachable"),
+    ):
+        p = subprocess.run(
+            [sys.executable, "-m", "agent_bridge.ledger.service", *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert p.returncode == code and out in p.stdout and err in p.stderr, (args, p)
+    assert not os.path.exists(db), "an argument opened the database"
 
 
 def test_cli_and_log():

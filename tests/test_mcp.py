@@ -326,3 +326,20 @@ def test_broadcast():
 
 def test_push():
     anyio.run(push)
+
+
+def test_arguments_start_nothing():
+    """--help prints usage and any argument is refused, before anything connects: a server started by mistake under a
+    session id would take that session's agent over from its real MCP server. A started server would wait on its
+    open stdin, so a prompt exit proves none ran."""
+    env = env_for(f"session-a-{RUN}", "args")
+    for args, code, out in ((["--help"], 0, "usage: agent-bridge-mcp"), (["--port", "1"], 2, "unrecognized arguments")):
+        pipe = subprocess.PIPE
+        p = subprocess.Popen([SERVER, *args], env=env, stdin=pipe, stdout=pipe, stderr=pipe)
+        try:
+            p.wait(timeout=10)  # not communicate(): that closes stdin, and a started server would then exit too
+        finally:
+            p.kill()
+        text = (p.stdout.read() + p.stderr.read()).decode()
+        p.stdin.close()
+        assert p.returncode == code and out in text, (args, p.returncode, text)

@@ -12,6 +12,7 @@ mod store;
 use agent_bridge::config;
 use agent_bridge::mqtt::{Ack, Conn, Handler, Message, Options, filter};
 use agent_bridge::protocol::NEVER;
+use agent_bridge::service::{Mode, mode};
 use request::is_addr;
 use rumqttc::v5::mqttbytes::v5::PublishProperties;
 use std::path::PathBuf;
@@ -67,20 +68,19 @@ impl Handler for Service {
 
 fn main() {
     let argv: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
-    match args::mode(&argv) {
-        args::Mode::Serve => {}
-        args::Mode::Health => {
+    match mode("agent-bridge-ledgerd", &argv) {
+        Mode::Serve => {}
+        Mode::Health => {
             config_or_exit();
             std::process::exit(args::health());
         }
-        args::Mode::Help => {
+        Mode::Help => {
             print!("{}", args::USAGE);
             return;
         }
-        args::Mode::Bad(message) => {
-            eprint!("{}", args::USAGE);
-            eprintln!("agent-bridge-ledgerd: {message}");
-            std::process::exit(1);
+        Mode::Bad(text) => {
+            eprint!("{text}");
+            std::process::exit(2);
         }
     }
     let cfg = config_or_exit();
@@ -88,10 +88,17 @@ fn main() {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| cfg.state_dir.join("ledger.db"));
-    let mut ledger = Ledger::open(&db, cfg.stale_days).unwrap_or_else(|e| {
-        eprintln!("cannot open the ledger at {}: {e}", db.display());
-        std::process::exit(1);
-    });
+    let mut ledger = match Ledger::open(&db, cfg.stale_days) {
+        Ok(ledger) => ledger,
+        Err(store::Open::Schema(e)) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        Err(store::Open::Failed(e)) => {
+            eprintln!("cannot open the ledger at {}: {e}", db.display());
+            std::process::exit(1);
+        }
+    };
     let (tx, rx) = channel();
     let service = Arc::new(Service {
         tx: Mutex::new(tx),

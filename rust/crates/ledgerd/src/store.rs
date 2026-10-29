@@ -109,13 +109,45 @@ pub struct Ledger {
     stale_s: f64,
 }
 
+/// Why Ledger::open failed: a database another schema version wrote (refused before anything is written), or
+/// anything else.
+pub enum Open {
+    Schema(String),
+    Failed(String),
+}
+
+/// The meta schema row of an existing database, as Python prints it, when it is not 1 (compared as a number, as
+/// the Python ledgerd does with its INTEGER column).
+fn other_schema(db: &Connection) -> rusqlite::Result<Option<String>> {
+    let has_meta = "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='meta'";
+    if db.query_row(has_meta, [], |r| r.get::<_, i64>(0))? == 0 {
+        return Ok(None);
+    }
+    let mut stmt = db.prepare("SELECT value FROM meta WHERE key='schema'")?;
+    let mut rows = stmt.query([])?;
+    let Some(row) = rows.next()? else { return Ok(None) };
+    Ok(match row.get_ref(0)? {
+        ValueRef::Integer(1) => None,
+        ValueRef::Real(1.0) => None,
+        ValueRef::Integer(n) => Some(n.to_string()),
+        ValueRef::Real(f) => Some(agent_bridge::json::float_repr(f)),
+        ValueRef::Text(t) | ValueRef::Blob(t) => Some(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Null => Some("None".into()),
+    })
+}
+
 impl Ledger {
-    pub fn open(path: &std::path::Path, stale_days: f64) -> Result<Ledger, String> {
-        let abs = std::path::absolute(path).map_err(|e| e.to_string())?;
+    pub fn open(path: &std::path::Path, stale_days: f64) -> Result<Ledger, Open> {
+        let failed = |e: &dyn std::fmt::Display| Open::Failed(e.to_string());
+        let abs = std::path::absolute(path).map_err(|e| failed(&e))?;
         if let Some(dir) = abs.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            std::fs::create_dir_all(dir).map_err(|e| Open::Failed(format!("{}: {e}", dir.display())))?;
         }
-        let db = Connection::open(path).map_err(|e| e.to_string())?;
+        let db = Connection::open(path).map_err(|e| failed(&e))?;
+        // Before anything is written, so a database a newer ledgerd migrated is left exactly as it is.
+        if let Some(n) = other_schema(&db).map_err(|e| failed(&e))? {
+            return Err(Open::Schema(format!("ledger.db has schema {n}; this ledgerd knows 1")));
+        }
         let setup = || -> rusqlite::Result<()> {
             db.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
             db.execute_batch("PRAGMA synchronous=FULL")?;
@@ -133,7 +165,7 @@ impl Ledger {
             db.execute_batch("INSERT OR IGNORE INTO meta VALUES ('schema', 1)")?;
             Ok(())
         };
-        setup().map_err(|e| e.to_string())?;
+        setup().map_err(|e| failed(&e))?;
         Ok(Ledger { db, out: Vec::new(), swept: 0.0, stale_s: (stale_days * 86400.0).max(1.0) })
     }
 
@@ -809,13 +841,31 @@ mod tests {
     #[test]
     fn schema_row_and_dump_names_the_implementation() {
         let dir = std::env::temp_dir().join(format!("ledgerd-store-{}", std::process::id()));
-        let mut ledger = Ledger::open(&dir.join("ledger.db"), 3.0).unwrap_or_else(|e| panic!("{e}"));
+        let mut ledger = Ledger::open(&dir.join("ledger.db"), 3.0).ok().expect("opens");
         assert_eq!(ledger.count("SELECT value FROM meta WHERE key='schema'", []).ok(), Some(1));
         let dump = ledger.run(&mut |_| {}, |l| l.op_dump(now())).ok().expect("dump");
         assert_eq!(dump["ledgerd"], json!({"impl": "rust", "version": env!("CARGO_PKG_VERSION")}));
         drop(ledger);
-        let reopened = Ledger::open(&dir.join("ledger.db"), 3.0).unwrap_or_else(|e| panic!("{e}"));
+        let reopened = Ledger::open(&dir.join("ledger.db"), 3.0).ok().expect("opens");
         assert_eq!(reopened.count("SELECT count(*) FROM meta WHERE key='schema'", []).ok(), Some(1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused_before_anything_is_written() {
+        let dir = std::env::temp_dir().join(format!("ledgerd-schema-{}", std::process::id()));
+        let path = dir.join("ledger.db");
+        drop(Ledger::open(&path, 3.0).ok().expect("opens"));
+        let db = Connection::open(&path).expect("reopens");
+        db.execute_batch("DROP INDEX resources_owner; UPDATE meta SET value=2 WHERE key='schema'").expect("migrates");
+        drop(db);
+        match Ledger::open(&path, 3.0) {
+            Err(Open::Schema(e)) => assert_eq!(e, "ledger.db has schema 2; this ledgerd knows 1"),
+            _ => panic!("schema 2 opened"),
+        }
+        let db = Connection::open(&path).expect("reopens");
+        let index = db.query_row("SELECT count(*) FROM sqlite_master WHERE name='resources_owner'", [], |r| r.get(0));
+        assert_eq!(index, Ok(0), "nothing was written");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -246,10 +246,10 @@ is refused with an error naming it. `@` glued to a word (`alice@example.com`) is
 ## History service
 
 `agent-bridge-historyd` is the only writer of message history, one store for every bridge client on the machine.
-Bridge clients no longer write `history.jsonl`; sending never depends on historyd. It exists twice: the Python
-reference (`src/agent_bridge/history/`), which Compose runs, and a Rust port (`rust/crates/historyd`) with the same
-schema, row digests and replies, so either can take over the other's `history.db` (see the README's
-[Rust implementation](../README.md#rust-implementation) section). Everything below holds for both.
+Bridge clients no longer write `history.jsonl`; sending never depends on historyd. It exists twice: the Rust one
+(`rust/crates/historyd`), which Compose runs, and the Python reference (`src/agent_bridge/history/`), kept as the
+rollback, with the same schema, row digests and replies, so either can take over the other's `history.db` (see the
+README's [Rust implementation](../README.md#rust-implementation) section). Everything below holds for both.
 
 - **Recording.** It subscribes to `#` with No Local and retain handling 2 (a reconnect does not replay retained
   records), keeps `room/...`, `inbox/...`, `broadcast` and raw topics, and ignores every other reserved level and
@@ -258,12 +258,22 @@ schema, row digests and replies, so either can take over the other's `history.db
   mentions and the receive time. A digest of topic, sender, ts and body is unique, so a redelivery or a migrated line
   that also arrived live is stored once. Like ledgerd it uses client id `historyd`, a persistent session (messages
   sent while it is down wait at the broker), acks a message only after its row committed, and exits if another
-  client takes its id over. That waiting is bounded: mosquitto queues at most 1000 messages (32 MiB) for it and drops
-  the rest, so a long outage leaves gaps. History is an advisory record, not an audit trail.
+  client takes its id over, so two historyds never take the session from each other. The Rust one exits on DISCONNECT
+  reason 142 (session taken over). The Python one exits on any broker-sent DISCONNECT: paho 2.1 reads mosquitto's
+  one-byte reason as 0, and mosquitto sends historyd a DISCONNECT only for a takeover (a broker restart just closes
+  the socket). That waiting is bounded: mosquitto queues at most 1000 messages (32 MiB) for it and drops the rest, so
+  a long outage leaves gaps. History is an advisory record, not an audit trail.
+- **Command line.** Only no arguments runs the service. `--health` pings the running historyd (exit 0 on an answer
+  within 5 s, else 1), `-h`/`--help` prints usage, and any other argument, abbreviations included, is refused
+  argparse-style with exit 2 before anything connects or opens a database.
 - **Migration.** On its first start it imports `HISTORY_IMPORT` (default `AGENT_BRIDGE_LOG`, the legacy
   `history.jsonl`) once, skipping malformed lines, and remembers the path in its database. The file is never deleted
   or changed; remove it by hand once you no longer need it. The compose service mounts the host's state directory
   read-only at `/import` for this.
+- **Schema version.** Either implementation writes the meta row `schema` = 1 on open. It checks the row first and
+  refuses to start on a database with another version, before writing anything (`historyd: <db> has history schema
+  N; this historyd knows 1`), so an older historyd used as a rollback can never touch a database a newer one has
+  migrated. Images built before cp7 do not check.
 - **Retention.** Every hour (or stale period, if shorter) it deletes what it received longer ago than
   `AGENT_BRIDGE_STALE_DAYS`. Receive time, not the sender's `ts`, so a forged timestamp cannot keep a row. It also
   keeps at most 500,000 rows and 256 MiB of bodies, oldest dropped first.
@@ -656,12 +666,14 @@ the service.
   the broadcast hook has seen) are never pruned automatically. Delete them by hand if they grow.
 - **leave**: drops the agent's ledger and its received DMs in historyd (3 s each, a warning if either service is
   down), wipes the session (a clean connect with expiry 0), and clears the retained presence.
-- **Ledger**: SQLite in the `ledger` volume (WAL, synchronous=FULL). The Rust ledgerd records the schema version in the
-  `meta` table (`schema`, now 1), where future migrations start. ledgerd uses a persistent session, so requests sent
-  while it restarts wait at the broker, and a request is acked only after its transaction commits. `drop` removes an
-  agent's ledger. The stale sweep drops any ledger whose owner has no retained presence and has made no ledger request
-  for longer than the stale period, and pending or denied requests older than that; granted ones stay. Presence with
-  `keep` protects a ledger indefinitely. Answers kept for redelivery replay expire after 300 s.
+- **Ledger**: SQLite in the `ledger` volume (WAL, synchronous=FULL). Both ledgerds record the schema version in the
+  `meta` table (`schema`, now 1), where future migrations start, and both refuse to start on another version before
+  writing anything (`ledger.db has schema N; this ledgerd knows 1`), so neither can be used as a rollback onto a
+  database a newer one migrated; images built before this check have no such guard. ledgerd uses a persistent session,
+  so requests sent while it restarts wait at the broker, and a request is acked only after its transaction commits.
+  `drop` removes an agent's ledger. The stale sweep drops any ledger whose owner has no retained presence and has made
+  no ledger request for longer than the stale period, and pending or denied requests older than that; granted ones stay.
+  Presence with `keep` protects a ledger indefinitely. Answers kept for redelivery replay expire after 300 s.
 
 ## Troubleshooting
 
@@ -669,8 +681,11 @@ the service.
 - **ledger calls time out**: `docker compose ps` shows ledgerd's health, which is a real `dump` round trip through
   the broker every 30 s, so `unhealthy` means disconnected or wedged, not only exited. Check
   `docker logs agent-bridge-ledgerd`. ledgerd reconnects to the broker on its own.
-  If it logs `another client connected as ledgerd`, something else used its client id. Stop that client, then run
-  `docker compose up -d ledgerd`.
+  If it exits with `another client connected as ledgerd` (Rust) or `the broker disconnected this ledgerd` (Python),
+  another client took its client id, and the newer one is now the single writer. Stop that client, then run `docker
+  compose up -d ledgerd`. The Rust ledgerd steps aside on DISCONNECT reason 142; the Python one on any DISCONNECT the
+  broker sends, since paho-mqtt 2.1 drops the one-byte reason mosquitto uses for a takeover (a broker shutdown sends
+  none, so a restart never stops it).
 - **Queued messages vanished after a broker restart**: the session was created with `clean_start=True`. mosquitto
   keeps a session on disk only if the latest connect used `clean_start=False`, even under MQTT 5 with a session expiry.
   Any client that wants offline delivery must connect that way.

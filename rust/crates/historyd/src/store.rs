@@ -10,6 +10,7 @@ use agent_bridge::json::{Map, dumps, float, loads, now};
 use agent_bridge::protocol::{BROADCAST, parse_message};
 use agent_bridge::stamp::stamp;
 use agent_bridge::validation::{ADMIN, RESERVED};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -78,18 +79,51 @@ pub struct History {
     since_trim: u32,
 }
 
+/// Why History::open failed: a database another schema version wrote (refused before anything is written), or
+/// anything else.
+pub enum Open {
+    Schema(String),
+    Failed(String),
+}
+
+/// The meta schema row of an existing database when it is not 1, compared as text as the Python historyd does
+/// (meta.value is TEXT, so 1 is stored as '1').
+fn other_schema(db: &Connection) -> rusqlite::Result<Option<String>> {
+    let has_meta = "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='meta'";
+    if db.query_row(has_meta, [], |r| r.get::<_, i64>(0))? == 0 {
+        return Ok(None);
+    }
+    let value = db.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| {
+        Ok(match r.get_ref(0)? {
+            ValueRef::Text(t) | ValueRef::Blob(t) => String::from_utf8_lossy(t).into_owned(),
+            ValueRef::Integer(n) => n.to_string(),
+            ValueRef::Real(f) => agent_bridge::json::float_repr(f),
+            ValueRef::Null => "None".into(),
+        })
+    });
+    Ok(value.optional()?.filter(|v| v != "1"))
+}
+
 impl History {
-    pub fn open(path: &Path, stale_s: u64) -> Result<History, String> {
-        let open = || -> rusqlite::Result<Connection> {
-            if let Some(dir) = abspath(path).parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let db = Connection::open(path)?;
+    pub fn open(path: &Path, stale_s: u64) -> Result<History, Open> {
+        let failed = |e: rusqlite::Error| Open::Failed(e.to_string());
+        if let Some(dir) = abspath(path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let db = Connection::open(path).map_err(failed)?;
+        // Before anything is written, so a database a newer historyd migrated is left exactly as it is.
+        if let Some(n) = other_schema(&db).map_err(failed)? {
+            return Err(Open::Schema(format!("{} has history schema {n}; this historyd knows 1", path.display())));
+        }
+        let setup = || -> rusqlite::Result<()> {
             db.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
             db.execute_batch(SCHEMA)?;
-            Ok(db)
+            // Schema 1 is all of the above. A later migration checks this row, migrates, then raises it; the first
+            // one retires the Python historyd as a rollback, which only knows schema 1.
+            db.execute_batch("INSERT OR IGNORE INTO meta VALUES ('schema', 1)")?;
+            Ok(())
         };
-        let db = open().map_err(|e| e.to_string())?;
+        setup().map_err(failed)?;
         Ok(History { db, stale_s: stale_s as f64, pruned: 0.0, since_trim: 0 })
     }
 
@@ -339,7 +373,7 @@ mod tests {
     #[test]
     fn records_history_once_and_serves_it() {
         let dir = temp("record");
-        let mut h = History::open(&dir.join("h.db"), 86400).expect("opens");
+        let mut h = History::open(&dir.join("h.db"), 86400).ok().expect("opens");
         let m = |from: &str, body: &str, ts: f64| json!({"from": from, "body": body, "ts": ts}).to_string();
         for (topic, payload) in [
             ("room/r", m("a-1", "one", 1.0)),
@@ -379,10 +413,13 @@ mod tests {
         let log = dir.join("history.jsonl");
         let line = r#"{"topic": "room/old", "from": "a-1", "body": "old", "ts": 5}"#;
         std::fs::write(&log, format!("{line}\nnot json\n{line}\n")).expect("writes");
-        let mut h = History::open(&dir.join("h.db"), 86400).expect("opens");
+        let mut h = History::open(&dir.join("h.db"), 86400).ok().expect("opens");
         assert_eq!(h.migrate(&log), Ok(1));
         assert_eq!(h.migrate(&log), Ok(0), "imported once");
         assert!(log.exists(), "the file stays");
+        let schema: String =
+            h.db.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).expect("a row");
+        assert_eq!(schema, "1", "TEXT affinity: stored as '1', as Python's INSERT of 1 stores it");
         h.record("room/new", br#"{"from": "a-1", "body": "new", "ts": 1}"#).expect("records");
         h.prune().expect("prunes");
         assert_eq!(
@@ -395,6 +432,26 @@ mod tests {
             ["new"],
             "received now, though its ts is old"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused_before_anything_is_written() {
+        let dir = temp("schema");
+        let path = dir.join("h.db");
+        drop(History::open(&path, 86400).ok().expect("opens"));
+        let db = Connection::open(&path).expect("reopens");
+        db.execute_batch("DROP INDEX messages_topic; UPDATE meta SET value=2 WHERE key='schema'").expect("migrates");
+        drop(db);
+        match History::open(&path, 86400) {
+            Err(Open::Schema(e)) => {
+                assert_eq!(e, format!("{} has history schema 2; this historyd knows 1", path.display()))
+            }
+            _ => panic!("schema 2 opened"),
+        }
+        let db = Connection::open(&path).expect("reopens");
+        let index = db.query_row("SELECT count(*) FROM sqlite_master WHERE name='messages_topic'", [], |r| r.get(0));
+        assert_eq!(index, Ok(0), "nothing was written");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

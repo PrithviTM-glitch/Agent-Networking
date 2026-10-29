@@ -386,6 +386,9 @@ impl Conn {
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
             loop {
+                if let Some(reason) = short_disconnect(&buf) {
+                    return Some(reason);
+                }
                 match Packet::read(&mut buf, None) {
                     Ok(packet) => {
                         if let Some(reason) = self.dispatch(packet) {
@@ -490,6 +493,15 @@ impl Conn {
     }
 }
 
+/// The reason of a DISCONNECT with remaining length 1, a reason and no property length, which MQTT 5 allows and
+/// mosquitto sends on a takeover (e0 01 8e); rumqttc 0.25 waits for the property length instead.
+fn short_disconnect(buf: &[u8]) -> Option<u8> {
+    match buf {
+        [0xe0, 0x01, reason, ..] => Some(*reason),
+        _ => None,
+    }
+}
+
 /// End a connection cleanly: DISCONNECT, then shut the socket for every clone of it.
 fn disconnect(stream: &TcpStream) {
     let mut buf = BytesMut::new();
@@ -559,5 +571,21 @@ fn dial(host: &str, port: u16, opts: &Options) -> Result<Dialed, DialError> {
             Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
             _ => return Err(DialError::NotAccepted),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// mosquitto's takeover DISCONNECT is e0 01 8e: a reason and no property length (paho 2.1 reads it as reason 0).
+    #[test]
+    fn a_one_byte_reason_reads_as_session_taken_over() {
+        assert!(Packet::read(&mut BytesMut::from(&[0xe0u8, 0x01, 0x8e][..]), None).is_err(), "rumqttc alone fails");
+        assert_eq!(short_disconnect(&[0xe0, 0x01, 0x8e]), Some(142));
+        assert_eq!(short_disconnect(&[0xe0, 0x01]), None, "not complete yet");
+        assert_eq!(short_disconnect(&[0xe0, 0x02, 0x8e, 0x00]), None, "with a property length rumqttc reads it");
+        let mut full = BytesMut::from(&[0xe0u8, 0x02, 0x8e, 0x00][..]);
+        assert!(matches!(Packet::read(&mut full, None), Ok(Packet::Disconnect(d)) if d.reason_code as u8 == 142));
     }
 }
