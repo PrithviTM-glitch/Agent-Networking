@@ -11,7 +11,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -25,8 +24,9 @@ from conftest import BIN
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from agent_bridge import config, identity, presence, relay
-from agent_bridge.bus import Bus
+from agent_bridge import _native, config
+
+Bus = _native.Bus
 
 BRIDGE, HOOK, SERVER = (str(BIN / name) for name in ("agent-bridge", "agent-bridge-relay-hook", "agent-bridge-mcp"))
 SESSION, RUN = str(uuid.uuid4()), uuid.uuid4().hex[:6]
@@ -51,7 +51,7 @@ def session_env(ledgerd, historyd):
         CLAUDE_CODE_MESSAGING_SOCKET=os.path.join(TMP, "inbox.sock"),
         CLAUDE_CODE_MESSAGING_TOKEN="tok-123",
     )
-    ADDR = identity.session_address(SESSION)
+    ADDR = _native.identity_session_address(SESSION)
     FAKE = os.path.join(TMP, "claude")
     shutil.copy("/bin/sh", FAKE)
     logging.disable(logging.WARNING)
@@ -68,8 +68,9 @@ def session_env(ledgerd, historyd):
 def s(session_env):
     """The inbox, a sender and the console, shared by both tests and cleaned up after them."""
     # The sender is not part of the session: with its id, the session's relay would adopt it as the session's agent.
+    # The native origin is read once per process; conftest clears the session id before the first native call, so
+    # every Bus this process registers is session-less, and only the relay and CLI subprocesses carry the session.
     os.environ.pop("CLAUDE_CODE_SESSION_ID")
-    identity.origin.cache_clear()
     s = SimpleNamespace(inbox=Inbox(), sender=Bus.register("sender"), room=f"r{RUN}")
     os.environ["CLAUDE_CODE_SESSION_ID"] = SESSION
     s.console = Bus.register("admin", addr="admin", keep=True, admin=True)
@@ -138,7 +139,7 @@ def session_claude(session=SESSION):
     CLAUDES.append(p)
     t = time.monotonic()
     assert p.stdout.readline().strip() == "hooked" and time.monotonic() - t < 5, "the hook returns at once"
-    until(lambda: relay.live(session), what="relay start")
+    until(lambda: _native.relay_live(session), what="relay start")
     return p
 
 
@@ -150,7 +151,7 @@ def end(claude):
 
 
 def relay_pid():
-    with open(relay.lock_path(SESSION)) as f:
+    with open(_native.relay_lock_path(SESSION)) as f:
         return int(f.readline())
 
 
@@ -160,18 +161,11 @@ def test_relay(s):
     # The hook starts one relay as a detached child of the session; it registers the session's address.
     claude = session_claude()
     # The lock is taken before the relay registers, so its presence may follow a moment later.
-    until(lambda: ADDR in {x["addr"] for x in presence.agents()}, what="the relay's presence")
+    until(lambda: ADDR in {x["addr"] for x in _native.presence_agents()}, what="the relay's presence")
     first = relay_pid()
     subprocess.run([HOOK], env=os.environ, check=True)
     p = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "agent_bridge.relay",
-            "run",
-            str(claude.pid),
-            str(identity.read_proc(claude.pid)["start"]),
-        ],
+        [BRIDGE, "relay", "run", str(claude.pid), str(_native.identity_read_proc(claude.pid)["start"])],
         capture_output=True,
         text=True,
         timeout=30,
@@ -223,7 +217,7 @@ def test_relay(s):
     inbox.close()
     sender.dm(ADDR, "while the inbox is down")
     time.sleep(3)
-    assert relay.stop(SESSION) and not relay.live(SESSION), "SIGTERM stops it"
+    assert _native.relay_stop(SESSION) and not _native.relay_live(SESSION), "SIGTERM stops it"
     end(claude)
     inbox.open()
     claude = session_claude()
@@ -232,7 +226,7 @@ def test_relay(s):
 
     # The relay ends with its claude process.
     end(claude)
-    until(lambda: not relay.live(SESSION), timeout=5, what="relay exit after its claude died")
+    until(lambda: not _native.relay_live(SESSION), timeout=5, what="relay exit after its claude died")
 
 
 def test_coexist_with_mcp(s):
@@ -387,13 +381,14 @@ def test_adopts_cli_agent(s):
         cli("join", cli_addr, s.room)
         before = len(s.inbox.posts)
         claude = session_claude(other)
-        assert identity.session_address(other) not in {x["addr"] for x in presence.agents()}, "no second agent"
+        live = {x["addr"] for x in _native.presence_agents()}
+        assert _native.identity_session_address(other) not in live, "no second agent"
         s.sender.say(s.room, "for the worker")
         until(lambda: len(s.inbox.posts) > before, what="post to the adopted agent")
         head, _, msgs = s.inbox.messages(len(s.inbox.posts) - 1)
         assert [(m["topic"], m["body"]) for m in msgs] == [(f"room/{s.room}", "for the worker")], "its room came along"
         end(claude)
-        until(lambda: not relay.live(other), timeout=5, what="relay exit")
+        until(lambda: not _native.relay_live(other), timeout=5, what="relay exit")
         cli("leave", cli_addr)
     finally:
         os.environ["CLAUDE_CODE_SESSION_ID"] = SESSION
@@ -405,8 +400,9 @@ def test_mentions_wake_only_the_mentioned(s):
     os.environ["CLAUDE_CODE_SESSION_ID"] = session  # its own session, so the relay's agent is not one of ours
     try:
         claude = session_claude(session)
-        me = identity.session_address(session)
-        until(lambda: relay.held(session) == me, what="the relay's agent")  # it takes the lock before registering
+        me = _native.identity_session_address(session)
+        # The relay takes the lock before registering.
+        until(lambda: _native.relay_held(session) == me, what="the relay's agent")
         cli("join", me, room)
         other = Bus.register("other")
         other.join(room)
@@ -427,7 +423,7 @@ def test_mentions_wake_only_the_mentioned(s):
         c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv5)
         c.connect(config.HOST, config.PORT)
         c.loop_start()
-        for i in range(relay.BACKLOG + 5):
+        for i in range(_native.RELAY_BACKLOG + 5):
             quiet = {"from": s.sender.addr, "body": f"quiet {i}", "ts": time.time(), "mentions": [other.addr]}
             c.publish(f"room/{room}", json.dumps(quiet), qos=1).wait_for_publish(5)
         c.disconnect()
@@ -438,11 +434,11 @@ def test_mentions_wake_only_the_mentioned(s):
         until(lambda: len(s.inbox.posts) > before, what="the DM's post")
         lines = s.inbox.posts[-1][1]["message"]["content"].split("\n")
         assert lines[0] == f"[agent-bridge] 1 message (DM from {s.sender.addr})"
-        assert lines[3] == f"[agent-bridge] while you were away: {relay.BACKLOG} quiet room messages"
-        assert [json.loads(x)["body"] for x in lines[4:]] == [f"quiet {i}" for i in range(5, relay.BACKLOG + 5)]
+        assert lines[3] == f"[agent-bridge] while you were away: {_native.RELAY_BACKLOG} quiet room messages"
+        assert [json.loads(x)["body"] for x in lines[4:]] == [f"quiet {i}" for i in range(5, _native.RELAY_BACKLOG + 5)]
         end(claude)
-        until(lambda: not relay.live(session), timeout=5, what="relay exit")
-        assert relay.held(session) is None
+        until(lambda: not _native.relay_live(session), timeout=5, what="relay exit")
+        assert _native.relay_held(session) is None
         other.leave()
         cli("leave", me)
     finally:

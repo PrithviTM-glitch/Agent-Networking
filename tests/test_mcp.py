@@ -17,7 +17,7 @@ from conftest import BIN
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from agent_bridge.bus import Bus
+from agent_bridge import _native
 
 SERVER = str(BIN / "agent-bridge-mcp")
 BRIDGE = str(BIN / "agent-bridge")
@@ -250,7 +250,7 @@ async def broadcast():
             ("sub", {"topic": "broadcast/#"}),
         ):
             assert "reserved" in await fails(s, tool, **args)
-        console = await anyio.to_thread.run_sync(lambda: Bus.register("admin", addr="admin", keep=True, admin=True))
+        console = await anyio.to_thread.run_sync(_native.Bus.register_admin)
         await anyio.to_thread.run_sync(console.broadcast, "hello agents")
         res = await s.call_tool("recv", {"wait": 5})
         head, body = res.content[0].text.split("\n", 1)

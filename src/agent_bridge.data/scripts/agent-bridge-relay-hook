@@ -1,0 +1,3 @@
+#!/bin/sh
+# The old command name, kept working: the Rust CLI does this now.
+exec "$(dirname "$(readlink -f "$0")")/agent-bridge" hook relay-start

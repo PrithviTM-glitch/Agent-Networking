@@ -6,10 +6,8 @@ suffix), at most 32 caps. Text: at most 64 KiB of UTF-8; tab, newline and CR are
 reserved levels agents, inbox, ledger, broadcast, rooms and history. + and # work only in subscription filters, as
 whole levels, # only last, and not as the first level.
 
-The limits and the checks the native core also enforces are its own, re-exported here so there is one definition. The
-rest are kept in Python: UUID and is_count (host-side helpers with no native counterpart), not_admin (the native one
-raises TypeError for a non-string, where callers rely on the later check's one-line BridgeError), and the checks only
-the Python bus modules use.
+The limits and the checks are the native core's own, re-exported here so there is one definition; UUID and is_count
+are host-side helpers with no native counterpart.
 """
 
 import re
@@ -35,27 +33,5 @@ check_text, check_session = _native.check_text, _native.check_session
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
-def show(value):
-    return repr(value)[:60]
-
-
 def is_count(value, cap):
     return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= cap
-
-
-def not_admin(value, what):
-    if isinstance(value, str) and value.lower() == ADMIN:
-        raise BridgeError(f"{what} {value!r} is reserved for the admin console")
-    return value
-
-
-def check_mentions(values):
-    if not isinstance(values, list) or not values or len(values) > MENTIONS_MAX:
-        raise BridgeError(f"mentions must be a list of 1-{MENTIONS_MAX} addresses")
-    return sorted({check_ident(v, "address") for v in values})
-
-
-def check_ts(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < 1e10:
-        raise BridgeError("bad timestamp")
-    return float(value)

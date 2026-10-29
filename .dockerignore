@@ -1,9 +1,0 @@
-*
-!pyproject.toml
-!README.md
-!LICENSE
-!src/
-!rust/
-rust/target
-src/agent_bridge/*.so
-**/__pycache__

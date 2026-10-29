@@ -23,18 +23,11 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 CONF = ROOT / "config" / "mosquitto.conf"
 IMAGE = "eclipse-mosquitto:2.0.22"
-# Overrides for running the suite against another implementation, such as the Rust binaries.
+# The commands under test: by default the ones installed next to this Python (the wheel puts the native binaries and
+# the shims in the same bin directory as its Python entry points). The overrides point the suite at other builds.
 BIN = Path(os.environ.get("AGENT_BRIDGE_BIN") or Path(sys.executable).parent)
-LEDGERD = shlex.split(os.environ.get("AGENT_BRIDGE_LEDGERD", "")) or [
-    sys.executable,
-    "-m",
-    "agent_bridge.ledger.service",
-]
-HISTORYD = shlex.split(os.environ.get("AGENT_BRIDGE_HISTORYD", "")) or [
-    sys.executable,
-    "-m",
-    "agent_bridge.history.service",
-]
+LEDGERD = shlex.split(os.environ.get("AGENT_BRIDGE_LEDGERD", "")) or [str(BIN / "agent-bridge-ledgerd")]
+HISTORYD = shlex.split(os.environ.get("AGENT_BRIDGE_HISTORYD", "")) or [str(BIN / "agent-bridge-historyd")]
 
 
 def free_port():
@@ -122,7 +115,7 @@ def pytest_configure(config):
 # bridge-core's checklist of bus behaviours, by name, and the tests that pin each; the summary reports them, so the
 # cutover gate shows which behaviour an implementation breaks rather than only which test failed.
 BEHAVIOURS = {
-    name: [*tests, *(f"tests/test_conformance.py::{conformance}[{impl}]" for impl in ("python", "native"))]
+    name: [*tests, f"tests/test_conformance.py::{conformance}"]
     for name, tests, conformance in (
         (
             "write-once origin",
@@ -205,14 +198,13 @@ class Broker:
         assert wait_for(self._accepts, 15), "the test broker never came up"
 
     def _accepts(self):
-        from agent_bridge.ledger import client
+        from agent_bridge import _native
+        from agent_bridge.errors import BridgeError
 
         try:
-            c = client.connect()
-        except client.LedgerError:
+            _native.presence_agents()
+        except BridgeError:
             return False
-        c.disconnect()
-        c.loop_stop()
         return True
 
     def remove(self):
@@ -265,7 +257,8 @@ def _service_env(var, db, extra):
 
 def start_ledgerd(db, log, **env):
     """A host ledgerd on the test broker, answering requests before this returns."""
-    from agent_bridge.ledger import client
+    from agent_bridge import _native
+    from agent_bridge.errors import LedgerError
 
     with open(log, "a") as err:
         proc = subprocess.Popen(
@@ -276,9 +269,9 @@ def start_ledgerd(db, log, **env):
 
     def answers():
         assert proc.poll() is None, open(log).read()
-        try:
-            return client.call("init", "probe-0", timeout=1)
-        except client.LedgerError:
+        try:  # dump needs no ledger, so the probe leaves no state behind
+            return _native.ledger_call("dump", "probe-0", timeout=1)
+        except LedgerError:
             return None
 
     assert wait_for(answers, 30), "ledgerd never answered"
@@ -287,7 +280,8 @@ def start_ledgerd(db, log, **env):
 
 def start_historyd(db, log, **env):
     """A host historyd on the test broker, answering requests before this returns."""
-    from agent_bridge.history import client
+    from agent_bridge import _native
+    from agent_bridge.errors import HistoryError
 
     with open(log, "a") as err:
         proc = subprocess.Popen(HISTORYD, stderr=err, env=_service_env("HISTORY_DB", db, env))
@@ -295,8 +289,8 @@ def start_historyd(db, log, **env):
     def answers():
         assert proc.poll() is None, open(log).read()
         try:
-            return client.call("ping", timeout=1)
-        except client.HistoryError:
+            return _native.history_call("ping", timeout=1)
+        except HistoryError:
             return None
 
     assert wait_for(answers, 30), "historyd never answered"

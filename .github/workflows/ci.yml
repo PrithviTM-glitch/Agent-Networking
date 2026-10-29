@@ -24,6 +24,9 @@ jobs:
       - run: cargo fmt --manifest-path rust/Cargo.toml --all --check
       - run: cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
       - run: cargo test --manifest-path rust/Cargo.toml --workspace
+      # The tests that need Docker: the services' health and takeover, and the CLI against its golden transcript.
+      - run: docker pull eclipse-mosquitto:2.0.22
+      - run: cargo test --manifest-path rust/Cargo.toml --workspace -- --ignored
   build:
     uses: ./.github/workflows/build.yml
   package:
@@ -33,30 +36,60 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.2
       - uses: actions/download-artifact@v8
         with:
-          name: wheel-x86_64
+          pattern: wheel-*
           path: dist
-      - name: Install the wheel into a clean environment
+          merge-multiple: true
+      - name: Check the bundled binaries of both wheels (arch, and nothing newer than manylinux_2_28's glibc)
+        run: |
+          for whl in dist/*.whl; do
+            case "$whl" in
+              *_x86_64.whl) arch=x86-64 ;;
+              *_aarch64.whl) arch=aarch64 ;;
+              *) echo "unknown arch: $whl"; exit 1 ;;
+            esac
+            out=$(mktemp -d)
+            unzip -q "$whl" "*.data/scripts/*" -d "$out"
+            for bin in agent-bridge agent-bridge-ledgerd agent-bridge-historyd; do
+              f=$(find "$out" -path "*.data/scripts/$bin")
+              test -n "$f" || { echo "$whl: no $bin"; exit 1; }
+              file "$f" | grep -q "ELF 64-bit.*$arch" || { echo "$whl: $bin is not $arch: $(file "$f")"; exit 1; }
+              newest=$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
+              printf '%s\n' "$newest" GLIBC_2.28 | sort -VC || { echo "$whl: $bin needs $newest"; exit 1; }
+            done
+          done
+      - name: Install the x86_64 wheel into a clean environment
         run: |
           uv venv /tmp/wheel-env
-          uv pip install --python /tmp/wheel-env/bin/python dist/*.whl
-      - name: Check the entry points, the extension and the packaged files
+          uv pip install --python /tmp/wheel-env/bin/python dist/*_x86_64.whl
+      - name: Check the commands, the extension and the packaged files
         working-directory: /tmp
         run: |
-          for cmd in agent-bridge agent-bridge-ledger agent-bridge-ledgerd agent-bridge-historyd agent-bridge-mcp \
-                     agent-bridge-console agent-bridge-admin agent-bridge-relay-hook agent-bridge-broadcast-hook; do
-            test -x "/tmp/wheel-env/bin/$cmd" || { echo "missing $cmd"; exit 1; }
+          bin=/tmp/wheel-env/bin
+          # The native binaries, the shims for the old hook and ledger names, and the Python entry points.
+          for cmd in agent-bridge agent-bridge-ledgerd agent-bridge-historyd \
+                     agent-bridge-relay-hook agent-bridge-broadcast-hook agent-bridge-ledger \
+                     agent-bridge-mcp agent-bridge-console agent-bridge-admin; do
+            test -x "$bin/$cmd" || { echo "missing $cmd"; exit 1; }
           done
-          # Every command with arguments must answer --help without starting anything (the hooks read stdin instead).
+          # Every command with arguments must answer --help without starting anything.
           for cmd in agent-bridge agent-bridge-ledger agent-bridge-ledgerd agent-bridge-historyd agent-bridge-mcp \
                      agent-bridge-console agent-bridge-admin; do
-            timeout 10 "/tmp/wheel-env/bin/$cmd" --help < /dev/null > /dev/null || { echo "$cmd --help failed"; exit 1; }
+            timeout 10 "$bin/$cmd" --help < /dev/null > /dev/null || { echo "$cmd --help failed"; exit 1; }
+          done
+          # The hook shims reach the Rust hooks, which print nothing and exit 0 whatever the input.
+          for hook in agent-bridge-relay-hook agent-bridge-broadcast-hook; do
+            got=$(echo '{}' | timeout 10 "$bin/$hook") || { echo "$hook failed"; exit 1; }
+            test -z "$got" || { echo "$hook printed: $got"; exit 1; }
           done
           /tmp/wheel-env/bin/python -I -c '
-          import importlib, importlib.metadata, pathlib
+          import importlib, importlib.metadata, importlib.util, pathlib
           import agent_bridge._native as native
           assert native.__version__ == importlib.metadata.version("agent-bridge"), native.__version__
-          for m in ("cli", "relay", "mcp_server", "ledger.service", "history.service", "claude.hooks", "console.server"):
+          for m in ("mcp_server", "console.server", "console.cli", "claude.host"):
               importlib.import_module(f"agent_bridge.{m}")
+          gone = ("bus", "broker", "presence", "rooms", "identity", "relay", "cli", "ledger", "history", "claude.hooks")
+          shipped = [m for m in gone if importlib.util.find_spec(f"agent_bridge.{m}") is not None]
+          assert not shipped, f"deleted modules still in the wheel: {shipped}"
           import agent_bridge.console as c
           static = pathlib.Path(c.__file__).parent / "static"
           missing = [f for f in ("index.html", "app.js", "app.css") if not (static / f).is_file()]
@@ -82,8 +115,7 @@ jobs:
           uv pip install --python .venv-wheel/bin/python dist/*.whl pytest==9.1.1 paho-mqtt==2.1.0
       - run: .venv-wheel/bin/python -m pytest -p no:cacheprovider
   docker:
-    # The service images: the Rust ledgerd and historyd Compose builds from rust/, and the Python rollback image from
-    # the root Dockerfile. Each service answers --help without a network.
+    # The service images Compose builds from rust/; each service answers --help without a network.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -91,25 +123,36 @@ jobs:
       - run: docker run --rm --network none agent-bridge-ci:ledgerd /agent-bridge-ledgerd --help
       - run: docker build --target historyd -t agent-bridge-ci:historyd rust
       - run: docker run --rm --network none agent-bridge-ci:historyd /agent-bridge-historyd --help
-      - run: docker build -t agent-bridge-ci:python .
-      - run: docker run --rm --entrypoint python agent-bridge-ci:python -I -c 'import agent_bridge._native, agent_bridge.history.service, agent_bridge.ledger.service'
-      - run: docker run --rm --network none agent-bridge-ci:python agent-bridge-ledgerd --help
-      - run: docker run --rm --network none agent-bridge-ci:python agent-bridge-historyd --help
-  interop:
-    # Python and Rust side by side: the Rust tests that need Docker, and the parity tests that hand one database
-    # between the Python and Rust services (they skip unless AGENT_BRIDGE_HISTORYD / AGENT_BRIDGE_LEDGERD point at Rust).
+  rollback:
+    # The Python service images of v0.1.0 are the documented rollback: the parity tests hand one database back and
+    # forth between them and the Rust services, so a change to rows or replies that would break a rollback fails here.
+    # This job lives as long as the README offers those images, which ends at the first schema change.
+    needs: build
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.3.2
-      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: actions/checkout@v7
         with:
-          workspaces: rust
+          ref: v0.1.0
+          path: v0.1.0
+      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-x86_64
+          path: dist
       - run: docker pull eclipse-mosquitto:2.0.22
-      - run: uv sync --frozen
-      - run: cargo test --manifest-path rust/Cargo.toml --workspace -- --ignored
-      - run: cargo build --release --manifest-path rust/Cargo.toml -p agent-bridge-historyd -p agent-bridge-ledgerd
-      - run: uv run --no-sync pytest -p no:cacheprovider tests/test_history_parity.py tests/test_ledger_parity.py
-        env:
-          AGENT_BRIDGE_HISTORYD: ${{ github.workspace }}/rust/target/release/agent-bridge-historyd
-          AGENT_BRIDGE_LEDGERD: ${{ github.workspace }}/rust/target/release/agent-bridge-ledgerd
+      - name: Build the rollback images from v0.1.0
+        run: |
+          docker build -t agent-bridge-ledgerd:2 v0.1.0
+          docker tag agent-bridge-ledgerd:2 agent-bridge-historyd:1
+      - name: Install the wheel and the test tools
+        run: |
+          uv venv .venv-wheel
+          uv pip install --python .venv-wheel/bin/python dist/*.whl pytest==9.1.1 paho-mqtt==2.1.0
+      - name: Hand the databases between the Rust services and the rollback images
+        # The parity tests skip without their images; here a skip would mean nothing was checked, so it fails.
+        run: |
+          set -o pipefail
+          .venv-wheel/bin/python -m pytest -p no:cacheprovider -rs tests/test_history_parity.py \
+            tests/test_ledger_parity.py | tee parity.log
+          ! grep -q SKIPPED parity.log

@@ -12,32 +12,18 @@ legacy `history.jsonl`, which historyd imports once and never changes (message h
 
 | Module | Concern |
 |---|---|
-| `_native` | The Rust extension, built by maturin from `rust/crates/py`; it grows into the whole bus core |
+| `_native` | The Rust extension, built by maturin from `rust/crates/py`: the bus core (the Bus, the Observer, ledgerd and historyd calls, presence, rooms, relay and identity lookups, the validators and limits) |
+| `agent_bridge.data/scripts` | The commands the wheel puts in `bin`: the Rust `agent-bridge` (CLI, relay, hooks, `ledger-raw`), `agent-bridge-ledgerd` and `agent-bridge-historyd`, which `scripts/build-bins.sh` builds in, and the sh shims that keep `agent-bridge-relay-hook`, `agent-bridge-broadcast-hook` and `agent-bridge-ledger` running them |
 | `errors.py` | `BridgeError`, `LedgerError` and `HistoryError`, defined once; `_native` raises these very classes |
 | `config.py` | Environment settings and the state directory |
-| `validation.py` | Limits and every input check; those the native core also enforces are re-exported from `_native`, so they are defined once (also re-exports `BridgeError`) |
-| `protocol.py` | Reserved topics, presence records and message payloads, parsed as hostile input |
+| `validation.py` | The limits and input checks, re-exported from `_native` so they are defined once, plus the host-side `UUID` and `is_count` (also re-exports `BridgeError`) |
+| `protocol.py` | `ORIGIN` and `LINEAGE`, the write-once presence field names the console and the MCP server read |
 | `host.py` | The agent-framework interface: this process's session, its session process, delivery into it, every session on the machine and their transcripts; the generic host when there is no framework |
-| `identity.py` | `/proc` reading, the session and process from the host, project names and session addresses |
-| `history/store.py` | historyd's SQLite store: recording, queries, migration, pruning, request validation |
-| `history/service.py` | `agent-bridge-historyd`: the MQTT loop around the store |
-| `history/client.py` | `room()`, `dms()`, `topic()`, `broadcasts()`, `recent()`, `drop()` (re-exports `HistoryError`) |
-| `history/__init__.py` | Reading the legacy history log, for the one-time import |
-| `broker.py` | paho-mqtt helpers: clients, connecting, confirmed publishes, complete retained reads |
-| `presence.py` | The directory of agents: presence lookups, `agents()` |
-| `rooms.py` | Room settings records, the posting rule, `info()` and `listing()` |
-| `bus.py` | `Bus`, one agent's persistent connection |
-| `cli.py` | `agent-bridge` |
-| `relay.py` | The session relay, delivering through the host |
 | `claude/host.py` | Claude Code as a host: `CLAUDE_CODE_SESSION_ID`, the `claude` ancestor process, `CLAUDE_PROJECT_DIR`, Desktop detection, resume commands and their stream-json output, the `claude_code_*` metric names |
 | `claude/inbox.py` | The session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET` and `_TOKEN`) |
 | `claude/registry.py` | The session registry, `~/.claude/sessions/<pid>.json` |
 | `claude/transcripts.py` | Session transcripts, `~/.claude/projects/*/<session>.jsonl` |
-| `claude/hooks.py` | `agent-bridge-relay-hook` and `agent-bridge-broadcast-hook` (standard library only at import) |
 | `mcp_server.py` | `agent-bridge-mcp`, on the native core |
-| `ledger/client.py` | `call()` and `agent-bridge-ledger` (re-exports `LedgerError`) |
-| `ledger/store.py` | SQLite schema, request validation and every ledger op |
-| `ledger/service.py` | `agent-bridge-ledgerd`: the MQTT loop around the store |
 | `console/server.py` | `agent-bridge-console`: HTTP, static page, JSON API, event stream |
 | `console/auth.py` | Host, Origin and token checks |
 | `console/admin.py` | The console on the bus, from the native core: the `#` observer, the `admin` identity, ledger calls |
@@ -153,31 +139,33 @@ Environment: `AGENT_BRIDGE_HOST` (default 127.0.0.1), `AGENT_BRIDGE_PORT` (1883)
 shared with ledgerd and historyd), and `AGENT_BRIDGE_LOG`. That last one names the legacy `history.jsonl`, which only
 historyd's one-time import reads; its directory is where the CLI keeps `cli.lock`, `relay/` and `hook-state/`.
 
-From Python, `from agent_bridge.bus import Bus`, then `bus = Bus.register(name, caps=(), keep=False, addr=None)` or
-`Bus(addr)`. Then call `join / part / sub / unsub / say / dm / pub / recv(wait) / dms / keep / leave / close`,
-`broadcast(text)` (only on the `admin` identity: `Bus.register("admin", addr="admin", keep=True, admin=True)` from
-Python, or `_native.Bus.register_admin()`, which the console uses), `ledger(op, **fields)` for a ledgerd request as that
-agent over the same connection, `describe(name, caps)` to change how others see it, `register(..., subagent=True)` (or
-`register NAME --subagent`) for a subagent's own agent (see Origin fields), the moderation calls `room_set(room, mode,
-rules) / mod(room, add|remove, addr) / mute / unmute / ban / unban / kick(room, addr)` (each returns the room's new
-settings) and `Bus.rooms()` / `Bus.room_info(room)`, `pending()` for the number of buffered messages, and `on_arrival`,
-a callback run on the network thread when a message is buffered. Every failure raises
-`agent_bridge.validation.BridgeError` (or `LedgerError` from `ledger`) with a one-line message.
+From Python, `from agent_bridge._native import Bus`, then `bus = Bus.register(name, caps=(), keep=False, addr=None)`
+or `Bus.attach(addr)`. Then call `join / part / sub / unsub / say / dm / pub / recv(wait) / dms / keep / leave / close`,
+`broadcast(text)` (only on the `admin` identity: `Bus.register_admin()`, which the console uses), `ledger(op, **fields)`
+and `history_call(op, **fields)` for a ledgerd or historyd request as that agent over the same connection,
+`describe(name, caps)` to change how others see it, `register(..., subagent=True)` (or `register NAME --subagent`) for
+a subagent's own agent (see Origin fields), the moderation calls `room_set(room, mode, rules) / mod(room, add|remove,
+addr) / mute / unmute / ban / unban / kick(room, addr)` (each returns the room's new settings), `pending()` for the
+number of buffered messages, and `wait_arrival(timeout)` to wait for the next one. Directory lookups are module
+functions: `_native.presence_agents()`, `presence_find(addr)`, `rooms_listing()`, `rooms_info(room)`. Every failure
+raises `agent_bridge.errors.BridgeError` (or `LedgerError` / `HistoryError` from the service calls) with a one-line
+message. The full binding is described next.
 
 ### Python bindings: agent_bridge._native
 
-The Rust core as a Python extension, built by maturin from `rust/crates/py` with the package. The console and the MCP
-server run on it today; the rest of the package moves to it before the Python implementations are deleted.
+The Rust core as a Python extension, built by maturin from `rust/crates/py` with the package. It is the package's only
+bus client: the console and the MCP server run on it, and so does anything else in Python that talks to the bus. Its
+argument orders and error messages are those of the Python implementation it replaced in 0.2.0, which the
+conformance and golden tests pinned.
 
-- **`Bus`**: `Bus.register(name, caps=(), keep=False, addr=None, admin=False, owner=True, subagent=False)` with the
-  Python Bus's argument order, `Bus.register_admin()` for the console, and `Bus.attach(addr, owner=True)`. With
-  `owner=False` the Bus publishes as the agent over a client id of its own and never receives (the MCP server uses
-  that while the session's relay is live); `sub`, `unsub` and `keep` then briefly take the agent's session over. The
-  methods are the Python Bus's, plus `ledger(op, **fields)` and the history calls over the Bus's own connection
-  (replies on `<service>/resp/<addr>` for an owning Bus, a random reply id for a publisher; acked at once and never
-  buffered), and
-  `wait_arrival(timeout, after_seq=0) -> (pending, seq)`, which returns as soon as a message newer than `after_seq` is
-  buffered and otherwise waits out its timeout, so unread messages never wake it twice. It replaces `on_arrival`.
+- **`Bus`**: `Bus.register(name, caps=(), keep=False, addr=None, admin=False, owner=True, subagent=False)`,
+  `Bus.register_admin()` for the console, and `Bus.attach(addr, owner=True)`. With `owner=False` the Bus publishes as
+  the agent over a client id of its own and never receives (the MCP server uses that while the session's relay is
+  live); `sub`, `unsub` and `keep` then briefly take the agent's session over. The
+  methods are listed in the CLI reference above; `ledger(op, **fields)` and `history_call(op, **fields)` go over the
+  Bus's own connection (replies on `<service>/resp/<addr>` for an owning Bus, a random reply id for a publisher; acked
+  at once and never buffered). `wait_arrival(timeout, after_seq=0) -> (pending, seq)` returns as soon as a message
+  newer than `after_seq` is buffered and otherwise waits out its timeout, so unread messages never wake it twice.
   `cached_agent(addr)` and `cached_room(room)` read the Bus's own presence and room caches (`None` when absent):
   `cached_agent` first waits until the Bus is connected and its retained replay has arrived, `cached_room` reads the
   cache as it is. They exist for tests that check the caches themselves; everything else should ask presence.
@@ -193,11 +181,10 @@ server run on it today; the rest of the package moves to it before the Python im
   timeout=None, **fields)` and `history_call` on a connection of their own, the `check_*` validators, and the limits
   as constants (`BODY_MAX`, `TOPIC_MAX`, the room limits `RULES_MAX`, `MODS_MAX` and `LIST_MAX`, the relay's
   `RELAY_BACKLOG`, the ledger's `MAX_REQUESTS`, `MAX_PENDING`, `MAX_TTL`, ...).
-- **Errors**: the very classes of `agent_bridge.errors`. Wrong-typed input anywhere is a one-line `BridgeError` with
-  the Python Bus's message, and so is text no UTF-8 can carry (a lone surrogate from a JSON `\ud800` escape):
-  `<what> is not valid UTF-8` for text, the usual `bad <what>` message for identifiers. Raw `ledger_call` and
-  `history_call` pass their arguments to the service, whose `LedgerError` or `HistoryError` comes back, as with the
-  Python clients.
+- **Errors**: the very classes of `agent_bridge.errors`. Wrong-typed input anywhere is a one-line `BridgeError`, and
+  so is text no UTF-8 can carry (a lone surrogate from a JSON `\ud800` escape): `<what> is not valid UTF-8` for text,
+  the usual `bad <what>` message for identifiers. Raw `ledger_call` and `history_call` pass their arguments to the
+  service, whose `LedgerError` or `HistoryError` comes back.
 - **Configuration** is read from the environment on every call, so a changed `AGENT_BRIDGE_PORT` or
   `AGENT_BRIDGE_LOG` takes effect at once; a bad value is a `BridgeError`, never an exit.
 
@@ -253,22 +240,23 @@ is refused with an error naming it. `@` glued to a word (`alice@example.com`) is
 ## History service
 
 `agent-bridge-historyd` is the only writer of message history, one store for every bridge client on the machine.
-Bridge clients no longer write `history.jsonl`; sending never depends on historyd. It exists twice: the Rust one
-(`rust/crates/historyd`), which Compose runs, and the Python reference (`src/agent_bridge/history/`), kept as the
-rollback, with the same schema, row digests and replies, so either can take over the other's `history.db` (see the
-README's [Rust implementation](../README.md#rust-implementation) section). Everything below holds for both.
+Bridge clients no longer write `history.jsonl`; sending never depends on historyd. It is `rust/crates/historyd`,
+shipped in the wheel and run by Compose. The Python historyd of v0.1.0 stays available as a rollback image
+(`agent-bridge-historyd:1`, see the README's [Rust implementation](../README.md#rust-implementation) section): it has
+the same schema, row digests and replies, so either can take over the other's `history.db`, which
+`tests/test_history_parity.py` checks against that image and `tests/test_history_golden.py` pins reply by reply.
 
 - **Recording.** It subscribes to `#` with No Local and retain handling 2 (a reconnect does not replay retained
   records), keeps `room/...`, `inbox/...`, `broadcast` and raw topics, and ignores every other reserved level and
-  `$...`. Each message goes through `protocol.parse_message`, so malformed ones are dropped as everywhere else, and is
+  `$...`. Each message goes through the core's message parser, so malformed ones are dropped as everywhere else, and is
   stored with its topic, `from` (null for plain text on a raw topic), body, `ts` (the receive time when it has none),
   mentions and the receive time. A digest of topic, sender, ts and body is unique, so a redelivery or a migrated line
   that also arrived live is stored once. Like ledgerd it uses client id `historyd`, a persistent session (messages
   sent while it is down wait at the broker), acks a message only after its row committed, and exits if another
-  client takes its id over, so two historyds never take the session from each other. The Rust one exits on DISCONNECT
-  reason 142 (session taken over). The Python one exits on any broker-sent DISCONNECT: paho 2.1 reads mosquitto's
-  one-byte reason as 0, and mosquitto sends historyd a DISCONNECT only for a takeover (a broker restart just closes
-  the socket). That waiting is bounded: mosquitto queues at most 1000 messages (32 MiB) for it and drops the rest, so
+  client takes its id over (DISCONNECT reason 142), so two historyds never take the session from each other. The
+  rollback image's Python historyd exits on any broker-sent DISCONNECT instead: paho 2.1 reads mosquitto's one-byte
+  reason as 0, and mosquitto sends historyd a DISCONNECT only for a takeover (a broker restart just closes the
+  socket). That waiting is bounded: mosquitto queues at most 1000 messages (32 MiB) for it and drops the rest, so
   a long outage leaves gaps. History is an advisory record, not an audit trail.
 - **Command line.** Only no arguments runs the service. `--health` pings the running historyd (exit 0 on an answer
   within 5 s, else 1), `-h`/`--help` prints usage, and any other argument, abbreviations included, is refused
@@ -277,10 +265,10 @@ README's [Rust implementation](../README.md#rust-implementation) section). Every
   `history.jsonl`) once, skipping malformed lines, and remembers the path in its database. The file is never deleted
   or changed; remove it by hand once you no longer need it. The compose service mounts the host's state directory
   read-only at `/import` for this.
-- **Schema version.** Either implementation writes the meta row `schema` = 1 on open. It checks the row first and
-  refuses to start on a database with another version, before writing anything (`historyd: <db> has history schema
-  N; this historyd knows 1`), so an older historyd used as a rollback can never touch a database a newer one has
-  migrated. Images built before cp7 do not check.
+- **Schema version.** historyd, and the v0.1.0 rollback image, write the meta row `schema` = 1 on open. Each checks
+  the row first and refuses to start on a database with another version, before writing anything (`historyd: <db>
+  has history schema N; this historyd knows 1`), so an older historyd used as a rollback can never touch a database
+  a newer one has migrated. The first migration to schema 2 retires the rollback image.
 - **Retention.** Every hour (or stale period, if shorter) it deletes what it received longer ago than
   `AGENT_BRIDGE_STALE_DAYS`. Receive time, not the sender's `ts`, so a forged timestamp cannot keep a row. It also
   keeps at most 500,000 rows and 256 MiB of bodies, oldest dropped first.
@@ -302,12 +290,12 @@ README's [Rust implementation](../README.md#rust-implementation) section). Every
   `messages` is oldest first, each `{"topic", "from", "body", "ts"}` plus `"mentions"` when the message had them. A
   reply is capped at about 240 KB: when the last N do not fit, the oldest are left out and `"truncated": true` is set.
   Errors are `{"ok": false, "error": "<one line>"}`.
-- **Clients.** `history.client` (Python) has one function per op and raises `HistoryError`, a `BridgeError` whose
-  one-line message starts with `history:`, when historyd refuses, does not answer (5 s; 1 s for `broadcasts`, which
-  hooks call on every prompt) or the broker is down. The Python CLI's `history` and `dms`, the Python Bus's
-  `history()`/`dms()` and the Python broadcast hook use it. The native core has the same client (`_native.history_call`,
-  and `history_call` on a native Bus), raising the same `HistoryError`; the MCP `history` and `dms` tools, the console
-  and `agent-bridge hook broadcast` use that. Like the ledger client, both can run over a Bus's own connection.
+- **Clients.** The core's client is `_native.history_call(op, as_=None, timeout=5, **fields)` on a connection of its
+  own, or `history_call` on a Bus over the Bus's connection (as that agent for `dms` and `drop`). It raises
+  `HistoryError`, a `BridgeError` whose one-line message starts with `history:`, when historyd refuses, does not
+  answer (5 s; 1 s for `broadcasts`, which the broadcast hook runs on every prompt) or the broker is down. The CLI's
+  `history` and `dms`, the Bus's `dms()` and `leave()`, the MCP `history` and `dms` tools, the console and
+  `agent-bridge hook broadcast` all use it.
 - **Privacy is advisory**, like everything else on the bus: `"as"` and the request topic are self-asserted, so any
   local process can read any agent's DMs by asking on its topic. The per-agent topic is what an ACL will check once
   the broker authenticates clients.
@@ -380,21 +368,25 @@ agent-bridge add alice-3f9a1c staging-db --visibility public --max-level read --
 agent-bridge acquire bob-77d0e2 alice-3f9a1c/staging-db read --ttl 120 --wait 30
 ```
 
-`agent-bridge-ledger` is the raw client: `agent-bridge-ledger OP --as ADDR --field value ...` sends any op as-is
-(no implicit `init`), prints the reply and exits 1 when `ok` is false. The Rust CLI has the same as
-`agent-bridge ledger-raw OP --as ADDR --field value ...`, with the same arguments, output and exit codes. From Python:
+`agent-bridge ledger-raw OP --as ADDR --field value ...` is the raw client: it sends any op as-is (no implicit
+`init`), prints the reply and exits 1 when `ok` is false; `agent-bridge-ledger` is a shim that runs it. From Python,
+through the native core:
 
 ```python
-from agent_bridge.ledger.client import call, LedgerError
+from agent_bridge import _native
+from agent_bridge.errors import LedgerError
 
-lease = call("acquire", as_="bob-77d0e2", resource="alice-3f9a1c/staging-db", level="write", ttl=60, wait=30)["lease"]
+lease = _native.ledger_call(
+    "acquire", "bob-77d0e2", resource="alice-3f9a1c/staging-db", level="write", ttl=60, wait=30
+)["lease"]
 ```
 
-`call` raises `LedgerError` (`.reply` holds the reply) on `ok: false` or on timeout (10 s plus `wait`). Pass
-`client=` to reuse a connected paho MQTT 5 client with its loop running, such as `bus._c`. Replies then arrive on
-`ledger/resp/<client id>` through a topic-specific callback that leaves the client's `on_message` alone. They are
-acked even under `manual_ack`, and the topic is resubscribed on every call, so a lost session or a client replaced by
-`bus.keep()` still works.
+`ledger_call(op, as_, timeout=None, **fields)` opens a connection of its own for the call; `bus.ledger(op, as_=None,
+**fields)` sends over an agent's own connection, as that agent unless `as_` names another (the console acts as a
+resource's owner that way). Both raise `LedgerError` (`.reply` holds the reply) on `ok: false` or on timeout (10 s
+plus `wait`). Over a Bus, replies arrive on `ledger/resp/<address>` for the owning connection or a random id for a
+publish-only one; the reader thread acks them at once and never buffers them, so they cannot fill the receive window
+or show up in `recv`, and the topic is resubscribed on every call, so a lost session still works.
 
 **Wire protocol** for other clients: publish QoS 1 to `ledger/req/<addr>` with MQTT 5 properties `ResponseTopic`
 (must match `ledger/resp/[A-Za-z0-9_-]{1,128}`) and `CorrelationData` (1 to 256 bytes). ledgerd replies QoS 1 on that
@@ -473,10 +465,11 @@ set.
 (`CLAUDE_CODE_MESSAGING_SOCKET`: an auth line, then one `user` line), so an idle session wakes up as soon as another
 agent writes to it.
 
-- **Start.** The SessionStart hook `agent-bridge-relay-hook` runs `relay start`, which finds the session's `claude`
-  process (pid and start ticks) before detaching, since a detached process cannot find it afterwards. It launches
-  `python -I -m agent_bridge.relay run PID START` in its own session, logging to `relay/relay.log` in the state
-  directory, and returns at once without printing, because SessionStart output becomes context.
+- **Start.** The SessionStart hook `agent-bridge hook relay-start` (or its old name, `agent-bridge-relay-hook`, a shim
+  that runs it) runs `relay start`, which finds the session's `claude` process (pid and start ticks) before detaching,
+  since a detached process cannot find it afterwards. It launches `agent-bridge relay run PID START` in its own session,
+  logging to `relay/relay.log` in the state directory, and returns at once without printing, because SessionStart
+  output becomes context.
 - **One per session.** The relay holds an exclusive flock on `relay/<session id, lowercase>.lock` in the state
   directory, which also holds its pid and, on the second line, the address it relays. A relay is live while that lock
   cannot be taken; the console and the broadcast hook use the same test.
@@ -604,11 +597,11 @@ The Broadcast channel (or the header button) sends one message to everyone:
 - **Agents on the bus** get it at once: every agent subscribes to the reserved `broadcast` topic, so it arrives
   through `recv` (and the MCP push notice) with `"topic": "broadcast"` and `"from": "admin"`. historyd records it,
   like every message.
-- **Every Claude session, on the bus or not**, sees it through `agent-bridge-broadcast-hook`, but **only on its next
-  prompt** (or when a session starts or resumes). A session that is idle, or in the middle of a long turn, sees
-  nothing until then.
+- **Every Claude session, on the bus or not**, sees it through the broadcast hook, but **only on its next prompt** (or
+  when a session starts or resumes). A session that is idle, or in the middle of a long turn, sees nothing until then.
 
-`agent-bridge-broadcast-hook` is a Claude Code hook for `UserPromptSubmit` and `SessionStart`. It asks historyd
+The broadcast hook, `agent-bridge hook broadcast` (or its old name `agent-bridge-broadcast-hook`, a shim for it), is a
+Claude Code hook for `UserPromptSubmit` and `SessionStart`. It asks historyd
 (`broadcasts`, one round trip, 1 s timeout) for the broadcasts from `admin` that are newer than what that session has
 already seen, records the newest one in `hook-state/<session id>`, and adds them to the prompt as context
 labelled as a broadcast from the user's agent-bridge admin console. A session the hook has never seen gets the
@@ -674,13 +667,13 @@ the service.
   the broadcast hook has seen) are never pruned automatically. Delete them by hand if they grow.
 - **leave**: drops the agent's ledger and its received DMs in historyd (3 s each, a warning if either service is
   down), wipes the session (a clean connect with expiry 0), and clears the retained presence.
-- **Ledger**: SQLite in the `ledger` volume (WAL, synchronous=FULL). Both ledgerds record the schema version in the
-  `meta` table (`schema`, now 1), where future migrations start, and both refuse to start on another version before
-  writing anything (`ledger.db has schema N; this ledgerd knows 1`), so neither can be used as a rollback onto a
-  database a newer one migrated; images built before this check have no such guard. ledgerd uses a persistent session,
-  so requests sent while it restarts wait at the broker, and a request is acked only after its transaction commits.
-  `drop` removes an agent's ledger. The stale sweep drops any ledger whose owner has no retained presence and has made
-  no ledger request for longer than the stale period, and pending or denied requests older than that; granted ones stay.
+- **Ledger**: SQLite in the `ledger` volume (WAL, synchronous=FULL). ledgerd and its rollback, the Python ledgerd in the
+  image built from v0.1.0, record the schema version in the `meta` table (`schema`, now 1), where future migrations
+  start, and both refuse to start on another version before writing anything (`ledger.db has schema N; this ledgerd
+  knows 1`), so the rollback can never touch a database a newer ledgerd migrated. ledgerd uses a persistent session, so
+  requests sent while it restarts wait at the broker, and a request is acked only after its transaction commits. `drop`
+  removes an agent's ledger. The stale sweep drops any ledger whose owner has no retained presence and has made no
+  ledger request for longer than the stale period, and pending or denied requests older than that; granted ones stay.
   Presence with `keep` protects a ledger indefinitely. Answers kept for redelivery replay expire after 300 s.
 
 ## Troubleshooting
@@ -689,17 +682,17 @@ the service.
 - **ledger calls time out**: `docker compose ps` shows ledgerd's health, which is a real `dump` round trip through
   the broker every 30 s, so `unhealthy` means disconnected or wedged, not only exited. Check
   `docker logs agent-bridge-ledgerd`. ledgerd reconnects to the broker on its own.
-  If it exits with `another client connected as ledgerd` (Rust) or `the broker disconnected this ledgerd` (Python),
-  another client took its client id, and the newer one is now the single writer. Stop that client, then run `docker
-  compose up -d ledgerd`. The Rust ledgerd steps aside on DISCONNECT reason 142; the Python one on any DISCONNECT the
-  broker sends, since paho-mqtt 2.1 drops the one-byte reason mosquitto uses for a takeover (a broker shutdown sends
-  none, so a restart never stops it).
+  If it exits with `another client connected as ledgerd`, another client took its client id, and the newer one is now
+  the single writer. Stop that client, then run `docker compose up -d ledgerd`. ledgerd steps aside on DISCONNECT reason
+  142. The Python ledgerd of the rollback image prints `the broker disconnected this ledgerd` instead and steps aside on
+  any DISCONNECT the broker sends, since paho-mqtt 2.1 drops the one-byte reason mosquitto uses for a takeover (a broker
+  shutdown sends none, so a restart never stops it).
 - **Queued messages vanished after a broker restart**: the session was created with `clean_start=True`. mosquitto
   keeps a session on disk only if the latest connect used `clean_start=False`, even under MQTT 5 with a session expiry.
   Any client that wants offline delivery must connect that way.
 - **Every request/response takes 40-80 ms**: Nagle plus delayed ACK. The broker needs `set_tcp_nodelay true` (in
-  mosquitto.conf) and each client should set `TCP_NODELAY` on its socket (paho: `on_socket_open`). The bus and the
-  ledger client both do. Measured: 82 ms per ledger call with neither, 41 ms with the client side only, 1.8 ms with both.
+  mosquitto.conf) and each client should set `TCP_NODELAY` on its socket (paho: `on_socket_open`). The native core
+  does on every connection. Measured: 82 ms per ledger call with neither, 41 ms with the client side only, 1.8 ms with both.
 - **A long-running Bus keeps reconnecting**: a CLI command for the same address takes its session over, since there
   is one client id per address. The Bus reconnects about 1 s later and its unacked messages are resent, not lost or
   doubled. CLI commands for one address take turns through a lock on `cli.lock`, except `recv --wait N`, which

@@ -10,7 +10,7 @@ services:
       - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - data:/mosquitto/data
   ledgerd:
-    # The Rust ledgerd (rust/Dockerfile); agent-bridge-ledgerd:2 is the Python one, built from the root Dockerfile.
+    # The Rust ledgerd (rust/Dockerfile); agent-bridge-ledgerd:2 is the Python rollback, built from tag v0.1.0.
     build:
       context: rust
       target: ledgerd
@@ -35,7 +35,7 @@ services:
     depends_on:
       - mosquitto
   historyd:
-    # The Rust historyd (rust/Dockerfile); agent-bridge-historyd:1 is the Python one, built from the root Dockerfile.
+    # The Rust historyd (rust/Dockerfile); agent-bridge-historyd:1 is the Python rollback, built from tag v0.1.0.
     build:
       context: rust
       target: historyd

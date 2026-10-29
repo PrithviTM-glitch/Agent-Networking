@@ -1,7 +1,8 @@
 #!/bin/sh
-# The release gate: build the wheel, install it into a fresh virtualenv, run the full suite against the installed wheel
-# GATE_RUNS times in a row (default 3), then the Rust tests including the ones that need Docker. Stops at the first
-# failure. Everything it builds lives in a temp directory removed on exit; the tests never touch the live state.
+# The release gate: build the wheel with its native binaries, install it into a fresh virtualenv, run the full suite
+# against the installed wheel GATE_RUNS times in a row (default 3), then the Rust tests including the ones that need
+# Docker. Stops at the first failure. The wheel and its virtualenv live in a temp directory removed on exit (the
+# binaries are built into src/agent_bridge.data/scripts, as for any wheel build); the tests never touch the live state.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -15,7 +16,8 @@ cd "$root"
 
 say() { printf 'gate: %s\n' "$*"; }
 
-say "building the wheel"
+say "building the native binaries and the wheel"
+scripts/build-bins.sh
 uvx --from maturin==1.15.0 maturin build --release --out "$work/dist"
 
 say "installing it into a fresh Python $python virtualenv"
@@ -28,6 +30,9 @@ where = agent_bridge.__file__
 assert sys.argv[1] not in where, f"agent_bridge imported from the tree: {where}"
 print("gate: agent_bridge", agent_bridge._native.__version__, "from", where)
 ' "$root/src"
+for cmd in agent-bridge agent-bridge-ledgerd agent-bridge-historyd; do
+    file -L "$work/venv/bin/$cmd" | grep -q ELF || { say "the wheel did not install a native $cmd"; exit 1; }
+done
 
 i=1
 while [ "$i" -le "$runs" ]; do

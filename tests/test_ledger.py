@@ -1,6 +1,7 @@
-"""The resource ledger end to end: semantics, a manual-ack shared client, a ledgerd kill mid-flight, hostile
-payloads and floods, the admin dump, request topics and redelivery, table bounds, a multi-process lock stress test and
-the stale sweep.
+"""The resource ledger end to end, against whichever ledgerd AGENT_BRIDGE_LEDGERD names (the bundled Rust one by
+default): semantics, a ledgerd kill mid-flight, hostile payloads and floods, the admin dump, request topics and
+redelivery, table bounds, a multi-process lock stress test, the stale sweep, the schema guard, the command line and
+agent-bridge ledger-raw.
 
 ledgerd is started and killed by these tests, so they use their own instead of the shared fixture. The broker runs a
 minimal config without packet limits, so oversized requests reach ledgerd. Run as a script with "worker" it is one
@@ -11,6 +12,7 @@ import json
 import os
 import random
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -22,14 +24,16 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 import pytest
+from conftest import BIN, LEDGERD
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 
-from agent_bridge import config
-from agent_bridge.ledger import client as ledger
+from agent_bridge import _native, config
+from agent_bridge.errors import LedgerError
 
 BROKER_CONF = Path(__file__).resolve().parent / "mosquitto-minimal.conf"
-TMP = LOG = LD = C = None
+LEDGER_RAW = [str(BIN / "agent-bridge"), "ledger-raw"]
+TMP = LOG = LD = None
 
 
 def start_ledgerd(db="ledger.db", **env):
@@ -41,16 +45,13 @@ def start_ledgerd(db="ledger.db", **env):
 
 @pytest.fixture(scope="module", autouse=True)
 def ledgerd_of_this_module(fresh_broker):
-    global TMP, LOG, C
+    global TMP, LOG
     TMP = tempfile.mkdtemp()
     LOG = os.path.join(TMP, "ledgerd.log")
-    C = ledger.connect()
     start_ledgerd()
     yield
     LD.kill()
     LD.wait()
-    C.disconnect()
-    C.loop_stop()
     shutil.rmtree(TMP, ignore_errors=True)
 
 
@@ -58,14 +59,26 @@ def alive():
     assert LD.poll() is None, open(LOG).read()
 
 
+def connect():
+    """A raw MQTT 5 client, for what the ledger client does not do: publish raw requests and watch topics."""
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv5)
+    up = threading.Event()
+    c.on_connect = lambda *_: up.set()
+    c.on_socket_open = lambda _c, _u, sock: sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    c.connect(config.HOST, config.PORT)
+    c.loop_start()
+    assert up.wait(5)
+    return c
+
+
 def call(op, who, **kw):
-    return ledger.call(op, who, client=C, **kw)
+    return _native.ledger_call(op, who, **kw)
 
 
 def err(op, who, **kw):
     try:
         call(op, who, **kw)
-    except ledger.LedgerError as e:
+    except LedgerError as e:
         return e.reply
     raise AssertionError(f"{op} {kw} should have failed")
 
@@ -82,7 +95,7 @@ def wait_for(pred, timeout=5):
 class Watch:
     def __init__(self, topic):
         self.msgs = []
-        self.c = ledger.connect()
+        self.c = connect()
         self.c.on_message = lambda _c, _u, m: self.msgs.append(
             (m.topic, m.payload, getattr(m.properties, "CorrelationData", None))
         )
@@ -110,8 +123,8 @@ def background(op, who, **kw):
     def go():
         t = time.monotonic()
         try:
-            box["reply"] = ledger.call(op, who, client=C, **kw)
-        except ledger.LedgerError as e:
+            box["reply"] = call(op, who, **kw)
+        except LedgerError as e:
             box["reply"] = e.reply
         box["secs"] = time.monotonic() - t
 
@@ -122,14 +135,13 @@ def background(op, who, **kw):
 
 
 def worker(who, resource, lvl, n, out):
-    c = ledger.connect()
     rows = []
     for _ in range(n):
-        lease = ledger.call("acquire", who, client=c, resource=resource, level=lvl, ttl=30, wait=120)["lease"]
+        lease = call("acquire", who, resource=resource, level=lvl, ttl=30, wait=120)["lease"]
         t0 = time.time()
         time.sleep(random.uniform(0, 0.003))
         t1 = time.time()
-        ledger.call("release", who, client=c, lease_id=lease["lease_id"])
+        call("release", who, lease_id=lease["lease_id"])
         rows.append([lvl, lease.get("token"), t0, t1])
     with open(out, "w") as f:
         json.dump(rows, f)
@@ -289,30 +301,6 @@ def test_functional():
     print("functional ok")
 
 
-def test_shared_client():
-    # shaped like the Bus: manual_ack, persistent session, its own on_message
-    me = "busagent-b1"
-    own = []
-    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=me, protocol=mqtt.MQTTv5, manual_ack=True)
-    ready = threading.Event()
-    c.on_connect = lambda *_: ready.set()
-    c.on_message = lambda _c, _u, m: own.append(m.topic)
-    props = Properties(PacketTypes.CONNECT)
-    props.SessionExpiryInterval = 600
-    props.ReceiveMaximum = 5
-    c.connect(config.HOST, config.PORT, clean_start=False, properties=props)
-    c.loop_start()
-    assert ready.wait(5)
-    for _ in range(30):
-        ledger.call("init", me, client=c, timeout=3)
-    assert own == [], "replies never reach the client's own on_message"
-    c.unsubscribe(f"ledger/resp/{me}")
-    assert ledger.call("init", me, client=c, timeout=3)["created"] is False, "a lost subscription is restored"
-    c.disconnect()
-    c.loop_stop()
-    print("shared client ok")
-
-
 def test_restart():
     a, f, g = "owner-o1", "fred-f1", "gina-g1"
     for x in (a, f, g):
@@ -350,7 +338,7 @@ def test_hostile():
     call("init", me)
     replies = Watch("ledger/resp/#")
     sniff = Watch("#")
-    raw = ledger.connect()
+    raw = connect()
     seq = [0]
 
     def send(payload, rt="ledger/resp/hostile", corr=True, qos=1):
@@ -523,7 +511,7 @@ def test_dump():
         call("init", b)
         for j in range(100):
             call("add", b, name=f"r{j}", description="x" * 1000, visibility="public")
-    raw = ledger.connect()
+    raw = connect()
     sizes = Watch("ledger/resp/#")
     d = call("dump", "admin-0")
     assert d["truncated"] is True and 0 < len(d["resources"]) < 300
@@ -556,7 +544,7 @@ def test_topics_and_redelivery():
         call("init", x)
     call("add", o, name="tr", visibility="public", max_level="write")
     replies = Watch("ledger/resp/topics")
-    raw = ledger.connect()
+    raw = connect()
     seq = [0]
 
     def send(topic, body, corr=None):
@@ -599,7 +587,7 @@ def test_topics_and_redelivery():
 
 
 def test_bounds():
-    from agent_bridge.ledger.store import MAX_REQUESTS
+    MAX_REQUESTS = _native.MAX_REQUESTS
 
     me, o = "bound-b1", "bound-o1"
     for x in (me, o):
@@ -660,7 +648,7 @@ def test_stale():
     LD.terminate()
     LD.wait()
     start_ledgerd("stale.db", AGENT_BRIDGE_STALE_DAYS=str(1 / 86400))  # 1 s, swept every 0.1 s
-    pres = ledger.connect()
+    pres = connect()
 
     def presence(who, rec):
         pres.publish(f"agents/{who}", json.dumps(rec) if rec else b"", qos=1, retain=True).wait_for_publish(5)
@@ -669,7 +657,7 @@ def test_stale():
         call("init", "active-a1")  # each poll keeps the active agent's ledger fresh
         try:
             call("ledger", "active-a1", owner=owner)
-        except ledger.LedgerError as e:
+        except LedgerError as e:
             return f"no ledger for {owner}" in e.reply["error"]
         return False
 
@@ -699,32 +687,30 @@ def test_stale():
     print("stale ok")
 
 
-def test_the_python_ledgerd_refuses_a_newer_schema():
-    """The Python ledgerd (the rollback) writes schema 1 and refuses to open a ledger.db a newer ledgerd migrated,
-    before writing anything to it. Python-only, so it runs whatever AGENT_BRIDGE_LEDGERD names."""
-    from agent_bridge.ledger.store import Ledger
-
+def test_a_newer_schema_is_refused():
+    """ledgerd refuses a ledger.db whose schema version it does not know, before writing anything to it, so a
+    rollback can never touch a database a newer ledgerd migrated."""
     db = os.path.join(tempfile.mkdtemp(), "ledger.db")
-    Ledger(db, lambda *_: None).db.close()
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT value FROM meta WHERE key='schema'").fetchall() == [(1,)]
-        conn.execute("UPDATE meta SET value=2 WHERE key='schema'")
-        conn.execute("DROP INDEX resources_owner")  # opening it would recreate this, so it shows a write
+        conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
+        conn.execute("INSERT INTO meta VALUES ('schema', 2)")
     service = subprocess.run(
-        [sys.executable, "-m", "agent_bridge.ledger.service"],
-        env={**os.environ, "LEDGER_DB": db},
+        LEDGERD,
+        env={**os.environ, "LEDGER_DB": db, "AGENT_BRIDGE_PORT": "1"},  # it opens the db before any connection
         capture_output=True,
         text=True,
         timeout=30,
     )
     assert service.returncode == 1 and "ledger.db has schema 2; this ledgerd knows 1" in service.stderr, service
     with sqlite3.connect(db) as conn:
-        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='resources_owner'").fetchall(), "it wrote"
+        assert [r[0] for r in conn.execute("SELECT name FROM sqlite_master")] == ["meta", "sqlite_autoindex_meta_1"], (
+            "it wrote"
+        )
 
 
 def test_arguments_start_nothing():
-    """Only no arguments runs the Python ledgerd: --help and refused arguments exit before a connection or the
-    database is opened, so a stray flag can never start a second ledgerd on the live defaults."""
+    """Only no arguments runs ledgerd: --help and refused arguments exit before a connection or the database is
+    opened, so a stray flag can never start a second ledgerd on the live defaults."""
     db = os.path.join(tempfile.mkdtemp(), "ledger.db")
     env = {**os.environ, "LEDGER_DB": db, "AGENT_BRIDGE_PORT": "1"}  # nothing listens there
     for args, code, out, err in (
@@ -732,11 +718,11 @@ def test_arguments_start_nothing():
         (["-h"], 0, "usage: agent-bridge-ledgerd", ""),
         (["--bogus"], 2, "", "agent-bridge-ledgerd: error: unrecognized arguments: --bogus"),
         (["--health", "x"], 2, "", "unrecognized arguments: x"),
-        (["--hea"], 2, "", "unrecognized arguments: --hea"),  # no abbreviations, as in the Rust ledgerd
+        (["--hea"], 2, "", "unrecognized arguments: --hea"),  # no abbreviations
         (["--health"], 1, "", "agent-bridge-ledgerd: unhealthy: broker unreachable"),
     ):
         p = subprocess.run(
-            [sys.executable, "-m", "agent_bridge.ledger.service", *args],
+            [*LEDGERD, *args],
             env=env,
             capture_output=True,
             text=True,
@@ -749,22 +735,20 @@ def test_arguments_start_nothing():
 def test_cli_and_log():
     call("init", "active-a1")
     cli = subprocess.run(
-        [sys.executable, "-m", "agent_bridge.ledger.client", "public", "--as", "active-a1"],
+        [*LEDGER_RAW, "public", "--as", "active-a1"],
         capture_output=True,
         text=True,
     )
     assert cli.returncode == 0 and json.loads(cli.stdout)["ok"], cli
     cli = subprocess.run(
-        [sys.executable, "-m", "agent_bridge.ledger.client", "acquire", "--as", "active-a1", "--resource", "x-1/y",
-         "--level", "read"],
+        [*LEDGER_RAW, "acquire", "--as", "active-a1", "--resource", "x-1/y", "--level", "read"],
         capture_output=True,
         text=True,
     )  # fmt: skip
     assert cli.returncode == 1 and "no such resource" in json.loads(cli.stdout)["error"], cli
     for flags in (["--wait", "inf"], ["--wait", "nan"], ["--wait", "1e300"], ["--timeout", "inf"], ["--ttl", "inf"]):
         cli = subprocess.run(
-            [sys.executable, "-m", "agent_bridge.ledger.client", "acquire", "--as", "active-a1", "--resource", "x-1/y",
-             "--level", "read", *flags],
+            [*LEDGER_RAW, "acquire", "--as", "active-a1", "--resource", "x-1/y", "--level", "read", *flags],
             capture_output=True,
             text=True,
         )  # fmt: skip

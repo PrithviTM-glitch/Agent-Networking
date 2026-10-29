@@ -1,5 +1,6 @@
 name: build
-# Called by ci.yml and release.yml: manylinux wheels and the sdist, uploaded as artifacts.
+# Called by ci.yml and release.yml: manylinux wheels and the sdist, uploaded as artifacts. Each wheel carries the Rust
+# extension and the native agent-bridge, agent-bridge-ledgerd and agent-bridge-historyd, built in the same container.
 on:
   workflow_call:
 permissions:
@@ -38,6 +39,12 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: 2_28
+          # The binaries go in as data scripts, which maturin does not audit, so they are built here, inside the
+          # manylinux container and for the wheel's target, not on the runner.
+          before-script-linux: |
+            export CARGO_BUILD_TARGET=${{ matrix.target }}-unknown-linux-gnu
+            rustup target add "$CARGO_BUILD_TARGET"
+            scripts/build-bins.sh
           args: --release --out dist
       - uses: actions/upload-artifact@v7
         with:

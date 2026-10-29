@@ -8,7 +8,7 @@ import time
 
 from conftest import start_ledgerd, wait_for
 
-from agent_bridge.ledger import client
+from agent_bridge import _native
 
 
 def test_the_first_ledgerd_steps_aside(fresh_broker, state_dir):
@@ -23,7 +23,7 @@ def test_the_first_ledgerd_steps_aside(fresh_broker, state_dir):
         assert first.returncode != 0
         time.sleep(3)  # the redial delay: a second takeover would come in this window
         assert second.poll() is None, open(logs[1]).read()
-        assert client.call("init", "after-takeover-a1", timeout=2)["created"] is True, "the one left serves"
+        assert _native.ledger_call("init", "after-takeover-a1", timeout=2)["created"] is True, "the one left serves"
     finally:
         for proc in (first, second):
             proc.kill()

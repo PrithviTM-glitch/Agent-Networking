@@ -1,4 +1,4 @@
-"""End to end: the CLI and the Bus against a disposable broker with ledgerd, including a broker restart.
+"""End to end: the CLI and the native Bus against a disposable broker with ledgerd, including a broker restart.
 
 The tests are one scenario in file order: later ones use the agents, rooms and log entries earlier ones made.
 """
@@ -14,16 +14,16 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-import conftest
 import paho.mqtt.client as mqtt
 import pytest
 from conftest import BIN
 
-from agent_bridge import broker, config, presence, relay
-from agent_bridge.bus import Bus
-from agent_bridge.history import client as history
+from agent_bridge import _native, config
+from agent_bridge.errors import BridgeError
 from agent_bridge.protocol import ORIGIN
-from agent_bridge.validation import BODY_MAX, BridgeError, is_ident
+from agent_bridge.validation import BODY_MAX, is_ident
+
+Bus = _native.Bus
 
 BRIDGE = str(BIN / "agent-bridge")
 RUN = uuid.uuid4().hex[:6]
@@ -105,6 +105,19 @@ def raw_client():
 
 def raw_pub(c, topic, payload, qos=1, retain=False):
     c.publish(topic, payload, qos=qos, retain=retain).wait_for_publish(5)
+
+
+def settle(bus, sender):
+    """Proof bus has caught up with what other processes just did, instead of a timeout: a DM sender sends after them
+    comes after their presence updates on bus's one connection, or bus was away (a takeover) and its reconnect re-read
+    the retained records first. Returns what arrived up to and including the marker."""
+    marker = f"marker {uuid.uuid4().hex[:6]}"
+    run("dm", sender, bus.addr, marker)
+    got = []
+    while not any(m["body"] == marker for m in got) and (batch := bus.recv(15)):
+        got += batch
+    assert any(m["body"] == marker for m in got), got
+    return got
 
 
 def raises(fn, *args, **kw):
@@ -198,14 +211,13 @@ def test_leave(s):
     run("leave", r3)
     assert r3 not in agents()
     run("dm", a, r3, "x", ok=False)
-    assert history.dms(r3) == [], "its DMs go too"
+    assert _native.history_call("dms", as_=r3)["messages"] == [], "its DMs go too"
 
 
 def test_bus_library(s):
     """One persistent connection, messages buffer in the background until recv drains them."""
     a = s.a
     s.lib = lib = Bus.register("lib", ["x"])
-    conn = lib._c
     run("dm", a, lib.addr, "to lib")
     assert [(m["topic"], m["from"], m["body"]) for m in lib.recv(5)] == [(f"inbox/{lib.addr}", a, "to lib")]
     lib.join("libroom")
@@ -222,9 +234,8 @@ def test_bus_library(s):
     assert (
         lib.recv() == []
         and lib.dms(a)[-1]["body"] == "lib to alice"
-        and lib.history("libroom")[-1]["body"] == "from lib"
+        and lib.history_call("room", room="libroom")["messages"][-1]["body"] == "from lib"
     )
-    assert lib._c is conn, "every operation used the one connection"
     assert set(agents()[lib.addr]["topics"]) == {"room/libroom", "libtopic"}
 
 
@@ -276,36 +287,27 @@ def test_broker_restart(s, fresh_broker):
     )
 
 
-def test_presence_cache(s, monkeypatch):
-    """A Bus keeps every presence record current over its own connection: no lookups, and a change another process
-    made to its record survives its next read-modify-write."""
+def test_presence_cache(s):
+    """A Bus keeps every presence record current over its own connection (mentions and DMs resolve from it), and a
+    change another process made to its record survives its next read-modify-write."""
     lib, room = s.lib, f"cache-{RUN}"
     newcomer = run("register", "newcomer")
     run("join", newcomer, room)
     run("keep", lib.addr, "on")  # another process acting as lib; lib reconnects
-    assert conftest.wait_for(lambda: (lib._seen(lib.addr) or {}).get("keep") is True, 5)
-    shots = []
-    real = broker.one_shot
-    monkeypatch.setattr(broker, "one_shot", lambda *a, **kw: shots.append(a) or real(*a, **kw))
+    settle(lib, s.a)
+    assert (lib.cached_agent(lib.addr) or {}).get("keep") is True
+    assert (lib.cached_agent(newcomer) or {}).get("topics") == [f"room/{room}"]
     lib.join(room)
     lib.say(room, "hello @newcomer")
     lib.dm(newcomer, "found you in the cache")
-    assert shots == [], "no short-lived lookup connections"
-    monkeypatch.undo()
-    assert presence.find(lib.addr)["keep"] is True and f"room/{room}" in presence.find(lib.addr)["topics"]
+    rec = _native.presence_find(lib.addr)
+    assert rec["keep"] is True and f"room/{room}" in rec["topics"], "the join kept what the other process changed"
     run("keep", lib.addr, "off")
     run("leave", newcomer)
-    # Proof the clear has reached lib, not a timeout: the marker is sent after the wipe was confirmed, so on lib's one
-    # connection it comes after the clear; or lib was away (the keep took its session), and then its reconnect re-reads
-    # the retained records before _seen answers.
-    run("dm", s.a, lib.addr, "marker")
-    got = []
-    while not any(m["body"] == "marker" for m in got) and (batch := lib.recv(15)):
-        got += batch
-    assert any(m["body"] == "marker" for m in got), got
-    assert lib._seen(newcomer) is None, (
+    settle(lib, s.a)
+    assert lib.cached_agent(newcomer) is None, (
         "a cleared record leaves the cache",
-        {"retained": presence.find(newcomer), "cached": lib._agents.get(newcomer), "up": lib._up.is_set()},
+        {"retained": _native.presence_find(newcomer), "cached": lib.cached_agent(newcomer)},
     )
     with pytest.raises(BridgeError, match="unknown address"):
         lib.dm(newcomer, "gone")
@@ -385,7 +387,7 @@ def test_forged_presence(s):
     lines("rooms")
     fails("dm", a, f"forged-inbox-{RUN}", "x")
     fails("recv", f"forged0-{RUN}")
-    raises(Bus, f"forged-many-{RUN}")
+    raises(Bus.attach, f"forged-many-{RUN}")
     s.victim2 = victim2 = run("register", "victim2")
     raw_pub(evil, f"agents/{victim2}", b"{garbage", retain=True)
     assert "unknown address" in fails("recv", victim2), "junk over a real presence reads as gone"
@@ -493,9 +495,9 @@ def test_subagents_and_write_once_origin(s):
     }
 
     main = run("register", "main", env_extra=in_session)
-    assert relay.session_agent(sid) == main, "the relay adopts the session's own agent"
+    assert _native.relay_session_agent(sid) == main, "the relay adopts the session's own agent"
     run("leave", main)
-    assert relay.session_agent(sid) is None, "never a subagent's"
+    assert _native.relay_session_agent(sid) is None, "never a subagent's"
     with pytest.raises(BridgeError):
         Bus.register("admin", addr="admin", keep=True, admin=True, subagent=True)
 
@@ -581,7 +583,7 @@ def test_broadcast(s):
         "a session from before broadcast picks it up on its next attach"
     )
     assert "broadcast" not in agents()[off]["topics"] and "broadcast" not in {r["room"] for r in lines("rooms")}
-    logged = history.broadcasts()[-1]
+    logged = _native.history_call("broadcasts")["messages"][-1]
     assert {"topic": "broadcast", "from": "admin", "body": "maintenance at noon"}.items() <= logged.items()
     for args in (
         ["pub", off, "broadcast", "x"],
@@ -727,8 +729,8 @@ def test_bad_arguments(s):
         (lib.dms, (None, 0)),
         (Bus.register, ("x", "abc")),
         (Bus.register, ("x", [], False, "a b")),
-        (Bus, ("nobody-000000",)),
-        (presence.agents, ("#",)),
+        (Bus.attach, ("nobody-000000",)),
+        (_native.presence_agents, ("#",)),
     ]:
         raises(fn, *args)
 

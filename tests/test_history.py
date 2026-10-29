@@ -1,5 +1,8 @@
-"""historyd: the store on its own (queries, dedupe, migration, privacy, pruning, caps, hostile requests), then the
-service end to end on a broker (recording, the clients, leave, restart persistence, health, historyd down).
+"""historyd end to end on a broker: recording, dedupe, privacy, drop, the one-time import, the clients, leave, restart
+persistence, health, historyd down, and its command line. It runs whichever historyd AGENT_BRIDGE_HISTORYD names (the
+bundled Rust one by default). The store's own rules (pruning by receive time, the row and byte caps, the schema
+refusal) are pinned by the Rust unit tests in rust/crates/historyd, and every reply's exact text by
+test_history_golden.py.
 """
 
 import json
@@ -8,14 +11,13 @@ import subprocess
 import time
 import uuid
 
+import paho.mqtt.client as mqtt
 import pytest
 from conftest import BIN, HISTORYD, start_historyd, wait_for
 
-from agent_bridge import config
-from agent_bridge.bus import Bus
-from agent_bridge.history import client, store
-from agent_bridge.history.store import History
-from agent_bridge.validation import BridgeError, check_topic
+from agent_bridge import _native, config
+from agent_bridge.errors import BridgeError, HistoryError
+from agent_bridge.validation import check_topic
 
 BRIDGE = str(BIN / "agent-bridge")
 RUN = uuid.uuid4().hex[:6]
@@ -25,165 +27,20 @@ def msg(sender, body, ts=None, **extra):
     return json.dumps({"from": sender, "body": body, "ts": time.time() if ts is None else ts, **extra}).encode()
 
 
-class Replies:
-    """A publish function that keeps what History sends back, by correlation."""
-
-    def __init__(self):
-        self.sent = []
-
-    def __call__(self, topic, payload, corr):
-        self.sent.append((topic, json.loads(payload), corr))
-
-    def ask(self, h, req, via=None, topic="history/resp/t", corr=b"c"):
-        h.handle(json.dumps(req).encode() if isinstance(req, dict) else req, topic, corr, via)
-        return self.sent[-1][1] if self.sent else None
+def call(op, as_=None, **fields):
+    return _native.history_call(op, as_=as_, **fields)
 
 
-@pytest.fixture
-def h(tmp_path):
-    r = Replies()
-    hist = History(str(tmp_path / "h.db"), r)
-    hist.replies = r
-    return hist
+def room(name, last=None, before=None):
+    return call("room", room=name, last=last, before=before)["messages"]
 
 
-def bodies(reply):
-    assert reply["ok"], reply
-    return [m["body"] for m in reply["messages"]]
+def dms(addr, peer=None):
+    return call("dms", as_=addr, peer=peer)["messages"]
 
 
-def test_records_rooms_dms_broadcasts_and_raw_topics(h):
-    ask = h.replies.ask
-    h.record("room/r", msg("al-1", "one"))
-    h.record("room/r", msg("al-1", "two", mentions=["bo-1"]))
-    h.record("inbox/bo-1", msg("al-1", "hi bo"))
-    h.record("inbox/al-1", msg("bo-1", "hi al"))
-    h.record("inbox/cy-1", msg("bo-1", "for cy"))
-    h.record("broadcast", msg("admin", "notice"))
-    h.record("broadcast", msg("mallory-1", "fake notice"))
-    h.record("ci/build", b"plain text")
-    for t in ("agents/al-1", "ledger/req/al-1", "rooms/r", "history/req", "$SYS/x"):
-        h.record(t, msg("al-1", "not history"))
-    h.record("room/r", b"not json")
-    h.record("room/r", msg("al-1", "bad mentions", mentions="bo-1"))
-    assert bodies(ask(h, {"op": "room", "room": "r"})) == ["one", "two"]
-    assert ask(h, {"op": "room", "room": "r"})["messages"][1]["mentions"] == ["bo-1"]
-    assert bodies(ask(h, {"op": "room", "room": "r", "last": 1})) == ["two"]
-    assert bodies(ask(h, {"op": "dms"}, via="bo-1")) == ["hi bo", "hi al", "for cy"], "received and sent"
-    assert bodies(ask(h, {"op": "dms", "peer": "al-1"}, via="bo-1")) == ["hi bo", "hi al"]
-    assert bodies(ask(h, {"op": "dms"}, via="cy-1")) == ["for cy"], "only its own conversations"
-    assert bodies(ask(h, {"op": "broadcasts"})) == ["notice"], "admin's only"
-    assert ask(h, {"op": "topic", "topic": "ci/build"})["messages"] == [
-        {"topic": "ci/build", "from": None, "body": "plain text", "ts": pytest.approx(time.time(), abs=5)}
-    ]
-    assert bodies(ask(h, {"op": "recent"}, via="admin"))[-1] == "plain text"
-    stamp = ask(h, {"op": "room", "room": "r"})["messages"][1]["ts"]
-    assert bodies(ask(h, {"op": "room", "room": "r", "before": stamp})) == ["one"]
-
-
-def test_redelivery_is_stored_once(h):
-    payload = msg("al-1", "once", ts=1_700_000_000.0)
-    h.record("room/r", payload)
-    h.record("room/r", payload)
-    assert bodies(h.replies.ask(h, {"op": "room", "room": "r"})) == ["once"]
-
-
-def test_drop_only_own_inbox(h):
-    ask = h.replies.ask
-    h.record("inbox/bo-1", msg("al-1", "to bo"))
-    h.record("inbox/al-1", msg("bo-1", "from bo"))
-    refused = {"ok": False, "error": "drop: an agent drops only its own inbox"}
-    assert ask(h, {"op": "drop", "addr": "al-1"}, via="bo-1") == refused
-    assert ask(h, {"op": "drop"}, via="bo-1") == {"ok": True, "dropped": 1}
-    assert bodies(ask(h, {"op": "dms"}, via="bo-1")) == ["from bo"], "what bo sent stays in al's inbox"
-
-
-def test_migration_imports_once_and_keeps_the_file(h, tmp_path):
-    legacy = tmp_path / "history.jsonl"
-    good = [{"topic": "room/r", "from": "al-1", "body": f"old {i}", "ts": time.time() - 100 + i} for i in range(3)]
-    lines = [json.dumps(e) for e in good] + ["not json", "{}", json.dumps({**good[0], "from": "a b"}), "[" * 50_000]
-    legacy.write_text("\n".join(lines) + "\n")
-    h.record("room/r", json.dumps({k: good[2][k] for k in ("from", "body", "ts")}).encode())  # arrived live too
-    assert h.migrate(str(legacy)) == 2
-    assert h.migrate(str(legacy)) == 0, "once"
-    assert legacy.exists() and legacy.read_text().count("\n") == len(lines), "never deleted or changed"
-    assert bodies(h.replies.ask(h, {"op": "room", "room": "r"})) == ["old 2", "old 0", "old 1"]
-    assert h.migrate(str(tmp_path / "missing.jsonl")) == 0
-
-
-def test_schema_version_is_written_and_checked(h, tmp_path):
-    """Either historyd writes schema 1; one that knows only 1 refuses a database migrated past it, so an older image
-    used as a rollback cannot damage a newer database."""
-    path = str(tmp_path / "h.db")
-    assert [tuple(r) for r in h.q("SELECT key, value FROM meta WHERE key='schema'")] == [("schema", "1")]
-    History(path, h.replies).db.close()  # reopening keeps the one row
-    h.db.execute("UPDATE meta SET value='2' WHERE key='schema'")
-    h.db.execute("DROP INDEX messages_received")  # as a migration might
-    h.db.commit()
-    with pytest.raises(store.SchemaError, match=r"has history schema 2; this historyd knows 1"):
-        History(path, h.replies)
-    indexes = {r[0] for r in h.q("SELECT name FROM sqlite_master WHERE type='index'")}
-    assert "messages_received" not in indexes, "refused before writing anything"
-
-
-def test_pruning_follows_receive_time_and_caps(h, monkeypatch):
-    now = time.time()
-    h.record("room/r", msg("al-1", "far future ts", ts=9_999_999_999.0), now=now - config.STALE_S - 10)
-    h.record("room/r", msg("al-1", "fresh"), now=now)
-    h.prune(now=now)
-    assert bodies(h.replies.ask(h, {"op": "room", "room": "r"})) == ["fresh"], "a forged ts does not keep a row"
-    h.record("room/r", msg("al-1", "old again"), now=now - config.STALE_S - 10)
-    h.prune(now=now + 1)
-    assert "old again" in bodies(h.replies.ask(h, {"op": "room", "room": "r"})), "at most once per hour"
-    monkeypatch.setattr(store, "MAX_ROWS", 1500)
-    for i in range(2000):
-        h.add("room/flood", "al-1", f"m{i}", float(i), None, now)
-    h.trim()
-    assert h.q("SELECT count(*) FROM messages").fetchone()[0] <= 1500
-    assert bodies(h.replies.ask(h, {"op": "room", "room": "flood", "last": 1})) == ["m1999"], "the oldest go"
-
-
-def test_hostile_requests(h):
-    ask, r = h.replies.ask, h.replies
-    h.handle(b"{}", "elsewhere/resp", b"c")
-    h.handle(b"{}", None, b"c")
-    assert r.sent == [], "no ResponseTopic under history/resp/: dropped"
-    bad = [
-        (b"\xff\xfe", "UTF-8 JSON"),
-        (b"[" * 20_000, "payload over"),
-        (b"[1]", "JSON object"),
-        ({"op": "nope"}, "op: one of"),
-        ({"op": "room"}, "room: required"),
-        ({"op": "room", "room": "a/b"}, "room: bad room"),
-        ({"op": "room", "room": "r", "last": 0}, "last:"),
-        ({"op": "room", "room": "r", "last": True}, "last:"),
-        ({"op": "room", "room": "r", "before": "now"}, "before:"),
-        ({"op": "room", "room": "r", "extra": 1}, "unknown fields"),
-        ({"op": "dms"}, "history/req/<your address>"),
-        ({"op": "dms", "as": "al-1"}, "history/req/<your address>"),
-        ({"op": "drop", "as": "al-1"}, "history/req/<your address>"),
-        ({"op": "topic", "topic": "inbox/al-1"}, "reserved"),
-        ({"op": "topic", "topic": "a/#"}, "wildcards"),
-        ({"op": "room", "room": "r", "as": "x y"}, "as:"),
-        ({"op": "broadcasts", "since": float("nan")}, "since:"),
-    ]
-    for req, error in bad:
-        reply = ask(h, req)
-        assert reply["ok"] is False and error in reply["error"] and "\n" not in reply["error"], (req, reply)
-    assert ask(h, {"op": "dms", "as": "bo-1"}, via="al-1")["error"].startswith("as: must match")
-    assert "peer:" in ask(h, {"op": "dms", "peer": 5}, via="al-1")["error"]
-    assert "admin console only" in ask(h, {"op": "recent"}, via="al-1")["error"]
-    assert "integer from 1 to" in ask(h, {"op": "recent", "last": 9999}, via="admin")["error"]
-    assert ask(h, {"op": "recent", "last": 2000}, via="admin")["ok"]
-    assert ask(h, {"op": "ping"}, corr=b"")["ok"] is False, "CorrelationData required"
-    h.record("room/big", msg("al-1", "x" * 60_000))
-    for i in range(6):
-        h.record("room/big", msg("al-1", "x" * 60_000 + str(i)))
-    reply = ask(h, {"op": "room", "room": "big", "last": 1000})
-    assert reply["truncated"] and len(json.dumps(reply)) < store.MAX_REPLY and len(reply["messages"]) < 7
-
-
-# The service on a broker.
+def bodies(messages):
+    return [m["body"] for m in messages]
 
 
 @pytest.fixture(scope="module")
@@ -200,6 +57,17 @@ def svc(ledgerd, state_dir):
     proc.wait()
 
 
+@pytest.fixture
+def raw():
+    """A plain MQTT client: anything any local process could publish."""
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv5)
+    c.connect(config.HOST, config.PORT)
+    c.loop_start()
+    yield lambda topic, payload: c.publish(topic, payload, qos=1).wait_for_publish(5)
+    c.disconnect()
+    c.loop_stop()
+
+
 def cli(*args, ok=True):
     p = subprocess.run([BRIDGE, *args], capture_output=True, text=True)
     err = p.stderr.strip()
@@ -207,67 +75,120 @@ def cli(*args, ok=True):
     return [json.loads(line) for line in p.stdout.splitlines()] if ok else err
 
 
+def settled():
+    """A request after what was just published: historyd handles messages and requests in order."""
+    assert call("ping") == {"ok": True}
+
+
+def test_records_what_is_history_and_nothing_else(svc, raw):
+    r, al, bo, cy = f"rec{RUN}", f"al{RUN}", f"bo{RUN}", f"cy{RUN}"
+    raw(f"room/{r}", msg(al, "one"))
+    raw(f"room/{r}", msg(al, "two", mentions=[bo]))
+    raw(f"inbox/{bo}", msg(al, "hi bo"))
+    raw(f"inbox/{al}", msg(bo, "hi al"))
+    raw(f"inbox/{cy}", msg(bo, "for cy"))
+    raw("broadcast", msg("admin", f"notice {RUN}"))
+    raw("broadcast", msg("mallory-1", f"fake notice {RUN}"))
+    raw(f"ci{RUN}/build", b"plain text")
+    for t in (f"agents/{al}", f"ledger/req/{al}", f"rooms/{r}", "history/req"):
+        raw(t, msg(al, "not history"))
+    raw(f"room/{r}", b"not json")
+    raw(f"room/{r}", msg(al, "bad mentions", mentions=bo))
+    settled()
+    assert bodies(room(r)) == ["one", "two"]
+    assert room(r)[1]["mentions"] == [bo]
+    assert bodies(room(r, last=1)) == ["two"]
+    assert bodies(dms(bo)) == ["hi bo", "hi al", "for cy"], "received and sent"
+    assert bodies(dms(bo, peer=al)) == ["hi bo", "hi al"]
+    assert bodies(dms(cy)) == ["for cy"], "only its own conversations"
+    assert f"fake notice {RUN}" not in bodies(call("broadcasts")["messages"]), "the admin's only"
+    assert f"notice {RUN}" in bodies(call("broadcasts")["messages"])
+    assert call("topic", topic=f"ci{RUN}/build")["messages"] == [
+        {"topic": f"ci{RUN}/build", "from": None, "body": "plain text", "ts": pytest.approx(time.time(), abs=30)}
+    ]
+    stamp = room(r)[1]["ts"]
+    assert bodies(room(r, before=stamp)) == ["one"]
+
+
+def test_redelivery_is_stored_once(svc, raw):
+    r = f"once{RUN}"
+    payload = msg("al-1", "once", ts=1_700_000_000.0)
+    raw(f"room/{r}", payload)
+    raw(f"room/{r}", payload)
+    settled()
+    assert bodies(room(r)) == ["once"]
+
+
+def test_drop_only_own_inbox(svc, raw):
+    al, bo = f"dal{RUN}", f"dbo{RUN}"
+    raw(f"inbox/{bo}", msg(al, "to bo"))
+    raw(f"inbox/{al}", msg(bo, "from bo"))
+    settled()
+    with pytest.raises(HistoryError, match="drop: an agent drops only its own inbox"):
+        call("drop", as_=bo, addr=al)
+    assert call("drop", as_=bo) == {"ok": True, "dropped": 1}
+    assert bodies(dms(bo)) == ["from bo"], "what bo sent stays in al's inbox"
+
+
 def test_service_records_and_serves(svc):
-    assert [m["body"] for m in client.room(f"old-{RUN}")] == ["from the old log"], "migrated on first start"
-    al, bo = Bus.register("al"), Bus.register("bo")
-    room = f"h{RUN}"
-    al.join(room)
-    al.say(room, "first")
+    assert bodies(room(f"old-{RUN}")) == ["from the old log"], "migrated on first start, the bad line skipped"
+    al, bo = _native.Bus.register("al"), _native.Bus.register("bo")
+    r = f"h{RUN}"
+    al.join(r)
+    al.say(r, "first")
     al.dm(bo.addr, "private")
     bo.dm(al.addr, "reply")
     al.pub(f"t{RUN}/x", "raw one")
-    assert wait_for(lambda: len(client.room(room)) == 2, 5)
-    assert [m["body"] for m in client.room(room)] == [f"[joined #{room}] al", "first"]
-    assert [m["body"] for m in client.room(room, last=1)] == ["first"]
-    assert wait_for(lambda: len(client.dms(bo.addr)) == 2, 5)
-    assert [m["body"] for m in client.dms(bo.addr, peer=al.addr)] == ["private", "reply"]
-    assert [m["body"] for m in client.topic(f"t{RUN}/x")] == ["raw one"]
-    assert client.dms(f"nobody-{RUN}") == []
-    assert client.drop(al.addr) == 1
-    assert [m["body"] for m in client.dms(bo.addr)] == ["private"], "everything sent to al went, bo's own inbox stays"
+    assert wait_for(lambda: len(room(r)) == 2, 5)
+    assert bodies(room(r)) == [f"[joined #{r}] al", "first"]
+    assert bodies(room(r, last=1)) == ["first"]
+    assert wait_for(lambda: len(dms(bo.addr)) == 2, 5)
+    assert bodies(dms(bo.addr, peer=al.addr)) == ["private", "reply"]
+    assert bodies(call("topic", topic=f"t{RUN}/x")["messages"]) == ["raw one"]
+    assert dms(f"nobody-{RUN}") == []
+    assert call("drop", as_=al.addr)["dropped"] == 1
+    assert bodies(dms(bo.addr)) == ["private"], "everything sent to al went, bo's own inbox stays"
     with pytest.raises(BridgeError, match="bad room"):
-        client.room("a/b")
+        room("a/b")
     al.leave()
     bo.leave()
 
 
-# phase 2 from here
 def test_clients_read_through_historyd(svc):
     """The CLI's history and dms, the Bus's dms and leave all go through historyd."""
-    al, bo = Bus.register("al"), Bus.register("bo")
-    room = f"c{RUN}"
-    al.join(room)
-    al.say(room, "said")
+    al, bo = _native.Bus.register("al"), _native.Bus.register("bo")
+    r = f"c{RUN}"
+    al.join(r)
+    al.say(r, "said")
     al.dm(bo.addr, "to bo")
     bo.dm(al.addr, "to al")
-    assert wait_for(lambda: len(client.dms(bo.addr)) == 2, 5)
-    assert [m["body"] for m in cli("history", room, "--last", "1")] == ["said"]
-    assert [m["body"] for m in cli("dms", bo.addr)] == ["to bo", "to al"]
-    assert [m["body"] for m in bo.dms(al.addr)] == ["to bo", "to al"]
+    assert wait_for(lambda: len(dms(bo.addr)) == 2, 5)
+    assert bodies(cli("history", r, "--last", "1")) == ["said"]
+    assert bodies(cli("dms", bo.addr)) == ["to bo", "to al"]
+    assert bodies(bo.dms(al.addr)) == ["to bo", "to al"]
     assert al.leave() is None, "ledger and DMs dropped without a warning"
-    assert [m for m in client.dms(al.addr) if m["topic"] == f"inbox/{al.addr}"] == [], "al's inbox went with al"
+    assert [m for m in dms(al.addr) if m["topic"] == f"inbox/{al.addr}"] == [], "al's inbox went with al"
     bo.leave()
 
 
-# phase 2 to here
 def test_restart_keeps_history_and_catches_up(svc):
     db, log, proc = svc
-    room = f"r{RUN}"
-    sender = Bus.register("sender")
-    sender.say(room, "before restart")
-    assert wait_for(lambda: client.room(room), 5)
+    r = f"r{RUN}"
+    sender = _native.Bus.register("sender")
+    sender.say(r, "before restart")
+    assert wait_for(lambda: room(r), 5)
     proc.kill()
     proc.wait()
-    sender.say(room, "while historyd was down")  # sending never depends on historyd
-    err = cli("history", room, ok=False)  # phase 2
-    assert err.startswith("history: no reply from historyd"), err  # phase 2
-    with pytest.raises(client.HistoryError):
-        client.broadcasts(timeout=0.5)
+    sender.say(r, "while historyd was down")  # sending never depends on historyd
+    err = cli("history", r, ok=False)
+    assert err.startswith("history: no reply from historyd"), err
+    with pytest.raises(HistoryError):
+        _native.history_call("broadcasts", timeout=0.5)
     svc_proc = start_historyd(db, log)
     try:
-        assert wait_for(lambda: len(client.room(room)) == 2, 10), "its persistent session queued what it missed"
-        assert [m["body"] for m in client.room(room)] == ["before restart", "while historyd was down"]
-        assert [m["body"] for m in client.room(f"old-{RUN}")] == ["from the old log"], "not imported twice"
+        assert wait_for(lambda: len(room(r)) == 2, 10), "its persistent session queued what it missed"
+        assert bodies(room(r)) == ["before restart", "while historyd was down"]
+        assert bodies(room(f"old-{RUN}")) == ["from the old log"], "not imported twice"
         assert subprocess.run([*HISTORYD, "--health"], capture_output=True).returncode == 0
     finally:
         sender.leave()

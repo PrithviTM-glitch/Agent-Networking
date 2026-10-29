@@ -1,4 +1,4 @@
-//! The command line, as the Python CLI defines it.
+//! The command line: the commands and arguments of v0.1.0's Python CLI.
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -234,8 +234,8 @@ pub enum Cmd {
     },
     /// a Claude Code hook: broadcast or relay-start. It prints nothing on failure and always exits 0
     Hook { which: Hook },
-    /// one raw ledgerd request: OP [--as ADDR] [--timeout S] [--FIELD VALUE ...], the reply as JSON (the same as
-    /// agent-bridge-ledger)
+    /// one raw ledgerd request: OP [--as ADDR] [--timeout S] [--FIELD VALUE ...], the reply as JSON (what
+    /// agent-bridge-ledger runs)
     #[command(name = "ledger-raw", disable_help_flag = true)]
     LedgerRaw {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]

@@ -21,11 +21,11 @@ import time
 import urllib.parse
 import uuid
 
+import paho.mqtt.client as mqtt
 import pytest
 from conftest import BIN, free_port
 
-from agent_bridge import config, relay
-from agent_bridge.ledger import client as ledger
+from agent_bridge import _native, config
 
 HOOK = str(BIN / "agent-bridge-broadcast-hook")
 CONSOLE = str(BIN / "agent-bridge-console")
@@ -35,6 +35,17 @@ TMP = HOME = FAKE_BIN = DATA = LOG = PROJ = REG = WEB = ORIGIN = HOST = None
 procs = []
 loose = []  # pids of double-forked test processes, which are nobody's child
 state = {"token": None, "mon": None, "c": None}
+
+
+def raw_client():
+    """A raw MQTT 5 client, to publish as anyone and watch topics as they are; no bus API does either."""
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv5)
+    up = threading.Event()
+    c.on_connect = lambda *_: up.set()
+    c.connect(config.HOST, config.PORT)
+    c.loop_start()
+    assert up.wait(5), "the broker did not accept the connection"
+    return c
 
 
 def wait_for(pred, timeout=10):
@@ -254,7 +265,7 @@ def console(ledgerd, historyd, state_dir):
     WEB = free_port()
     ORIGIN, HOST = f"http://127.0.0.1:{WEB}", f"127.0.0.1:{WEB}"
     fixtures()
-    state["c"] = ledger.connect()
+    state["c"] = raw_client()
     env = {k: v for k, v in os.environ.items() if k not in ("XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR")}
     prom = fake_server(FakePrometheus)
     env.update(
@@ -323,7 +334,7 @@ def test_security():
 
 def test_messaging():
     seen = []
-    w = ledger.connect()
+    w = raw_client()
     w.on_message = lambda _c, _u, m: seen.append((m.topic, json.loads(m.payload)))
     for t in ("room/#", "inbox/#", "broadcast", "t/#"):
         w.subscribe(t, qos=1)
@@ -352,7 +363,7 @@ def test_messaging():
     refused("/api/send", {"kind": "shell", "target": "ops", "text": "x"}, "kind must be")
     refused("/api/send", {"kind": "room", "target": "ops", "text": "x" * 70000}, "limit")
     refused("/api/signal", {"addr": ["x"], "signal": "kill"}, "bad address")
-    other = ledger.connect()
+    other = raw_client()
     # Service RPC traffic, like historyd's healthcheck, is never a message in the feed or the backlog.
     for topic, payload in (
         ("history/req", {"op": "ping"}),
@@ -394,13 +405,12 @@ def hook(session=S1, event="UserPromptSubmit"):
 
 
 def test_hooks():
-    from agent_bridge.history import client as history
-
     # A raw client can publish on broadcast as anyone: historyd keeps it, but only admin's reach the hook.
     forged = json.dumps({"from": "bob-1", "body": "forged by bob", "ts": time.time()})
     state["c"].publish("broadcast", forged, qos=1).wait_for_publish(5)
     state["c"].publish("broadcast", "{not json", qos=1).wait_for_publish(5)
-    assert wait_for(lambda: any(m["body"] == "forged by bob" for m in history.recent(last=100))), "historyd kept it"
+    recent = lambda: _native.history_call("recent", as_="admin", last=100)["messages"]  # noqa: E731
+    assert wait_for(lambda: any(m["body"] == "forged by bob" for m in recent())), "historyd kept it"
     first = hook()
     assert "everyone stop pushing to main" in first and "forged" not in first, first
     assert hook() is None
@@ -522,13 +532,12 @@ def test_agents():
 
 
 def test_ledgers():
-    c = state["c"]
     for who in ("own-1", "hold-1"):
-        ledger.call("init", who, client=c)
+        _native.ledger_call("init", who)
         presence(who)
-    ledger.call("add", "own-1", client=c, name="db", visibility="public", max_level="write")
-    rq = ledger.call("request", "hold-1", client=c, resource="own-1/db", level="write")["request"]
-    lease = ledger.call("acquire", "hold-1", client=c, resource="own-1/db", level="write", ttl=60)["lease"]
+    _native.ledger_call("add", "own-1", name="db", visibility="public", max_level="write")
+    rq = _native.ledger_call("request", "hold-1", resource="own-1/db", level="write")["request"]
+    lease = _native.ledger_call("acquire", "hold-1", resource="own-1/db", level="write", ttl=60)["lease"]
     d = req("GET", "/api/ledger")[1]
     assert any(x["lease_id"] == lease["lease_id"] and x["token"] == lease["token"] for x in d["leases"]), d
     assert wait_for(lambda: agent("own-1"))
@@ -542,7 +551,7 @@ def test_ledgers():
     refused("/api/ledger/release", {"lease_id": lease["lease_id"]}, "no such lease")
     refused("/api/ledger/release", {"lease_id": "x; drop"}, "16 hex")
     refused("/api/ledger/revoke", {"request_id": 7}, "16 hex")
-    lease = ledger.call("acquire", "hold-1", client=c, resource="own-1/db", level="write", ttl=60)["lease"]
+    lease = _native.ledger_call("acquire", "hold-1", resource="own-1/db", level="write", ttl=60)["lease"]
     ok("/api/ledger/revoke", {"request_id": rq["id"]})
     d = req("GET", "/api/ledger")[1]
     assert [r["status"] for r in d["requests"] if r["id"] == rq["id"]] == ["denied"] and not d["leases"], d
@@ -771,7 +780,7 @@ def test_room_kill():
     presence("bystander-1", topics=["room/elsewhere"], **origin)
     for a in ("sess-k", "twin-k", "sub-k", "mark-k", "ghost-k", "claim-k", "sub-2", "bystander-1"):
         assert wait_for(lambda a=a: agent(a)), a
-    os.makedirs(os.path.dirname(lock_path := relay.lock_path(sk)), exist_ok=True)
+    os.makedirs(os.path.dirname(lock_path := _native.relay_lock_path(sk)), exist_ok=True)
     lock = open(lock_path, "w")
     fcntl.flock(lock, fcntl.LOCK_EX)
     lock.write(f"{os.getpid()}\nsess-k\n")
@@ -875,7 +884,7 @@ def test_room_kill():
 
 def test_admin_mentions():
     seen = []
-    w = ledger.connect()
+    w = raw_client()
     w.on_message = lambda _c, _u, m: seen.append(json.loads(m.payload))
     w.subscribe("room/men", qos=1)
     presence("men-a1b2c3", topics=["room/men"])
@@ -1227,7 +1236,7 @@ def test_admin_cli():
     addrs = {a["addr"] for a in cli_ok("agents")}
     assert {"admin", "bob-1"} <= addrs, addrs
     seen = []
-    w = ledger.connect()
+    w = raw_client()
     w.on_message = lambda _c, _u, m: seen.append((m.topic, json.loads(m.payload)))
     w.subscribe("room/cli-room", qos=1)
     w.subscribe("broadcast", qos=1)

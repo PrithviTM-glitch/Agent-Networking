@@ -1,7 +1,7 @@
 """Golden replies: a fixed script of raw ledger requests whose normalised replies must equal what the Python ledgerd
-answered, recorded in golden/ledgerd.jsonl. It runs against whichever ledgerd AGENT_BRIDGE_LEDGERD names, so the Rust
-ledgerd keeps answering as the reference did once the Python one is gone. Regenerate with golden/make_ledgerd.py
-(Python ledgerd only), and review the diff.
+answered, recorded in golden/ledgerd.jsonl. The file was generated from the Python ledgerd before it was removed (v0.1.0
+is the last release that has it) and is now the reference: a deliberate change to a reply is a reviewed edit of that
+file. It runs against whichever ledgerd AGENT_BRIDGE_LEDGERD names, the bundled Rust one by default.
 
 Normalised the same way on both sides: request and lease ids become R1, L1, ... in order of first appearance, every
 timestamp becomes "<t>", fencing tokens count from the first one seen, and dump's "ledgerd" field is dropped. Error
@@ -27,7 +27,6 @@ from agent_bridge import config
 HERE = Path(__file__).resolve().parent
 BROKER_CONF = HERE / "mosquitto-minimal.conf"  # no packet cap, so oversized requests reach ledgerd
 GOLDEN = HERE / "golden" / "ledgerd.jsonl"
-WRITE = os.environ.get("LEDGER_GOLDEN_WRITE") == "1"
 TIMES = {"ts", "since", "last_seen", "created", "updated", "expires_at", "queued_at", "deadline"}
 ID = re.compile(r"[0-9a-f]{16}")
 SUMMARY_OVER = 4096
@@ -305,11 +304,6 @@ def test_replies_match_the_reference(state_dir):
         wire.close()
         proc.kill()
         proc.wait()
-    if WRITE:
-        assert not s.rust, "the golden file is the Python ledgerd's: unset AGENT_BRIDGE_LEDGERD"
-        GOLDEN.parent.mkdir(exist_ok=True)
-        GOLDEN.write_text("".join(json.dumps(step) + "\n" for step in s.steps))
-        return
     golden = [json.loads(line) for line in GOLDEN.read_text().splitlines()]
     assert [g["step"] for g in golden] == [a["step"] for a in s.steps], "the script and the golden file differ"
     for g, a in zip(golden, s.steps, strict=True):

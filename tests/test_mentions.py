@@ -9,10 +9,11 @@ from types import SimpleNamespace
 import paho.mqtt.client as mqtt
 import pytest
 
-from agent_bridge import config
-from agent_bridge.bus import Bus
-from agent_bridge.history import client as history
-from agent_bridge.validation import MENTIONS_MAX, BridgeError
+from agent_bridge import _native, config
+from agent_bridge.errors import BridgeError
+from agent_bridge.validation import MENTIONS_MAX
+
+Bus = _native.Bus
 
 RUN = uuid.uuid4().hex[:6]
 ROOM = f"at-{RUN}"
@@ -59,7 +60,9 @@ def test_names_addresses_and_all_resolve():
     assert heard(S.carol) == [{"body": "@all standup now, @bob too"}, {"body": "mail me at alice@example.com"}], (
         "@all means no mentions, and a@b is not a mention"
     )
-    logged = [e for e in history.room(ROOM, 1000) if e["body"] == "hey @bob, ready?"]
+    logged = [
+        e for e in _native.history_call("room", room=ROOM, last=1000)["messages"] if e["body"] == "hey @bob, ready?"
+    ]
     assert logged[0]["mentions"] == bobs
 
 

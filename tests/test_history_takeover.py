@@ -8,7 +8,7 @@ import time
 
 from conftest import start_historyd, wait_for
 
-from agent_bridge.history import client
+from agent_bridge import _native
 
 
 def test_the_first_historyd_steps_aside(fresh_broker, state_dir):
@@ -23,7 +23,7 @@ def test_the_first_historyd_steps_aside(fresh_broker, state_dir):
         assert first.returncode != 0
         time.sleep(3)  # the redial delay: a second takeover would come in this window
         assert second.poll() is None, open(logs[1]).read()
-        assert client.call("ping", timeout=2) == {"ok": True}, "the one left answers"
+        assert _native.history_call("ping", timeout=2) == {"ok": True}, "the one left answers"
     finally:
         for proc in (first, second):
             proc.kill()

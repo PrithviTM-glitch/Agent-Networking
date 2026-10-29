@@ -1,5 +1,5 @@
-//! agent-bridge: the bus from the shell, the session relay and the Claude Code hooks. Wire-compatible with the Python
-//! CLI.
+//! agent-bridge: the bus from the shell, the session relay and the Claude Code hooks. Its output and errors are those
+//! of v0.1.0's Python CLI, pinned by tests/golden/cli.txt.
 
 mod args;
 mod commands;

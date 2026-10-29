@@ -17,10 +17,10 @@ from conftest import BIN, wait_for
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from agent_bridge import config, presence, rooms
-from agent_bridge.bus import Bus
-from agent_bridge.history import client as history
-from agent_bridge.validation import BridgeError
+from agent_bridge import _native, config
+from agent_bridge.errors import BridgeError
+
+Bus = _native.Bus
 
 BRIDGE, SERVER = str(BIN / "agent-bridge"), str(BIN / "agent-bridge-mcp")
 RUN = uuid.uuid4().hex[:6]
@@ -45,8 +45,8 @@ def refused(fn, *args, match=""):
 
 def synced(*buses, room=ROOM):
     """Wait until every bus has the room record its moderator just published."""
-    want = rooms.info(room)
-    assert wait_for(lambda: all(rooms.view(room, b._rooms.get(room)) == want for b in buses), 5), want
+    want = _native.rooms_info(room)
+    assert wait_for(lambda: all(_native.rooms_view(room, b.cached_room(room)) == want for b in buses), 5), want
 
 
 def heard(bus, wait=3):
@@ -79,7 +79,7 @@ def test_a_room_without_settings_is_open():
     for b in (S.alice, S.bob, S.carol, S.watch):
         b.join(ROOM)
     heard(S.watch)
-    assert rooms.info(ROOM) == {"room": ROOM, **rooms.OPEN}
+    assert _native.rooms_info(ROOM) == {"room": ROOM, **_native.ROOM_OPEN}
     S.bob.say(ROOM, "anyone may post")
     assert heard(S.watch) == [(S.bob.addr, "anyone may post")]
     refused(S.alice.room_set, ROOM, "announce", match="admin names the first")
@@ -91,7 +91,7 @@ def test_admin_names_the_first_moderator():
     settings = S.admin.mod(ROOM, "add", S.alice.addr)
     assert settings["moderators"] == [S.alice.addr] and settings["by"] == "admin" and settings["mode"] == "open"
     assert heard(S.watch) == [("admin", f"[moderator #{ROOM}] +{S.alice.addr} by admin")]
-    listed = {r["room"]: r for r in rooms.listing()}[ROOM]
+    listed = {r["room"]: r for r in _native.rooms_listing()}[ROOM]
     assert listed["mode"] == "open" and listed["moderators"] == [S.alice.addr] and listed["members"] == 4
 
 
@@ -135,9 +135,9 @@ def test_mute_stops_posts_and_spoofed_ones():
 
 def test_rules_and_bad_settings():
     assert S.alice.room_set(ROOM, rules="Be kind.\nNo spam.")["rules"] == "Be kind.\nNo spam."
-    assert rooms.info(ROOM)["rules"] == "Be kind.\nNo spam."
+    assert _native.rooms_info(ROOM)["rules"] == "Be kind.\nNo spam."
     assert heard(S.watch) == [(S.alice.addr, f"[rules #{ROOM}] updated by {S.alice.addr}")]
-    refused(S.alice.room_set, ROOM, None, "x" * (rooms.RULES_MAX + 1), match="rules is")
+    refused(S.alice.room_set, ROOM, None, "x" * (_native.RULES_MAX + 1), match="rules is")
     refused(S.alice.room_set, ROOM, None, "bell\x07", match="control character")
     refused(S.alice.room_set, ROOM, "loud", match="mode must be")
     refused(S.alice.room_set, ROOM, match="nothing to change")
@@ -159,13 +159,13 @@ def test_non_moderators_are_refused():
         (S.carol.room_set, (ROOM, "announce")),
     ):
         refused(fn, *args, match="only admin or a moderator")
-    assert rooms.info(ROOM)["moderators"] == [S.alice.addr]
+    assert _native.rooms_info(ROOM)["moderators"] == [S.alice.addr]
 
 
 def test_kick_bans_and_drops_the_room_and_the_target_keeps_working():
     # bob is a persistent Bus, as a relay holds: the kick takes its session over and it reconnects.
     S.alice.kick(ROOM, S.bob.addr)
-    assert wait_for(lambda: f"room/{ROOM}" not in presence.find(S.bob.addr)["topics"], 5)
+    assert wait_for(lambda: f"room/{ROOM}" not in _native.presence_find(S.bob.addr)["topics"], 5)
     synced(S.bob, S.watch)
     assert heard(S.watch) == [(S.alice.addr, f"[kicked #{ROOM}] {S.bob.addr} by {S.alice.addr}")]
     refused(S.bob.join, ROOM, match="banned")
@@ -188,7 +188,7 @@ def test_ban_without_kick_keeps_the_subscription_but_not_the_voice():
     S.alice.ban(ROOM, S.carol.addr)
     synced(S.carol, S.watch)
     refused(S.carol.say, ROOM, "hello?", match="banned")
-    assert f"room/{ROOM}" in presence.find(S.carol.addr)["topics"]
+    assert f"room/{ROOM}" in _native.presence_find(S.carol.addr)["topics"]
     S.carol.part(ROOM)
     refused(S.carol.join, ROOM, match="banned")
 
@@ -200,12 +200,13 @@ def test_admin_overrides_moderators():
     S.admin.unban(ROOM, S.carol.addr)
     synced(S.carol)
     S.carol.join(ROOM)
-    assert rooms.info(ROOM)["moderators"] == [] and rooms.info(ROOM)["banned"] == []
+    assert _native.rooms_info(ROOM)["moderators"] == [] and _native.rooms_info(ROOM)["banned"] == []
 
 
 def test_announcements_are_in_the_transcript():
     verbs = ("[moderator", "[muted", "[unmuted", "[banned", "[unbanned", "[kicked", "[rules", "[mode")
-    notes = [e["body"] for e in history.room(ROOM, 1000) if e["body"].startswith(verbs)]
+    transcript = _native.history_call("room", room=ROOM, last=1000)["messages"]
+    notes = [e["body"] for e in transcript if e["body"].startswith(verbs)]
     by_a, by_admin = f"by {S.alice.addr}", "by admin"
     assert notes == [
         f"[moderator #{ROOM}] +{S.alice.addr} {by_admin}",
@@ -229,7 +230,7 @@ def test_malformed_records_count_as_open():
     c.loop_start()
     bad = {"mode": "announce", "moderators": ["x/y"], "rules": "", "muted": [], "banned": [], "by": "a", "ts": 1}
     c.publish(f"rooms/{junk_room}", json.dumps(bad), qos=1, retain=True).wait_for_publish(5)
-    assert rooms.info(junk_room) == {"room": junk_room, **rooms.OPEN}
+    assert _native.rooms_info(junk_room) == {"room": junk_room, **_native.ROOM_OPEN}
     S.watch.join(junk_room)
     S.watch.say(junk_room, "still open")
     c.publish(f"rooms/{junk_room}", b"", qos=1, retain=True).wait_for_publish(5)
@@ -263,7 +264,7 @@ def test_cli():
     listed = {json.loads(line)["room"]: json.loads(line) for line in cli("rooms").splitlines()}[ROOM]
     assert listed["mode"] == "announce" and listed["moderators"] == sorted([S.alice.addr, S.carol.addr])
     assert json.loads(cli("kick", S.alice.addr, ROOM, S.bob.addr))["banned"] == [S.bob.addr]
-    assert wait_for(lambda: f"room/{ROOM}" not in presence.find(S.bob.addr)["topics"], 5)
+    assert wait_for(lambda: f"room/{ROOM}" not in _native.presence_find(S.bob.addr)["topics"], 5)
 
 
 def test_mcp():

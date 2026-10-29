@@ -1,9 +1,10 @@
-"""Conformance: what every implementation of the bus must do, checked through the public API and the wire only, so it
-runs unchanged against the Python modules and against the Rust bindings.
+"""Conformance: what the bus must do, checked through agent_bridge._native's public API and the wire only. These tests
+ran against the Python modules and the Rust bindings side by side until the cutover; the Python side is gone, and the
+messages they pin are still the Python reference's.
 
 Covered: no call stalls behind a blocked recv or a queued acquire; concurrent joins keep every room; ledger replies on
 a Bus's own connection never fill its receive window; leave drops the agent's ledger, and still completes when ledgerd
-is down; wait_arrival (bindings only); forged history requests on the plain topic are refused; wrong-typed input to
+is down; wait_arrival; forged history requests on the plain topic are refused; wrong-typed input to
 every entry point is a one-line BridgeError (LedgerError for ledger requests) with the reference message, never a bare
 TypeError; and the named bus behaviours the conftest's summary reports (origin written once, subagent lineage, the
 whole-record refresh, cache reset on reconnect, for_me, the relay lock's second line, moderation at recv).
@@ -25,42 +26,21 @@ from conftest import start_ledgerd, wait_for
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 
-from agent_bridge import config, presence, relay, rooms
-from agent_bridge.bus import Bus
-from agent_bridge.history import client as history
-from agent_bridge.ledger import client as ledger
-from agent_bridge.validation import BODY_MAX, BridgeError
+from agent_bridge import _native, config
+from agent_bridge.errors import BridgeError, LedgerError
 
-# The entry points of each implementation, for the tests that run against both side by side.
-IMPLS = {
-    "python": SimpleNamespace(
-        native=False,
-        Bus=Bus,
-        attach=Bus,
-        agents=presence.agents,
-        room_info=rooms.info,
-        ledger_call=ledger.call,
-        history_call=history.call,
-        relay_lock_path=relay.lock_path,
-        relay_held=relay.held,
-    )
-}
-try:
-    from agent_bridge import _native
-
-    IMPLS["native"] = SimpleNamespace(
-        native=True,
-        Bus=_native.Bus,
-        attach=_native.Bus.attach,
-        agents=_native.presence_agents,
-        room_info=_native.rooms_info,
-        ledger_call=_native.ledger_call,
-        history_call=_native.history_call,
-        relay_lock_path=_native.relay_lock_path,
-        relay_held=_native.relay_held,
-    )
-except ImportError:
-    pass
+# The entry points under test, by role, so each test reads the same as when it ran against two implementations.
+API = SimpleNamespace(
+    Bus=_native.Bus,
+    attach=_native.Bus.attach,
+    agents=_native.presence_agents,
+    room_info=_native.rooms_info,
+    ledger_call=_native.ledger_call,
+    history_call=_native.history_call,
+    relay_lock_path=_native.relay_lock_path,
+    relay_held=_native.relay_held,
+)
+BODY_MAX = _native.BODY_MAX
 RUN = uuid.uuid4().hex[:6]
 agents = []
 restarted = []  # ledgerd processes a test started in place of the fixture's
@@ -79,10 +59,9 @@ def services(ledgerd, historyd):
         proc.wait()
 
 
-@pytest.fixture(scope="module", params=sorted(IMPLS))
-def api(request):
-    """Each test runs once per implementation present: the Python modules, and the Rust bindings when built."""
-    return IMPLS[request.param]
+@pytest.fixture(scope="module")
+def api():
+    return API
 
 
 def agent(api, name):
@@ -151,18 +130,15 @@ def test_no_call_waits_behind_a_blocked_one(api):
     assert queued.get("result", {}).get("lease", {}).get("holder") == a.addr, queued
 
 
-def test_concurrent_joins_keep_every_room(api, request):
+def test_concurrent_joins_keep_every_room(api):
     """Ten joins at once on one Bus: presence lists all ten rooms and each room delivers."""
-    if api.Bus is Bus:
-        reason = "the Python Bus can lose a concurrent join; the Rust Bus serialises presence writes"
-        request.applymarker(pytest.mark.xfail(reason=reason))
     a, talker = agent(api, "joins"), agent(api, "talker")
     rooms = [f"j{RUN}{id(api) % 997}x{i}" for i in range(10)]
     joins = [in_thread(a.join, r) for r in rooms]
     for j in joins:
         j["thread"].join(30)
         assert "error" not in j, j
-    listed = {x["addr"]: x for x in presence.agents()}[a.addr]["topics"]
+    listed = {x["addr"]: x for x in api.agents()}[a.addr]["topics"]
     assert {f"room/{r}" for r in rooms} <= set(listed), listed
     for r in rooms:
         talker.say(r, r)
@@ -192,7 +168,7 @@ def test_ledger_replies_never_fill_the_receive_window(api):
 
 
 def _dump():
-    return ledger.call("dump", as_=f"inspector{RUN}")
+    return _native.ledger_call("dump", f"inspector{RUN}")
 
 
 def test_leave_drops_the_ledger(api):
@@ -221,8 +197,6 @@ def test_leave_drops_the_ledger(api):
 def test_wait_arrival_fires_once_per_new_arrival(api):
     """wait_arrival(timeout, after_seq) -> (pending, seq): it returns at once for a newer arrival, and waits out its
     timeout while messages sit unread, so a notice loop fires once per burst and never spins."""
-    if not hasattr(api.Bus, "wait_arrival"):
-        pytest.skip("wait_arrival comes with the Rust bindings")
     a, peer = agent(api, "arrival"), agent(api, "notifier")
     started = time.monotonic()
     pending, seq = a.wait_arrival(0.5, 0)
@@ -265,7 +239,7 @@ def test_forged_history_requests_on_the_plain_topic(api):
     victim's DMs stay readable to the victim and only through its own topic."""
     victim, sender = agent(api, "victim"), agent(api, "sender")
     sender.dm(victim.addr, f"secret {RUN}")
-    assert wait_for(lambda: [m["body"] for m in history.dms(victim.addr)] == [f"secret {RUN}"], 5)
+    assert wait_for(lambda: [m["body"] for m in victim.dms()] == [f"secret {RUN}"], 5)
     for request in (
         {"op": "dms", "as": victim.addr},
         {"op": "drop", "as": victim.addr},
@@ -274,7 +248,7 @@ def test_forged_history_requests_on_the_plain_topic(api):
         reply = _raw_history("history/req", request)
         assert reply["ok"] is False and "history/req/" in reply["error"], (request, reply)
         assert f"secret {RUN}" not in json.dumps(reply)
-    assert [m["body"] for m in history.dms(victim.addr)] == [f"secret {RUN}"], "the forged drop deleted nothing"
+    assert [m["body"] for m in victim.dms()] == [f"secret {RUN}"], "the forged drop deleted nothing"
 
 
 def test_leave_completes_with_ledgerd_down(api, ledgerd, state_dir):
@@ -288,7 +262,7 @@ def test_leave_completes_with_ledgerd_down(api, ledgerd, state_dir):
         started = time.monotonic()
         warning = gone.leave()
         assert warning and "ledger" in warning and time.monotonic() - started < 6, warning
-        assert gone.addr not in {x["addr"] for x in presence.agents()}
+        assert gone.addr not in {x["addr"] for x in api.agents()}
     finally:
         restarted.append(start_ledgerd(os.path.join(state_dir, "ledger.db"), os.path.join(state_dir, "ledgerd.log")))
 
@@ -297,7 +271,7 @@ def _refusal(fn, *args, **kw):
     """The one-line message fn raises for bad input, or a description of what it did instead."""
     try:
         fn(*args, **kw)
-    except (BridgeError, ledger.LedgerError) as e:
+    except (BridgeError, LedgerError) as e:
         assert "\n" not in str(e), str(e)
         return type(e).__name__, str(e)
     except Exception as e:  # noqa: BLE001  the failure this test exists to catch
@@ -307,7 +281,7 @@ def _refusal(fn, *args, **kw):
 
 def test_wrong_types_are_one_line_bridge_errors(api):
     """Every entry point that takes user input checks its type itself: the MCP server and the console pass tool and
-    form arguments straight through. The messages are the reference implementation's, for both implementations."""
+    form arguments straight through. The messages are the Python reference's."""
     a, peer = api.Bus.register(f"types{RUN}"), api.Bus.register(f"typepeer{RUN}")
     agents.extend((a, peer))
     room = f"types{RUN}{id(api) % 997}"
@@ -346,9 +320,6 @@ def test_wrong_types_are_one_line_bridge_errors(api):
         ("register addr int", api.Bus.register, ("x", [], False, 5), "bad address 5"),
         ("agents room int", api.agents, (5,), "bad room 5"),
         ("room info None", api.room_info, (None,), "bad room None"),
-        ("history room int", history.room, (5,), "bad room 5"),
-        ("history dms None", history.dms, (None,), "bad address None"),
-        ("history topic None", history.topic, (None,), "topic must be a string, got NoneType"),
     ]
     # Raw service requests are checked by the service: its own error class and message come back.
     service_cases = [
@@ -417,17 +388,13 @@ def test_lone_surrogates_are_one_line_errors(api):
     assert not wrong, "\n".join(wrong)
 
 
-# bridge-core's named bus behaviours, each against both implementations. Another process acting as the same agent is
-# a separate Python process running the same implementation, so its origin is read from its own environment.
+# bridge-core's named bus behaviours. Another process acting as the same agent is a separate Python process, so its
+# origin is read from its own environment.
 
 
 def _other_process(api, code, session=None):
-    """Run code in a fresh process of the same implementation; `Bus` and `attach` are defined for it."""
-    prelude = (
-        "from agent_bridge import _native\nBus = _native.Bus\nattach = Bus.attach\n"
-        if api.native
-        else "from agent_bridge.bus import Bus\nattach = Bus\n"
-    )
+    """Run code in a fresh process; `Bus` and `attach` are defined for it."""
+    prelude = "from agent_bridge import _native\nBus = _native.Bus\nattach = Bus.attach\n"
     env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_SESSION_ID"}
     if session:
         env["CLAUDE_CODE_SESSION_ID"] = session
@@ -437,7 +404,7 @@ def _other_process(api, code, session=None):
 
 
 def _record(addr):
-    return {x["addr"]: x for x in presence.agents()}.get(addr) or {}
+    return {x["addr"]: x for x in _native.presence_agents()}.get(addr) or {}
 
 
 def _heard(bus, wait=3, until=None):
@@ -489,7 +456,7 @@ def test_presence_cache_resets_on_reconnect(api):
     a.dm(ghost.addr, "you are there")
     agents.remove(ghost)
     ghost.close()
-    wipe = "_native.presence_wipe" if api.native else "__import__('agent_bridge.presence').presence.wipe"
+    wipe = "_native.presence_wipe"
     # The takeover disconnects a. Usually the wipe lands while a is away and its reconnect re-reads the retained
     # records; on a slow runner a may be back first and must apply the live clear. Either way the dm is refused.
     # Closing the attached Bus keeps it from taking the session back once a has reconnected.
@@ -510,7 +477,7 @@ def test_presence_cache_resets_on_reconnect(api):
         "subprocess": [f"{n} +{float(t) - t0:.3f}" for n, t in zip(stamps[::2], stamps[1::2], strict=True)],
         "returned": f"+{t1 - t0:.3f}",
         "marker": f"+{t2 - t0:.3f}" if any(m["body"] == "marker" for m in marker) else "never",
-        "ghost still retained": ghost.addr in (retained := {x["addr"] for x in presence.agents()}),
+        "ghost still retained": ghost.addr in (retained := {x["addr"] for x in api.agents()}),
         "retained agents": len(retained),
     }
     assert (kind, text) == ("BridgeError", f"unknown address: {ghost.addr}"), (kind, text, timeline)

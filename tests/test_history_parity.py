@@ -1,13 +1,15 @@
-"""historyd parity: the reference (Python) historyd and the one under test (AGENT_BRIDGE_HISTORYD) share one database.
-Messages recorded by one are not stored again by the other, and every request gets the same reply, byte for byte.
-Skipped when the historyd under test is the reference itself.
+"""historyd handover with the rollback: the frozen Python historyd image (agent-bridge-historyd:1, built from v0.1.0;
+AGENT_BRIDGE_ROLLBACK_HISTORYD names another) and the historyd under test (AGENT_BRIDGE_HISTORYD, the bundled Rust one
+by default) take turns on one database. Messages recorded by one are not stored again by the other, and every request
+gets the same reply, byte for byte. This is what the README's rollback promise rests on, so it lives exactly as long
+as that image is offered as a rollback (until the first history schema change). Skipped when the image is not there;
+CI's rollback job builds it from the v0.1.0 tag.
 """
 
 import json
 import os
 import sqlite3
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -20,9 +22,13 @@ from paho.mqtt.properties import Properties
 
 from agent_bridge import config
 
-REFERENCE = [sys.executable, "-m", "agent_bridge.history.service"]
+ROLLBACK = os.environ.get("AGENT_BRIDGE_ROLLBACK_HISTORYD") or "agent-bridge-historyd:1"
 RUN = uuid.uuid4().hex[:6]
-pytestmark = pytest.mark.skipif(HISTORYD == REFERENCE, reason="AGENT_BRIDGE_HISTORYD is the reference")
+CONTAINER = f"agent-bridge-parity-historyd-{RUN}"
+pytestmark = pytest.mark.skipif(
+    subprocess.run(["docker", "image", "inspect", ROLLBACK], capture_output=True).returncode != 0,
+    reason=f"no rollback image {ROLLBACK}",
+)
 
 ROOM, AL, BO = f"par{RUN}", f"al{RUN}", f"bo{RUN}"
 
@@ -136,19 +142,40 @@ def rows(db):
         return conn.execute("SELECT count(*) FROM messages").fetchone()[0]
 
 
+def rollback(state_dir):
+    """The rollback image as a foreground process on the test broker, writing state_dir's parity.db as this user (so
+    the host-run historyd can open the files it leaves); --init so SIGTERM stops it."""
+    return [
+        "docker", "run", "--rm", "--init", "--name", CONTAINER, "--network", "host",
+        "--user", f"{os.getuid()}:{os.getgid()}", "-v", f"{state_dir}:/data",
+        "-e", "HISTORY_DB=/data/parity.db", "-e", "HISTORY_IMPORT=/data/none.jsonl",
+        "-e", f"AGENT_BRIDGE_HOST={config.HOST}", "-e", f"AGENT_BRIDGE_PORT={os.environ['AGENT_BRIDGE_PORT']}",
+        ROLLBACK, "agent-bridge-historyd",
+    ]  # fmt: skip
+
+
 def test_two_implementations_share_one_database(fresh_broker, state_dir):
     db, log = os.path.join(state_dir, "parity.db"), os.path.join(state_dir, "parity.log")
     asker = Asker()
 
     def start(cmd):
         proc = subprocess.Popen(cmd, stderr=open(log, "a"), env={**os.environ, "HISTORY_DB": db})
-        assert wait_for(lambda: asker.ask({"op": "ping"}, wait=0.5), 30), open(log).read()
+        assert wait_for(lambda: asker.ask({"op": "ping"}, wait=0.5), 60), open(log).read()
         return proc
 
     def stop(proc):
         # one writer at a time: the next one starts only once this one is gone and nothing answers
         proc.terminate()
-        assert proc.wait(10) is not None and asker.ask({"op": "ping"}, wait=1.0) is None
+        assert proc.wait(20) is not None and asker.ask({"op": "ping"}, wait=1.0) is None
+
+    try:
+        handover(asker, start, stop, rollback(state_dir), db)
+    finally:
+        subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True)
+
+
+def handover(asker, start, stop, reference, db):
+    """The rollback records, the one under test takes over the same db and answers alike, then back again."""
 
     def send(messages):
         for topic, payload in messages:
@@ -156,7 +183,7 @@ def test_two_implementations_share_one_database(fresh_broker, state_dir):
         before = asker.ask({"op": "ping"})  # a request after them: historyd handles in order
         assert before is not None
 
-    ref = start(REFERENCE)
+    ref = start(reference)
     send(MESSAGES)
     stored, expected = rows(db), asker.all()
     stop(ref)
@@ -170,7 +197,7 @@ def test_two_implementations_share_one_database(fresh_broker, state_dir):
     new = (f"room/{ROOM}", msg(AL, "recorded by the one under test", 1793000099.03125))
     send([new])
     stop(under_test)
-    ref = start(REFERENCE)
+    ref = start(reference)
     send([new])
     assert rows(db) == stored + 1, "and what it stored, the reference does not store again"
     stop(ref)

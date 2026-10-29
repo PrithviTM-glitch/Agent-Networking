@@ -16,7 +16,7 @@ import uuid
 import pytest
 from conftest import wait_for
 
-from agent_bridge import host, identity
+from agent_bridge import _native, host
 from agent_bridge.claude import inbox, registry, transcripts
 from agent_bridge.claude.host import CLAUDE, DESKTOP_DIR, SESSION_ENV
 
@@ -52,8 +52,8 @@ def test_not_under_a_framework(tmp):
     out = os.path.join(tmp, "out.json")
     code = (
         "import json, sys, time; time.sleep(0.3)\n"
-        "from agent_bridge import host, identity\n"
-        f"json.dump([host.current().name, identity.origin()], open({out!r}, 'w'))\n"
+        "from agent_bridge import _native, host\n"
+        f"json.dump([host.current().name, _native.identity_origin()], open({out!r}, 'w'))\n"
     )
     env = {k: v for k, v in os.environ.items() if k != SESSION_ENV}
     subprocess.run(["sh", "-c", f'"{sys.executable}" -c "$CODE" &'], env={**env, "CODE": code}, check=True)
@@ -240,12 +240,14 @@ def test_kind_and_resume():
     assert CLAUDE.usage_metrics["cost"] == ("claude_code_cost_usage_USD_total", False)
 
 
-def test_identity_delegates(monkeypatch):
+def test_identity(monkeypatch, tmp):
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/srv/My Project!")
-    assert identity.project_name() == "My-Project"
-    assert identity.session_address(SID) == f"My-Project-{identity.short_hash(SID)}"
+    assert _native.identity_project_name() == "My-Project"
+    assert _native.identity_session_address(SID) == f"My-Project-{_native.identity_short_hash(SID)}"
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/srv/Admin")
-    assert identity.project_name() == "agent", "admin is reserved"
+    assert _native.identity_project_name() == "agent", "admin is reserved"
     monkeypatch.delenv("CLAUDE_PROJECT_DIR")
-    assert identity.project_name("/tmp/plain") == "plain"
-    assert identity.read_proc(os.getpid())["ppid"] == os.getppid()
+    os.makedirs(plain := os.path.join(tmp, "plain"))
+    monkeypatch.chdir(plain)
+    assert _native.identity_project_name() == "plain", "without a project dir, the working directory names it"
+    assert _native.identity_read_proc(os.getpid())["ppid"] == os.getppid()

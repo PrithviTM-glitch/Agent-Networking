@@ -1,24 +1,22 @@
 """historyd golden replies: a fixed corpus of messages and requests, replayed against whichever historyd
 AGENT_BRIDGE_HISTORYD names, must get the replies the Python reference gave, byte for byte (tests/golden/historyd.json).
-It keeps the Rust historyd held to the reference after the Python one is gone. The documented divergences (a NaN
-echoed in an error, JSON nested past 128 levels, an integer over 4300 digits) carry the Rust reply as an override, so
-they stay pinned too.
+It keeps the historyd held to the reference now that the Python one is gone. The documented divergences (a NaN echoed
+in an error, JSON nested past 128 levels, an integer over 4300 digits) carry the Rust reply as an override, so they
+stay pinned too.
 
-To regenerate, while the Python reference still exists, with AGENT_BRIDGE_HISTORYD set to a Rust historyd:
-    AGENT_BRIDGE_GOLDEN=write uv run pytest tests/test_history_golden.py
-It replays the corpus against both and refuses to write if they differ anywhere but the documented divergences.
+The file was generated at cp8 (02db236) by replaying this corpus against the Python reference and the Rust historyd;
+it refused to write where they differed anywhere else. With the reference deleted it cannot be regenerated, so the
+corpus and the file are frozen together: changing one fails test_golden_file_is_the_corpus.
 """
 
 import json
 import os
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
-import pytest
 from conftest import HISTORYD, wait_for
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
@@ -26,8 +24,6 @@ from paho.mqtt.properties import Properties
 from agent_bridge import config
 
 GOLDEN = Path(__file__).parent / "golden" / "historyd.json"
-REFERENCE = [sys.executable, "-m", "agent_bridge.history.service"]
-WRITE = os.environ.get("AGENT_BRIDGE_GOLDEN") == "write"
 ROOM, AL, BO = "golden", "al-g", "bo-g"
 
 
@@ -189,29 +185,15 @@ def replay(cmd, db, log):
 def test_replies_match_golden(fresh_broker, state_dir, tmp_path):
     log = os.path.join(state_dir, "golden.log")
     got = replay(HISTORYD, str(tmp_path / "under-test.db"), log)
-    reference = HISTORYD == REFERENCE
-    if WRITE:
-        assert not reference, "set AGENT_BRIDGE_HISTORYD to a Rust historyd to write the golden file"
-        want = replay(REFERENCE, str(tmp_path / "reference.db"), log)
-        divergent = [d for _, _, d in REQUESTS] + [False] * (len(CORR) + len(RESP))
-        for entry, rust, div in zip(want, got, divergent, strict=True):
-            assert entry["request"] == rust["request"]
-            if rust["reply"] != entry["reply"]:
-                assert div, ("an undocumented divergence", entry, rust)
-                entry["rust"] = rust["reply"]
-        GOLDEN.parent.mkdir(exist_ok=True)
-        GOLDEN.write_text(json.dumps(want, indent=1, ensure_ascii=False) + "\n")
-        return
     golden = json.loads(GOLDEN.read_text())
-    assert [g["request"] for g in golden] == [g["request"] for g in got], "the corpus changed: regenerate the file"
+    assert [g["request"] for g in golden] == [g["request"] for g in got], "the corpus and the golden file differ"
     for want, have in zip(golden, got, strict=True):
-        reply = want["reply"] if reference else want.get("rust", want["reply"])
+        reply = want.get("rust", want["reply"])
         assert have["reply"] == reply, (want["request"], reply and reply[:300], have["reply"] and have["reply"][:300])
         if reply is not None:
             assert want["expiry"] - 2 <= have["expiry"] <= want["expiry"], (want["request"], have["expiry"])
 
 
-@pytest.mark.skipif(not GOLDEN.exists(), reason="no golden file yet")
 def test_golden_file_is_the_corpus():
     """Every corpus entry has its recorded reply, and only the documented divergences carry a Rust override."""
     golden = json.loads(GOLDEN.read_text())
