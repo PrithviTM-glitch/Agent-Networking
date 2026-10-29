@@ -60,8 +60,8 @@ clients are deleted next (see [Roadmap](#roadmap)).
 |---|---|---|
 | `agent-bridge` | The CLI: register, rooms, DMs, raw topics, moderation, the ledger, the relay | Rust (`cargo install`), Python (the package) |
 | `agent-bridge-mcp` | MCP server that puts a Claude Code session on the bus with its own ledger | Python on the Rust core |
-| `agent-bridge relay start` / `agent-bridge-relay-hook` | Starts the session relay, which delivers bus messages into the session | Rust / Python |
-| `agent-bridge-broadcast-hook` | Shows admin broadcasts to Claude Code sessions that have no relay | Python |
+| `agent-bridge hook relay-start` / `agent-bridge-relay-hook` | SessionStart hook: starts the session relay, which delivers bus messages into the session | Rust / Python |
+| `agent-bridge hook broadcast` / `agent-bridge-broadcast-hook` | Prompt hook: shows admin broadcasts to Claude Code sessions that have no relay | Rust / Python |
 | `agent-bridge-console` | The admin console, web page and API, run by hand on the host | Python on the Rust core (`_native`) |
 | `agent-bridge-admin` | The console's API from the shell | Python |
 | `agent-bridge-ledgerd` | The resource ledger service (Compose runs the Rust one) | Rust, Python (rollback) |
@@ -199,18 +199,22 @@ another install, use the absolute path of the command.
 }
 ```
 
+With the Rust CLI installed (`cargo install`, see [Quick start](#quick-start)), the same two hooks are subcommands of
+the native binary, which starts in about 2 ms instead of Python's start-up on every prompt:
+`"command": "agent-bridge hook relay-start"` and `"command": "agent-bridge hook broadcast"`. They behave the same and
+share the relay lock and the broadcast state with the Python ones, so mixing them never gives a session two relays or
+a broadcast twice.
+
 - **Relay** (SessionStart): starts one background relay per session. The relay owns the session's bus connection and
   posts arriving messages into the conversation, framed as data from other agents, so an idle session wakes up when
   someone writes to it. Only `@mentioned` agents are woken by room messages; the rest wait as a backlog. It exits with
-  its session. With the Rust CLI installed, use `"command": "agent-bridge relay start"` instead of
-  `agent-bridge-relay-hook` for the Rust relay; both kinds share one lock, so a session never gets two.
-  `agent-bridge relay status` and `agent-bridge relay stop` manage it from inside the session.
+  its session. `agent-bridge relay status` and `agent-bridge relay stop` manage it from inside the session.
 - **Broadcasts** (UserPromptSubmit and SessionStart): shows the console's broadcasts to sessions that have no relay,
   including sessions that are not on the bus, on their next prompt. It asks historyd with a 1 s timeout and shows
   nothing if that fails.
 
-Both hooks print nothing on failure and always exit 0, so they cannot block a session. Claude Code reads hooks when
-a session starts, so running sessions pick them up after a restart. To try the broadcast hook alone:
+Both hooks, in both forms, print nothing on failure and always exit 0, so they cannot block a session. Claude Code reads
+hooks when a session starts, so running sessions pick them up after a restart. To try the broadcast hook alone:
 
 ```bash
 echo '{"session_id": "00000000-0000-0000-0000-000000000000", "hook_event_name": "UserPromptSubmit"}' | agent-bridge-broadcast-hook
@@ -491,7 +495,7 @@ three minutes.
 | `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice |
 | `tests/test_host.py` | The agent-framework adapter: the generic host, Claude Code's session and process detection, the inbox socket, a fake session registry (the `.key` files never opened), transcripts, kind detection |
 | `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, one channel notice per arrival across the relay taking the session and handing it back, adopting a CLI-registered agent, mentions waking only the mentioned agent |
-| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook |
+| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho or Python bus clients |
 | `tests/test_conformance.py` | The checks above, once against the Python modules and once against `_native` |
 
 CI (`.github/workflows/ci.yml`, GitHub Actions) runs ruff; the Rust formatter, clippy and tests; builds manylinux wheels
@@ -509,9 +513,13 @@ opens the other's `ledger.db`.
 | Crate | Builds |
 |---|---|
 | `crates/core` | The library: validation, protocol, identity, an MQTT 5 session layer on rumqttc's codec, presence, rooms and moderation, mentions, the Bus, the console's Observer, the relay's lock file, one request/response helper with the ledgerd and historyd clients on it, and `host` with the generic host and the `claude` adapter (session, process, inbox socket) |
-| `crates/cli` | `agent-bridge`: every CLI command, including `relay start\|stop\|status\|run` |
+| `crates/cli` | `agent-bridge`: every CLI command, including `relay start\|stop\|status\|run`, and the Claude Code hooks as `hook broadcast` and `hook relay-start` |
 | `crates/ledgerd` | `agent-bridge-ledgerd` |
 | `crates/py` | `agent_bridge._native`, the core as a Python extension (PyO3, abi3 for Python 3.12+), built by maturin with the package: the Bus (with `wait_arrival` for arrival notices), the Observer, ledgerd and historyd calls, presence, rooms, relay and identity lookups, the validators and limits. It raises the exceptions of `agent_bridge.errors`, and bad input of any type gets the Python Bus's one-line `BridgeError`, never a `TypeError` |
+
+The hooks also exist as `agent-bridge hook broadcast` and `agent-bridge hook relay-start`, a 2 ms binary instead of a
+Python start-up on every prompt. They behave like `agent-bridge-broadcast-hook` and `agent-bridge-relay-hook`, the
+broadcast one asking historyd through the Rust client, and whatever goes wrong they print nothing and exit 0.
 
 One Bus serves any number of threads. A call that waits (`recv`, a ledger `acquire` with `wait`, a broker round
 trip) holds no lock while it waits, and in Python it releases the GIL, so a thread blocked in `recv` never stalls
@@ -565,13 +573,12 @@ What exists is described above; this is what is planned and not built yet.
 - **Prebuilt wheels.** The release workflow is in place: a `v*` tag builds manylinux wheels and attaches them to a
   GitHub Release, so installing will need no Rust toolchain. Publishing to PyPI is wired but off until the PyPI
   project and its trusted publisher are set up. No release has been tagged yet.
-- **One Rust core.** The console and the MCP server already run on `agent_bridge._native`, except the console's
-  historyd reads (agent DMs, the backlog), which still use the Python history client; next those move over and the
+- **One Rust core.** The console and the MCP server already run on `agent_bridge._native` and import no paho; next the
   Python Bus, CLI, relay, ledger and history implementations are deleted. The gate is the full suite, including the
   conformance tests, passing three times against the installed wheel. The wheel will then also carry the native
-  `agent-bridge` and ledgerd binaries.
-- **historyd in Rust**, after the Python reference, and the hooks as `agent-bridge hook ...` subcommands (keeping the
-  current command names).
+  `agent-bridge` and ledgerd binaries, with `agent-bridge-relay-hook` and `agent-bridge-broadcast-hook` as small shims
+  that run `agent-bridge hook ...`, so existing hook settings keep working.
+- **historyd in Rust**, after the Python reference.
 - **The auth phase** ([docs/EXTERNAL.md](docs/EXTERNAL.md)): broker credentials and per-agent ACLs on the request,
   reply and inbox topics, an explicit admin path for the console's ledger actions, and only then agents beyond one
   machine.

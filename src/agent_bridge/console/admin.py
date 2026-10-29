@@ -1,12 +1,13 @@
 """The console on the bus: a read-only observer of every topic, and the reserved admin identity for writes, both
-from the native core (agent_bridge._native). Ledger and history requests go over connections of their own."""
+from the native core (agent_bridge._native). Ledger requests go over the admin Bus's connection while it is held,
+history requests over connections of their own."""
 
 import sys
 import threading
 import time
 
 from .. import _native
-from ..history import client as history
+from ..errors import HistoryError
 from ..validation import ADMIN
 from . import events, sessions
 from .processes import ERRORS, Refused
@@ -80,14 +81,18 @@ def need_bus():
 def backlog():
     """The last messages from historyd, for a newly opened console; none while historyd is down."""
     try:
-        return history.recent(BACKLOG)
-    except history.HistoryError as e:
+        return _native.history_call("recent", as_=ADMIN, last=BACKLOG)["messages"]
+    except HistoryError as e:
         print(f"admin: no backlog: {e}", file=sys.stderr, flush=True)
         return []
 
 
 def ledger_call(op, as_, **fields):
+    """Over the admin Bus's connection while it is held, so a ledger view opens no connection; else over one of its
+    own, so the ledger stays readable while another console holds the admin identity."""
     try:
+        if bus := held["bus"]:
+            return bus.ledger(op, as_, **fields)
         return _native.ledger_call(op, as_, **fields)
     except ERRORS as e:
         raise Refused(f"ledger: {' '.join(str(e).split())}") from None

@@ -1,6 +1,6 @@
 //! Each command, on the core library.
 
-use crate::args::{Cmd, Details, Moderation, OnOff, RoomCmd};
+use crate::args::{Cmd, Details, Hook, Moderation, OnOff, RoomCmd};
 use crate::relay;
 use agent_bridge::bus::Bus;
 use agent_bridge::json::{Map, dumps_map, float};
@@ -163,6 +163,14 @@ pub fn run(cmd: Cmd) -> Result<()> {
         // reconnects.
         Cmd::Recv { addr, wait } => recv(&addr, wait),
         Cmd::Relay { action, run, session } => relay::command(action, &run, session),
+        Cmd::Hook { which: Hook::Broadcast } => {
+            crate::hooks::broadcast();
+            Ok(())
+        }
+        Cmd::Hook { which: Hook::RelayStart } => {
+            crate::hooks::relay_start();
+            Ok(())
+        }
         Cmd::Add { addr, name, details: d } => {
             ledger_op(&addr, "add", &[[("name", Some(name.into()))].as_slice(), &details(&d)].concat())
         }

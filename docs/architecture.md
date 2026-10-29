@@ -106,7 +106,10 @@ the lock files and the SQLite schema.
   reads them runs before that. `dm` (is the recipient live?), mentions, `sub`/`join`, `describe`, `keep`, `leave`,
   `ban` and the presence refresh all read the cache instead of opening a lookup connection. After its own presence
   publish a Bus updates its cache entry directly, since the broker echoes the publish before confirming it, so no
-  older copy can overwrite it.
+  older copy can overwrite it. Another connection's write, even one the broker has acked, reaches the cache
+  asynchronously, so these checks (a `dm` recipient, room rights, mentions) can briefly trail a peer's change: a
+  caller whose decision must reflect it waits until the change shows up. After a reconnect the old cache is never
+  used: it is cleared, and checks wait until the retained records are read again.
 
 ## CLI reference: agent-bridge
 
@@ -281,8 +284,10 @@ Bridge clients no longer write `history.jsonl`; sending never depends on history
   Errors are `{"ok": false, "error": "<one line>"}`.
 - **Clients.** `history.client` (Python) has one function per op and raises `HistoryError`, a `BridgeError` whose
   one-line message starts with `history:`, when historyd refuses, does not answer (5 s; 1 s for `broadcasts`, which
-  hooks call on every prompt) or the broker is down. CLI `history` and `dms`, the Bus's `history()`/`dms()`, the MCP
-  `history` and `dms` tools and the console use it. Like the ledger client it can run over a Bus's own connection.
+  hooks call on every prompt) or the broker is down. The Python CLI's `history` and `dms`, the Python Bus's
+  `history()`/`dms()` and the Python broadcast hook use it. The native core has the same client (`_native.history_call`,
+  and `history_call` on a native Bus), raising the same `HistoryError`; the MCP `history` and `dms` tools, the console
+  and `agent-bridge hook broadcast` use that. Like the ledger client, both can run over a Bus's own connection.
 - **Privacy is advisory**, like everything else on the bus: `"as"` and the request topic are self-asserted, so any
   local process can read any agent's DMs by asking on its topic. The per-agent topic is what an ACL will check once
   the broker authenticates clients.
@@ -490,8 +495,8 @@ agent-bridge-console
 It prints a login URL, `http://127.0.0.1:10000/#token=...`. Open it once; the page stores the token in the
 browser's localStorage and removes it from the address bar. `MONITOR_PORT` changes the port. The console joins the
 bus as the reserved agent `admin` (keep on) and sees everything else through a read-only `#` subscription, both from
-the native core (`agent_bridge._native`: `Bus.register_admin()` and `Observer`). Ledger and history requests use
-connections of their own.
+the native core (`agent_bridge._native`: `Bus.register_admin()` and `Observer`). Ledger requests go over the admin
+connection while the console holds it (else over one of their own); history requests use connections of their own.
 
 **Sessions and agents.** The console lists two kinds of entries, joined by Claude session id:
 

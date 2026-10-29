@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from .. import _native, config
-from ..history import client as history
+from ..errors import HistoryError
 from . import actions, admin, auth, capacity, events, kill, leaks, metrics, processes, sessions, usage
 from .processes import ERRORS, Refused
 
@@ -32,8 +32,8 @@ def agent_detail(query):
     out = {"agent": v, "activity": sessions.activity(v["session"]) if v["session"] else [], "dms": [], "ledger": None}
     if v["addr"]:
         try:
-            out["dms"] = history.dms(v["addr"], last=DMS_SHOWN)
-        except history.HistoryError as e:
+            out["dms"] = _native.history_call("dms", as_=v["addr"], last=DMS_SHOWN)["messages"]
+        except HistoryError as e:
             out["dms_error"] = str(e)
         try:
             out["ledger"] = admin.ledger_of(v["addr"], admin.dump())

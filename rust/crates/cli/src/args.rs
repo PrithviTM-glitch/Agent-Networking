@@ -56,6 +56,14 @@ pub enum Mode {
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
+pub enum Hook {
+    /// UserPromptSubmit and SessionStart: show the admin console's broadcasts this session has not seen
+    Broadcast,
+    /// SessionStart: start this session's relay in the background
+    RelayStart,
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
 pub enum RelayAction {
     Start,
     Stop,
@@ -224,6 +232,8 @@ pub enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// a Claude Code hook: broadcast or relay-start. It prints nothing on failure and always exits 0
+    Hook { which: Hook },
     /// ledger: add a resource you own
     Add {
         #[arg(value_name = "MY_ADDR")]

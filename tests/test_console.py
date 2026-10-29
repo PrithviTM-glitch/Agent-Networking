@@ -1333,6 +1333,26 @@ def test_audits():
     print("audit ok")
 
 
+def test_native_only_imports():
+    """The console and the MCP server run on the native core: importing them loads no paho and none of the Python bus,
+    presence, rooms, ledger or history clients, so those can be deleted without touching either."""
+    banned = (
+        "paho",
+        "agent_bridge.broker",
+        "agent_bridge.bus",
+        "agent_bridge.presence",
+        "agent_bridge.rooms",
+        "agent_bridge.ledger.client",
+        "agent_bridge.history.client",
+    )
+    code = (
+        "import sys, agent_bridge.console.server, agent_bridge.console.cli, agent_bridge.mcp_server\n"
+        f"print(sorted(m for m in sys.modules if any(m == b or m.startswith(b + '.') for b in {banned!r})))"
+    )
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert p.stdout.strip() == "[]", p.stdout
+
+
 def test_console_never_crashed():
     with open(os.path.join(TMP, "monitor.err")) as f:
         err = f.read()

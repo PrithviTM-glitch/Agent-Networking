@@ -240,6 +240,8 @@ impl Conn {
     }
 
     /// Disconnect cleanly and stop the reader thread; the session and anything not yet acked stay with the broker.
+    /// Returns only after any in-flight dial has let go of what it connected, so a client that connects after this
+    /// returns keeps the session: a closed Conn never takes it back from its next owner.
     pub fn close(&self) {
         lock(&self.0.state).closed = true;
         self.0.cv.notify_all();

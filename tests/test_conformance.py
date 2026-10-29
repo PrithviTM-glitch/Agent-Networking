@@ -315,6 +315,8 @@ def test_wrong_types_are_one_line_bridge_errors(api):
     console = api.Bus.register("admin", addr="admin", keep=True, admin=True)
     console.mod(room, "add", a.addr)  # rights are checked before argument types, so a must be a moderator
     console.close()
+    # The room record reaches a's cache asynchronously, after the broker acked the console's write.
+    assert wait_for(lambda: "moderator" not in _refusal(a.room_set, room, 5)[1], 10), "a never saw its moderator rights"
     cases = [
         ("say text int", a.say, (room, 5), "text must be a string, got int"),
         ("say text list", a.say, (room, ["x"]), "text must be a string, got list"),
@@ -385,24 +387,13 @@ def _record(addr):
     return {x["addr"]: x for x in presence.agents()}.get(addr) or {}
 
 
-def _until_up(bus, room):
-    """Wait until a Bus that was taken over is connected again."""
-
-    def up():
-        try:
-            bus.say(room, "back")
-            return True
-        except BridgeError:
-            return False
-
-    assert wait_for(up, 10), "the Bus never reconnected"
-
-
-def _heard(bus, wait=3):
+def _heard(bus, wait=3, until=None):
+    """What bus receives within wait seconds: until some message satisfies until, else until a batch leaves nothing
+    pending (which a late message can still miss under load)."""
     got, end = [], time.monotonic() + wait
     while time.monotonic() < end:
         got += bus.recv(0.5)
-        if got and not bus.pending():
+        if any(map(until, got)) if until else got and not bus.pending():
             break
     return got
 
@@ -412,7 +403,7 @@ def test_origin_is_written_once(api):
     a = agent(api, "nosession")
     room = f"origin{RUN}{id(api) % 997}"
     assert "session" not in _record(a.addr)
-    _other_process(api, f"attach({a.addr!r}).join({room!r})", session=str(uuid.uuid4()))
+    _other_process(api, f"b = attach({a.addr!r})\nb.join({room!r})\nb.close()", session=str(uuid.uuid4()))
     rec = _record(a.addr)
     assert f"room/{room}" in rec.get("topics", []) and "session" not in rec, rec
 
@@ -431,7 +422,7 @@ def test_subagent_keeps_its_lineage(api):
 def test_a_join_keeps_what_another_process_changed(api):
     """keep set by another process acting as the agent survives the agent's next join (whole-record refresh)."""
     a = agent(api, "keeper")
-    _other_process(api, f"attach({a.addr!r}).keep(True)")
+    _other_process(api, f"b = attach({a.addr!r})\nb.keep(True)\nb.close()")
     assert wait_for(lambda: _record(a.addr).get("keep") is True, 5)
     room = f"keeper{RUN}{id(api) % 997}"
     a.join(room)
@@ -441,18 +432,34 @@ def test_a_join_keeps_what_another_process_changed(api):
 
 def test_presence_cache_resets_on_reconnect(api):
     """A record cleared while the Bus was disconnected is gone from its cache once it reconnects."""
-    a, ghost = agent(api, "watcher"), agent(api, "ghost")
-    room = f"reset{RUN}{id(api) % 997}"
-    a.join(room)
+    a, ghost, peer = agent(api, "watcher"), agent(api, "ghost"), agent(api, "marker")
     a.dm(ghost.addr, "you are there")
     agents.remove(ghost)
     ghost.close()
     wipe = "_native.presence_wipe" if api.native else "__import__('agent_bridge.presence').presence.wipe"
-    # The takeover disconnects a; the wipe happens before it reconnects, so a never sees the clear arrive.
-    _other_process(api, f"attach({a.addr!r})\n{wipe}({ghost.addr!r})")
-    _until_up(a, room)
+    # The takeover disconnects a. Usually the wipe lands while a is away and its reconnect re-reads the retained
+    # records; on a slow runner a may be back first and must apply the live clear. Either way the dm is refused.
+    # Closing the attached Bus keeps it from taking the session back once a has reconnected.
+    t0 = time.monotonic()
+    code = (
+        f"import time\nb = attach({a.addr!r})\nprint('attached', time.monotonic())\n{wipe}({ghost.addr!r})\n"
+        "print('wiped', time.monotonic())\nb.close()"
+    )
+    stamps = _other_process(api, code).split()
+    t1 = time.monotonic()
+    # Queued in a's session while it is away, the marker can only reach a over its new connection: a has reconnected.
+    peer.dm(a.addr, "marker")
+    marker = _heard(a, 15, lambda m: m["body"] == "marker")
+    t2 = time.monotonic()
     kind, text = _refusal(a.dm, ghost.addr, "still there?")
-    assert (kind, text) == ("BridgeError", f"unknown address: {ghost.addr}"), (kind, text)
+    timeline = {
+        "subprocess": [f"{n} +{float(t) - t0:.3f}" for n, t in zip(stamps[::2], stamps[1::2], strict=True)],
+        "returned": f"+{t1 - t0:.3f}",
+        "marker": f"+{t2 - t0:.3f}" if marker else "never",
+        "ghost still retained": ghost.addr in (retained := {x["addr"] for x in presence.agents()}),
+        "retained agents": len(retained),
+    }
+    assert (kind, text) == ("BridgeError", f"unknown address: {ghost.addr}"), (kind, text, timeline)
 
 
 def test_recv_marks_mentions_for_me(api):
@@ -463,8 +470,11 @@ def test_recv_marks_mentions_for_me(api):
         bus.join(room)
     _heard(a, 1), _heard(c, 1)
     b.say(room, f"@{a.addr} over to you")
-    mine = [m for m in _heard(a) if m["body"].endswith("over to you")]
-    theirs = [m for m in _heard(c) if m["body"].endswith("over to you")]
+
+    def mention(m):
+        return m["body"].endswith("over to you")
+
+    mine, theirs = [[m for m in _heard(bus, 15, mention) if mention(m)] for bus in (a, c)]
     assert [m.get("for_me") for m in mine] == [True] and [m.get("for_me") for m in theirs] == [False], (mine, theirs)
 
 
@@ -501,7 +511,7 @@ def test_moderation_applies_at_recv(api):
     speaker.say(room, f"legit {RUN}")
     back = api.attach(receiver.addr)
     agents.append(back)
-    bodies = [m["body"] for m in _heard(back)]
+    bodies = [m["body"] for m in _heard(back, 15, lambda m: m["body"] == f"legit {RUN}")]
     assert f"legit {RUN}" in bodies and f"spoof {RUN}" not in bodies, bodies
 
 

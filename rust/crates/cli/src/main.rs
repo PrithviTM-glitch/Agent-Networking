@@ -1,13 +1,23 @@
-//! agent-bridge: the bus from the shell, and the session relay. Wire-compatible with the Python CLI.
+//! agent-bridge: the bus from the shell, the session relay and the Claude Code hooks. Wire-compatible with the Python
+//! CLI.
 
 mod args;
 mod commands;
+mod hooks;
 mod relay;
 
 use clap::Parser;
 use clap::error::ErrorKind;
 
 fn main() {
+    // A hook must never block or break a session: whatever happens, it exits 0 and says nothing.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
+        std::panic::set_hook(Box::new(|_| std::process::exit(0)));
+        if let Ok(cli) = args::Cli::try_parse() {
+            let _ = commands::run(cli.cmd);
+        }
+        return;
+    }
     std::panic::set_hook(Box::new(|info| {
         let what = info
             .payload()
