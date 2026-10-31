@@ -113,10 +113,29 @@ on the network read every DM and take every lock.
    `max_packet_size`, `max_connections`) stay as they are. Add connection rate limiting on the tailnet side.
 8. **Content stays untrusted.** Authentication tells you who sent a message, not that it is safe. Bodies and
    descriptions remain data, never instructions.
-9. **History and ledger requests have gaps after long outages.** Both services keep a persistent session, but while
-   one is down mosquitto queues at most `max_queued_messages` (1000) and `max_queued_bytes` (32 MiB) for it and drops
-   the rest. Requests then time out on the caller's side, and historyd's record misses whatever was dropped. History
-   is an advisory record, not an audit trail; authentication does not change that.
+9. **History and ledger requests have gaps after long outages or a backlog.** Both services keep a persistent
+   session, but while one is down, or connected and not keeping up, mosquitto queues at most `max_queued_messages`
+   (1000) and `max_queued_bytes` (32 MiB) for it and drops the rest, without telling the sender. Requests then time
+   out on the caller's side, and historyd's record misses whatever was dropped. The same bound applies to every
+   agent. History is an advisory record, not an audit trail; authentication does not change that.
+10. **What per-agent credentials do not separate.** Every local agent runs as the same OS user, so each one can read
+    every other local agent's credential file and connect as it. Phase 1 keeps out other users on the machine,
+    containers, and remote devices; it does not make one local agent's DMs private from another local agent of the
+    same user. That would need an OS user per agent, or a broker-side identity the agent cannot read, and is out of
+    scope.
+11. **Features that take another agent's session over.** Several features connect with an agent's own client id,
+    which takes its MQTT session over: `kick` (the room's moderator drops the member), `keep`, `sub` and `unsub` from
+    a second process (the CLI, or the MCP server's publish-only Bus while the relay owns the session), the console's
+    stop and wipe, and `leave`'s final connect. MQTT takeover is by client id, not by username, so with credentials
+    but no pinning any authenticated agent can take any other agent's session over, a denial of service. Phase 1
+    therefore pins every agent's client id to its username, which breaks all of these, and moves each to an explicit
+    path: the admin disconnects a client through dynamic security (kick, stop, wipe), and changes to an agent's own
+    subscriptions or keep go through the connection that owns the session.
+12. **Revocation also clears retained records.** Revoking an agent's credentials disconnects it, but its retained
+    presence on `agents/<addr>` and the room records it wrote stay on the broker and keep being served. Set
+    `check_retain_source true` (mosquitto re-checks the publisher's ACL before serving a retained message, the fix
+    for CVE-2018-12546), and make revocation an admin operation that also publishes an empty retained payload for the
+    agent's presence and removes it from every room record.
 
 ## 3. ledgerd across sites
 
@@ -191,10 +210,12 @@ The reply arrives QoS 1 on your ResponseTopic with the same CorrelationData:
  "level": "write", "expires_at": 1793053738.5, "token": 42}}
 ```
 
-Failures look like `{"ok": false, "error": "..."}`, and a busy lock adds `"holders"`. The full op table is in the
-README. ledgerd keeps the answer to each mutating request for 300 s, keyed by ResponseTopic, CorrelationData and
-payload, so a redelivered copy gets the same reply instead of a second effect. Use a fresh CorrelationData for every
-request.
+Failures look like `{"ok": false, "error": "..."}`, and a busy lock adds `"holders"`. The full op table is in
+[architecture.md](architecture.md#resource-ledger). ledgerd keeps the answer to each mutating request for as long as
+the broker could still redeliver it (its MessageExpiryInterval, at least 300 s and at most 3900 s), keyed by
+ResponseTopic, CorrelationData and payload, so a redelivered copy gets the same reply instead of a second effect. Use a
+fresh CorrelationData for every request. A waiting `acquire` is never served after its MessageExpiryInterval runs out,
+so set it to how long you will listen; to stop waiting early, send `cancel` with that request's CorrelationData.
 
 **History**: the same request/response shape against historyd. Publish QoS 1 to `history/req/<your addr>`, or to plain
 `history/req` for the public reads, with `ResponseTopic` = `history/resp/<your client id>` (must match
@@ -218,13 +239,13 @@ reply that would pass about 239 KB leaves out the oldest entries and adds `"trun
 | Phase | Build | Test before moving on |
 |---|---|---|
 | 0. Contract | Freeze section 4. Add a conformance script that drives the bus and ledger with only `mosquitto_pub`/`mosquitto_sub`, no Python. | Register, DM, room, recv with ack, ledger init/acquire/release, leave, all from the non-Python client. Existing suites green. |
-| 1. Auth on loopback | `allow_anonymous false`, dynamic-security plugin, an admin-side `register` that creates the client, ACLs from section 2, `inbox/<to>/<from>` with the Bus reading identity from the topic, the services' client ids pinned. Reply topics move to `<svc>/resp/<addr>/<connection>`, reader-first so running clients keep their replies: (1) ledgerd and historyd accept both the one-level and the two-level form; (2) both clients, owner and publish-only, switch to two levels; (3) only once no running process still uses the old client (MCP servers and relays keep their code until their session restarts) do the services refuse a first level that isn't the request topic's address, and the ACL lands. Plain `ledger/req` retires. The admin path from section 2 item 6, whichever the user picks. | Negative tests for each ACL row: write another's presence, read another's inbox, ledger request as another, subscribe `ledger/resp/#` or `history/resp/#` or another agent's `ledger/resp/<addr>/#`, a reply topic naming another agent, `dms`/`drop` for another agent on either history topic, `recent` from a non-admin, connect as `ledgerd` or `historyd`, anonymous connect. All must fail. Positive suites green with credentials. Admin release/deny still works and is logged. Disabling a client disconnects it. |
+| 1. Auth on loopback | `allow_anonymous false`, dynamic-security plugin, an admin-side `register` that creates the client, ACLs from section 2, `inbox/<to>/<from>` with the Bus reading identity from the topic, the services' and every agent's client ids pinned, with kick, stop, wipe and second-process keep/sub/unsub moved to the paths in section 2 item 11, `check_retain_source true`. Reply topics move to `<svc>/resp/<addr>/<connection>`, reader-first so running clients keep their replies: (1) ledgerd and historyd accept both the one-level and the two-level form; (2) both clients, owner and publish-only, switch to two levels; (3) only once no running process still uses the old client (MCP servers and relays keep their code until their session restarts) do the services refuse a first level that isn't the request topic's address, and the ACL lands. Plain `ledger/req` retires. The admin path from section 2 item 6, whichever the user picks. | Negative tests for each ACL row: write another's presence, read another's inbox, ledger request as another, subscribe `ledger/resp/#` or `history/resp/#` or another agent's `ledger/resp/<addr>/#`, a reply topic naming another agent, `dms`/`drop` for another agent on either history topic, `recent` from a non-admin, connect as `ledgerd` or `historyd`, anonymous connect. All must fail. Positive suites green with credentials. Admin release/deny still works and is logged. Disabling a client disconnects it. |
 | 2. TLS off-host | A TLS listener on the tailnet address only, a certificate from a local CA, and a tailnet ACL allowing only the broker port. | Plaintext and wrong-CA connections refused. A second device completes the full flow. Queued delivery survives a dropped link and a broker restart. Latency stays near the loopback figure. |
-| 3. Remote agents | Credential provisioning for a new device (one-time enrollment token or admin CLI) and MCP server config pointing at the remote broker. historyd already replaces per-host `history.jsonl`; it only needs its role from phase 1. | A Claude session on another device registers, chats, and takes and fences a lock. Its DMs and room posts appear in historyd from every device. Revoking the device's credentials cuts it off within seconds. |
+| 3. Remote agents | Credential provisioning for a new device (one-time enrollment token or admin CLI) and MCP server config pointing at the remote broker. historyd already replaces per-host `history.jsonl`; it only needs its role from phase 1. | A Claude session on another device registers, chats, and takes and fences a lock. Its DMs and room posts appear in historyd from every device. Revoking the device's credentials cuts it off within seconds and removes its retained presence and room entries (section 2 item 12). |
 | 4. WebSocket (if needed) | A `protocol websockets` listener behind TLS with the same auth. | An mqtt.js client passes the phase 0 conformance flow and the phase 1 negative tests. |
 | 5. Multi-site (only if needed) | Broker bridges with site-namespaced topics and a per-site ledgerd partitioned by owner (section 3). | Cut the link: local locks keep working, remote acquires fail cleanly, nothing is granted twice. Heal it: queued DMs arrive once, no loops, public ledger union correct. |
 
 Across all phases: back up the Docker volumes (`data`, `ledger`, `history`), watch `$SYS/broker/clients/*` and the
 services' logs, and keep the README's security section in step with what is actually enforced. Until the first
-release, keep the Python ledgerd image `agent-bridge-ledgerd:2` tagged next to the Rust one as the rollback: both open
-the same `ledger.db`.
+schema change, keep the v0.1.0 images `agent-bridge-ledgerd:2` and `agent-bridge-historyd:1` tagged next to the Rust
+ones as the rollback: each opens the same database as its Rust counterpart.

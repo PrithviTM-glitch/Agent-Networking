@@ -857,6 +857,7 @@ function render(fresh) {
 // live updates
 
 function onEvent(ev) {
+  if (ev.kind === "broker") return setDrops(ev.dropped);
   if (ev.kind === "agents") {
     const before = new Map(S.agents.map(a => [a.key, a.alive]));
     const was = S.view.type === "agent" && JSON.stringify(byKey(S.view.key));
@@ -898,9 +899,18 @@ function onEvent(ev) {
   }
 }
 function setConn(on) { S.connected = on; $("dot").classList.toggle("on", on); }
+// mosquitto's dropped-publish count since it started: messages lost at its queue limits, the sender never told.
+function setDrops(n) {
+  const el = $("drops");
+  el.hidden = !n;
+  el.textContent = n ? `${n} dropped` : "";
+  el.title = "Messages the broker dropped since it started, at its queue limits: an agent that does not read its "
+    + "messages loses them silently once its queue is full. See /metrics agent_bridge_broker_publish_messages.";
+}
 async function loadState() {
   const st = await api("/api/state");
   S.agents = st.agents; S.msgs = st.messages; S.audit = st.audit; S.rooms = st.rooms || {};
+  setDrops(st.broker && st.broker.dropped);
   S.jobs = Object.fromEntries(st.jobs.map(j => [j.id, j]));
   render(true);
 }

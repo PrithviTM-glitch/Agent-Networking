@@ -1,0 +1,10 @@
+# Only for a machine with a history.jsonl from before historyd (agent-bridge 0.1 and earlier): copy this file to
+# compose.override.yaml, which docker compose reads with compose.yaml, and historyd imports that log once on its next
+# start, read-only, leaving the file as it is. The directory must exist and be yours: a missing bind source is created
+# by Docker as root.
+services:
+  historyd:
+    environment:
+      HISTORY_IMPORT: /import/history.jsonl
+    volumes:
+      - ${HOME}/.local/state/agent-bridge:/import:ro

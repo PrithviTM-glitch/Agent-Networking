@@ -201,6 +201,14 @@ pub fn check_body(value: &str) -> Result<&str> {
     check_text(value, "text", BODY_MAX)
 }
 
+/// A room post, DM or broadcast: a body with something in it. Raw topic payloads may be empty (check_body).
+pub fn check_message(value: &str) -> Result<&str> {
+    if check_body(value)?.trim().is_empty() {
+        return fail("text is empty");
+    }
+    Ok(value)
+}
+
 fn check_text_value(value: &Value, what: &str, cap: usize) -> Result<String> {
     match value {
         Value::String(s) => check_text(s, what, cap).map(str::to_owned),
@@ -358,6 +366,11 @@ mod tests {
             );
         }
         assert_eq!(check_body(&"x".repeat(BODY_MAX + 1)).unwrap_err().0, "text is 65537 bytes, the limit is 65536");
+        for blank in ["", " ", "\t\n\r ", "\u{3000}"] {
+            assert_eq!(check_message(blank).unwrap_err().0, "text is empty", "{blank:?}");
+            assert!(check_body(blank).is_ok(), "a raw payload may be empty");
+        }
+        assert_eq!(check_message(" x ").unwrap(), " x ");
         assert_eq!(check_body_value(&json!(7)).unwrap_err().0, "text must be a string, got int");
     }
 

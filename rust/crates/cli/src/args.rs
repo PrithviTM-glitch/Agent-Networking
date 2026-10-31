@@ -2,18 +2,20 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-const ABOUT: &str = "agent-bridge: the bus from the shell. Every command prints JSON, one object per line; errors are one \
-line on stderr with a non-zero exit.";
+const ABOUT: &str = "agent-bridge: the bus from the shell. Commands that return data print JSON, one object per line; \
+errors are one line on stderr with a non-zero exit.";
 
 const LONG_ABOUT: &str =
-    "agent-bridge: the bus from the shell. Every command prints JSON, one object per line; errors \
-are one line on stderr with a non-zero exit.
+    "agent-bridge: the bus from the shell. Commands that return data print JSON, one object per line (recv one per
+message, so possibly none); register prints just the address, and keep, join, part, say, dm, sub, unsub, pub, leave
+and relay start print nothing when they succeed. Errors are one line on stderr with a non-zero exit.
 
 Names, addresses, rooms and caps: 1-64 ASCII letters, digits, _ or - (names at most 57, leaving room for the address
-suffix), at most 32 caps. TEXT: at most 64 KiB of UTF-8; tab, newline and CR are kept, any other control character
-(C0, DEL, C1) is refused. Raw topics: at most 256 bytes of UTF-8, no control characters, never starting with $ or the
-reserved levels agents, inbox, ledger, broadcast, rooms and history (only the dedicated commands touch those). + and # work
-only in sub, as whole levels, # only last, and not as the first level. Incoming messages that are over 256 KiB, not
+suffix), at most 32 caps. TEXT: at most 64 KiB of UTF-8, and not empty or only whitespace for say and dm (a raw pub
+payload may be empty); tab, newline and CR are kept, any other control character (C0, DEL, C1) is refused. Raw topics:
+at most 256 bytes of UTF-8, no control characters, never starting with $ or the reserved levels agents, inbox, ledger,
+broadcast, rooms and history (only the dedicated commands touch those). + and # work only in sub, as whole levels, #
+only last, and not as the first level. Incoming messages that are over 256 KiB, not
 UTF-8, or break these rules are dropped; plain text on a raw topic arrives with \"from\": null. \"from\" is checked for
 shape only: any local process can claim any address. Room moderation (mode, moderators, mute, ban) is advisory for
 the same reason.";
@@ -141,7 +143,10 @@ pub enum Cmd {
         addr: String,
         room: String,
     },
-    /// post to a chat room; @name, @address and @all mention
+    /// post to a chat room; @name / @address of a member and @all mention
+    ///
+    /// Post to a chat room. @name / @address of a room member and @all mention; any other @word stays plain text
+    /// (@@word never mentions), and stderr says which words mentioned nobody.
     Say {
         #[arg(value_name = "MY_ADDR")]
         addr: String,

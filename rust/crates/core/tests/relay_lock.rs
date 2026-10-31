@@ -21,9 +21,19 @@ fn fake_relay(addr: &str) -> Child {
     child
 }
 
+/// A temp dir removed when the test ends, failed assertions included.
+struct TempDir(std::path::PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn live_held_and_stop() {
-    let dir = std::env::temp_dir().join(format!("agent-bridge-relay-lock-{}", std::process::id()));
+    let tmp = TempDir(std::env::temp_dir().join(format!("agent-bridge-relay-lock-{}", std::process::id())));
+    let dir = &tmp.0;
     // SAFETY: set before anything in this test binary reads the environment.
     unsafe { std::env::set_var("AGENT_BRIDGE_LOG", dir.join("history.jsonl")) };
     assert!(lock_path(SESSION).unwrap().ends_with("relay/0f8fad5b-d9cb-469f-a165-70867728950e.lock"));
@@ -37,5 +47,4 @@ fn live_held_and_stop() {
     let _ = relay.wait();
     assert!(!live(SESSION) && held(SESSION).is_none(), "a stale lock file is not a live relay");
     assert!(lock_path("not-a-uuid").is_err());
-    let _ = std::fs::remove_dir_all(dir);
 }

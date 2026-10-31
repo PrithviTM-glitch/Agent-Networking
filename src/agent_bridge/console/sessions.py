@@ -128,11 +128,14 @@ def view(addr, rec, reg):
     """One session or agent as the page shows it. key is the address when on the bus, else the session id."""
     session = (reg and reg["session"]) or (rec and rec.get("session"))
     t = transcripts.get(session) if session else None
+    # A presence record's pid is its Claude process only when it names a session or a parent: an agent registered
+    # from a shell with no session (before 0.2.1 it still recorded that shell's claude) owns no process here.
+    owned = rec and (rec.get("session") or rec.get("parent"))
     pid, start = (
         (reg["pid"], reg["pid_start"])
         if reg and reg["pid"]
         else (rec.get("pid"), rec.get("pid_start"))
-        if rec
+        if owned
         else (None, None)
     )
     p = verified(pid, start) if pid else None

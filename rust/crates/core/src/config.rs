@@ -70,6 +70,69 @@ pub fn data_path(parts: &[&str]) -> crate::Result<PathBuf> {
 /// The directory of the history log, created if missing.
 pub fn data_dir() -> crate::Result<PathBuf> {
     let path = data_path(&[])?;
-    std::fs::create_dir_all(&path).map_err(|e| crate::validation::os_error(&e, Some(&path)))?;
+    std::fs::create_dir_all(&path).map_err(|e| data_error(&e, &path))?;
     Ok(path)
+}
+
+/// An error creating or writing path in the data directory. Permission denied says which directory refused and how to
+/// fix it: Docker creates a missing bind-mount source as root, which once made the CLI's lock file unwritable.
+pub fn data_error(e: &std::io::Error, path: &Path) -> Error {
+    if e.kind() != std::io::ErrorKind::PermissionDenied {
+        return crate::validation::os_error(e, Some(path));
+    }
+    // the nearest existing ancestor is the one that refused
+    let dir = path.ancestors().skip(1).find(|d| d.exists()).unwrap_or(path);
+    let owner = std::fs::metadata(dir).map_or(0, |m| std::os::unix::fs::MetadataExt::uid(&m));
+    denied(path, dir, owner, nix::unistd::getuid().as_raw())
+}
+
+fn denied(path: &Path, dir: &Path, owner: u32, me: u32) -> Error {
+    if owner == me {
+        return Error(format!(
+            "cannot write {}: {} is not writable; fix it with: chmod u+w {}",
+            path.display(),
+            dir.display(),
+            dir.display()
+        ));
+    }
+    let whose = match nix::unistd::User::from_uid(owner.into()) {
+        Ok(Some(u)) => u.name,
+        _ => owner.to_string(),
+    };
+    Error(format!(
+        "cannot write {}: {} belongs to {whose}, not you (Docker makes a missing bind-mount source root's); \
+         take it back with: sudo chown -R \"$(id -un)\" {}",
+        path.display(),
+        dir.display(),
+        dir.display()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn an_unwritable_data_dir_says_how_to_fix_it() {
+        if nix::unistd::getuid().is_root() {
+            return; // root writes anywhere
+        }
+        let dir = std::env::temp_dir().join(format!("agent-bridge-config-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("read-only");
+        let path = dir.join("agent-bridge");
+        let err = std::fs::create_dir_all(&path).map_err(|e| data_error(&e, &path)).unwrap_err();
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (p, d) = (path.display(), dir.display());
+        assert_eq!(err.0, format!("cannot write {p}: {d} is not writable; fix it with: chmod u+w {d}"));
+        // what a root-owned dir (Docker's doing) says, worded for a user who is not root
+        let root = denied(Path::new("/s/agent-bridge/cli.lock"), Path::new("/s/agent-bridge"), 0, 1000).0;
+        assert_eq!(
+            root,
+            "cannot write /s/agent-bridge/cli.lock: /s/agent-bridge belongs to root, not you (Docker makes a missing \
+             bind-mount source root's); take it back with: sudo chown -R \"$(id -un)\" /s/agent-bridge"
+        );
+    }
 }

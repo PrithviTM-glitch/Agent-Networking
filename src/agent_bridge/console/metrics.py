@@ -101,8 +101,9 @@ class Registry:
         fam["samples"][tuple(sorted(labels.items()))] = float(value)
 
 
-def _sessions(r):
-    """Agents and sessions; returns room -> member count for _rooms."""
+def _sessions(r, names):
+    """Agents and sessions; returns room -> member count for _rooms. names adds each one's friendly name (session
+    titles and branches), which only a scrape with the admin token gets."""
     best, states, members, relays, relayed = {}, {}, {}, 0, set()
     # Most recently seen first, so among equals the freshest names the session.
     for v in sessions.entities():
@@ -114,17 +115,19 @@ def _sessions(r):
             # One per session for name joins: the agent its relay holds, else a bus agent that is no subagent.
             rank = (bool(v["addr"]) and v["addr"] == _native.relay_held(sid), v["on_bus"] and not v["subagent"])
             if sid not in best or rank > best[sid][0]:
-                best[sid] = (rank, {"session_id": sid, "name": v["friendly"], "addr": v["addr"], "kind": kind})
+                name = v["friendly"] if names else None
+                best[sid] = (rank, {"session_id": sid, "name": name, "addr": v["addr"], "kind": kind})
         if v["session"] and v["relay"] is not None and v["session"] not in relayed:
             relayed.add(v["session"])
             r.add("agent_bridge_session_relay", int(v["relay"]), session_id=v["session"])
             relays += v["relay"]
         if v["addr"]:
-            r.add("agent_bridge_agent", 1, session_id=sid, addr=v["addr"], name=v["friendly"], kind=kind)
+            name = v["friendly"] if names else None
+            r.add("agent_bridge_agent", 1, session_id=sid, addr=v["addr"], name=name, kind=kind)
             if v["alive"] is not None:
                 r.add("agent_bridge_agent_alive", int(v["alive"]), addr=v["addr"], session_id=sid)
             for room in v["rooms"]:
-                r.add("agent_bridge_membership", 1, session_id=sid, addr=v["addr"], name=v["friendly"], room=room)
+                r.add("agent_bridge_membership", 1, session_id=sid, addr=v["addr"], name=name, room=room)
                 members[room] = members.get(room, 0) + 1
     for _, labels in best.values():
         r.add("agent_bridge_session", 1, **labels)
@@ -235,9 +238,9 @@ def _safe(r, name, fn):
         return None
 
 
-def collect():
+def collect(names=False):
     r = Registry()
-    members = _safe(r, "sessions", _sessions) or {}
+    members = _safe(r, "sessions", lambda reg: _sessions(reg, names)) or {}
     for name, fn in (
         ("capacity", _capacity),
         ("ledger", _ledger),

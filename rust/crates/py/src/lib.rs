@@ -253,6 +253,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         ("MAX_LEDGERS", ledger::MAX_LEDGERS),
         ("MAX_RESOURCES", ledger::MAX_RESOURCES),
         ("MAX_PENDING", ledger::MAX_PENDING),
+        ("MAX_PENDING_PER_OWNER", ledger::MAX_PENDING_PER_OWNER),
         ("MAX_LEASES", ledger::MAX_LEASES),
         ("MAX_WAITERS", ledger::MAX_WAITERS),
         ("MAX_REQUESTS", ledger::MAX_REQUESTS),

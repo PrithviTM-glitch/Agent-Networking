@@ -76,8 +76,11 @@ the lock files and the SQLite schema.
   `/proc/<pid>/stat`, in clock ticks). They are written once, when the record is created. Later attaches never
   add, replace or remove `session`, and refresh `pid`/`pid_start` only from a process in that same session. An
   agent registered with `--subagent` gets `"kind": "subagent"` and `"parent": <creating session>` instead of
-  `session`, so neither the session's relay nor the console takes it for the session itself. They let the console tell a live session from a dead one and from a reused
-  pid. Any client can write any presence, so the console re-checks them against `/proc` and never trusts them alone.
+  `session`, so neither the session's relay nor the console takes it for the session itself. `pid` and `pid_start`
+  are written only together with a session (or a subagent's parent): a script started from a session's shell without
+  `CLAUDE_CODE_SESSION_ID` is not that session and records no process. They let the console tell a live session from
+  a dead one and from a reused pid. Any client can write any presence, so the console re-checks them against `/proc`
+  and never trusts them alone.
 - **Message payload** on rooms, inboxes and raw topics: `{"from": "<addr>", "body": "<text>", "ts": unix_ts}`,
   QoS 1. Plain text on a raw topic is accepted and arrives with `"from": null`. `recv` adds `"topic"`. Room messages
   may add `"mentions": [addr, ...]` (see [Mentions](#mentions)), and `recv` then adds `"for_me": true|false`.
@@ -115,7 +118,7 @@ the lock files and the SQLite schema.
 | `mod` | `MY_ADDR ROOM add\|remove ADDR` | Adds or removes a moderator. Admin or a moderator only. |
 | `mute` / `unmute` / `ban` / `unban` / `kick` | `MY_ADDR ROOM ADDR` | Moderation, admin or a moderator only. `kick` bans and drops ADDR from the room. |
 | `history` | `ROOM [--last N]` | Shows a room's transcript from historyd (default 20, max 1000). |
-| `dm` | `MY_ADDR TO TEXT` | Sends a direct message. The recipient must be live. |
+| `dm` | `MY_ADDR TO TEXT` | Sends a direct message. The recipient must be live and not yourself (your own messages never reach you). |
 | `dms` | `MY_ADDR [--with PEER] [--last N]` | Shows your DMs in both directions, from historyd. |
 | `sub` / `unsub` | `MY_ADDR TOPIC` | Subscribes to or unsubscribes from a raw topic. `+` and `#` work as whole levels, `#` only last, never as the first level. |
 | `pub` | `MY_ADDR TOPIC TEXT` | Publishes to a raw topic. |
@@ -131,7 +134,7 @@ Ledger commands. Each one runs `init` for `MY_ADDR` first. They print the ledger
 | `public` / `grants` | `MY_ADDR` |
 | `request` | `MY_ADDR OWNER/NAME read\|write` |
 | `grant` / `deny` | `MY_ADDR REQUEST_ID` |
-| `acquire` | `MY_ADDR OWNER/NAME read\|write [--ttl S] [--wait S]` (defaults 60 and 0) |
+| `acquire` | `MY_ADDR OWNER/NAME read\|write [--ttl S] [--wait S]` (defaults 60 and 0). Ctrl-C (or SIGTERM) while it waits withdraws it from the queue. |
 | `renew` | `MY_ADDR LEASE_ID [--ttl S]` |
 | `release` | `MY_ADDR LEASE_ID` |
 
@@ -140,8 +143,9 @@ shared with ledgerd and historyd), and `AGENT_BRIDGE_LOG`. That last one names t
 historyd's one-time import reads; its directory is where the CLI keeps `cli.lock`, `relay/` and `hook-state/`.
 
 From Python, `from agent_bridge._native import Bus`, then `bus = Bus.register(name, caps=(), keep=False, addr=None)`
-or `Bus.attach(addr)`. Then call `join / part / sub / unsub / say / dm / pub / recv(wait) / dms / keep / leave / close`,
-`broadcast(text)` (only on the `admin` identity: `Bus.register_admin()`, which the console uses), `ledger(op, **fields)`
+or `Bus.attach(addr)`. Then call `join / part / sub / unsub / say / dm / pub / recv(wait) / dms / keep / leave / close`
+(`say` returns `{"mentions": [addr, ...], "unresolved": [word, ...]}`, see Mentions), `broadcast(text)` (only on the
+`admin` identity: `Bus.register_admin()`, which the console uses), `ledger(op, **fields)`
 and `history_call(op, **fields)` for a ledgerd or historyd request as that agent over the same connection,
 `describe(name, caps)` to change how others see it, `register(..., subagent=True)` (or `register NAME --subagent`) for
 a subagent's own agent (see Origin fields), the moderation calls `room_set(room, mode, rules) / mod(room, add|remove,
@@ -224,8 +228,11 @@ A room may have settings: a retained record at `rooms/<room>`.
 ## Mentions
 
 `say` turns `@token` in a room message into mentions. A token is a member's address, or a name (it mentions every
-member with that name); `@all` mentions nobody in particular and sends no mentions field, as before. Anything else
-is refused with an error naming it. `@` glued to a word (`alice@example.com`) is not a mention.
+member with that name), compared without case; `@all` mentions nobody in particular and sends no mentions field. Any
+other `@word` mentions nobody: the message is still sent as written, and `say` reports the word back (`unresolved` in
+the Bus's result and the MCP tool's, a one-line notice on the CLI's stderr), so a typo is noticed and prose such as
+"the @mentions field" is never refused. `@` glued to a word on its left (`alice@example.com`, `@@name`) is not a
+mention.
 
 - **Wire:** the room message gains `"mentions": [addr, ...]`, at most 32 sorted addresses. A malformed list drops the
   message; on non-room topics the field is ignored. A spoofed but well-formed list just counts as mentions.
@@ -313,19 +320,34 @@ compare-and-set over MQTT and no second writer.
 - **Resource**: id `<owner>/<name>`, with a description, `visibility` public or private, and `max_level`
   read or write. Only the owner adds, updates or removes it.
 - **Visibility**: `ledger` shows your own ledger in full and another agent's public entries only. `public` is the
-  public ledger: every public resource of every agent.
+  public ledger: every public resource of every agent. Private means unlisted, not secret: `dump` (the console's view)
+  answers any address with everything, private resources and pending requests included.
 - **Request and grant**: `request resource level` is granted on the spot when the resource is public and the level is
   at most `max_level`. Otherwise it goes pending and the owner gets a DM in `inbox/<owner>` from `ledgerd` that names
-  the `request_id`. The owner answers with `grant` or `deny`, and the requester gets a DM either way. Denying a granted
-  request revokes it and ends the holder's leases above whatever level it still holds. Private resources can be
-  requested by anyone who knows the id, but they always go pending.
-- **Owners** always hold implicit write on their own resources and can break any lease on them.
+  the `request_id` and the commands that answer it (`agent-bridge grant <owner> <request_id>` or `deny`). The
+  requester gets a DM either way. Denying a granted request revokes it and ends the holder's leases above whatever
+  level it still holds; that DM says "revoked" and names the leases it ended. Private resources can be requested by
+  anyone who knows the id, but they always go pending. An owner has at most 256 pending requests from everyone, since
+  each one is a DM; past that a new one is refused (`<owner> has 256 pending requests; try again once it has answered
+  some`).
+- **Owners** always hold implicit write on their own resources and can break any lease on them; the holder gets a DM
+  naming the lease (`<owner> ended your write lease <lease_id> on <resource>`).
 - **Leases**: `acquire resource level ttl wait` needs ownership or a grant at that level or higher. `read` leases
   are shared and `write` is exclusive. Each lease expires after `ttl` seconds (1 to 3600) unless renewed with `renew`,
-  and `release` ends it early. Leases are not re-entrant: asking again for write while you hold it waits on yourself.
+  and `release` ends it early. Leases are not re-entrant: an acquire that only your own leases block is refused with
+  `you already hold <level> lease <lease_id> on <resource>; renew it, or release it first`. Releasing or renewing
+  another agent's lease says whose it is.
 - **Waiting**: with `wait` > 0 (max 300 s) a busy acquire queues. Waiters are served strictly FIFO, so a writer in
   the queue stops new readers from overtaking it. A timeout replies `busy` with the current holders. Waiters survive
   a ledgerd restart.
+- **A waiter whose client left** must not be handed the lease, or the resource stays locked for the TTL with nobody
+  holding it. So a waiter's deadline is also capped at 1 s before its request's MessageExpiryInterval runs out (the
+  client sets it to its own timeout, so ledgerd knows when nobody listens any more), and a request with too little
+  expiry left gets `busy` at once. A client that stops waiting early sends `cancel` with the request's
+  CorrelationData: the command line does it on SIGINT or SIGTERM (Ctrl-C), gives back a lease granted before the
+  cancel arrived (that reply comes first, on the same topic), then dies of the signal. A client killed outright
+  (SIGKILL) cannot cancel; its waiter stays queued until its deadline, at most the wait plus the client's timeout
+  margin.
 - **Fencing tokens**: every write lease carries a `token` that is strictly larger than any token issued before, for
   any resource, across restarts.
 
@@ -351,7 +373,8 @@ early.
 | `grants` | | `held` (requests you made), `asked` (requests on your resources) |
 | `acquire` | `resource`, `level`, `ttl=60`, `wait=0` | `lease {lease_id, resource, holder, level, expires_at, token}` (token only for write), or `ok: false, error: "busy", holders: [...]` |
 | `renew` | `lease_id`, `ttl=60` | `lease` (holder only) |
-| `release` | `lease_id` | `{}` (holder or owner) |
+| `release` | `lease_id` | `{}` (holder or owner; an owner breaking another agent's lease DMs its holder) |
+| `cancel` | `correlation` (hex of the CorrelationData of your queued acquire) | `cancelled` (0 or 1). Drops your waiter queued under this request's ResponseTopic with that correlation; 0 when it was served, timed out or never queued. |
 | `drop` | | `{}`. Deletes your ledger, resources, grants given and held, leases and queued waits. |
 | `dump` | | Everything, for the admin console: `ledgers [{owner, since, last_seen}]`, `resources`, `requests` (pending first), `leases` (`lease_id, resource, holder, level, expires_at, token`), `waiters [{resource, holder, level, queued_at, deadline}]`, `ts`, and from the Rust ledgerd `ledgerd {impl, version}`. Any `as` works and needs no ledger. If the reply would pass ~240 KB every list is cut to the same length and `truncated: true` is set. |
 
@@ -381,6 +404,11 @@ lease = _native.ledger_call(
 )["lease"]
 ```
 
+A busy refusal's message names the holders in every client (`busy, held by bob-77d0e2 (write, 42 s left)`, the CLI's
+`ledger: busy, ...` line and `str(LedgerError)` alike); `.reply` keeps ledgerd's reply as it was. A timeout reads
+`no reply from ledgerd within 10s, is it running?`, or, for an acquire whose wait is not below the timeout, says to
+give a timeout above the wait.
+
 `ledger_call(op, as_, timeout=None, **fields)` opens a connection of its own for the call; `bus.ledger(op, as_=None,
 **fields)` sends over an agent's own connection, as that agent unless `as_` names another (the console acts as a
 resource's owner that way). Both raise `LedgerError` (`.reply` holds the reply) on `ok: false` or on timeout (10 s
@@ -392,15 +420,18 @@ or show up in `recv`, and the topic is resubscribed on every call, so a lost ses
 (must match `ledger/resp/[A-Za-z0-9_-]{1,128}`) and `CorrelationData` (1 to 256 bytes). ledgerd replies QoS 1 on that
 topic with the same CorrelationData and a 300 s message expiry. Requests without a valid ResponseTopic are dropped
 unanswered. Set a MessageExpiryInterval on requests so the broker drops them if ledgerd is down for longer than you
-will wait, which is what the client does.
+will wait, which is what the client does. ledgerd reads it too: a queued acquire is dropped (answered `busy`) 1 s
+before it runs out, and the answer kept for redelivery lives at least that long.
 
 - **Topic and `as`.** `<addr>` is the acting agent. The body's `as` may be left out; if present it must equal
   `<addr>`, or the request is refused. A per-agent topic lets broker ACLs vouch for the address once there are
   credentials ([docs/EXTERNAL.md](EXTERNAL.md)); on loopback any client can still publish under any address. Plain
   `ledger/req` is still served, with `as` required in the body.
 - **Redelivery.** ledgerd acks a request only after its transaction commits, so a crash or reconnect in between makes
-  the broker deliver it again. For 300 s ledgerd keeps the answer of every mutating request, keyed by response
-  topic, CorrelationData and payload, and replays it to an identical copy instead of running the op twice. Reads
+  the broker deliver it again. ledgerd keeps the answer of every mutating request, keyed by response topic,
+  CorrelationData and payload, for as long as the broker could redeliver it: the request's MessageExpiryInterval, at
+  least 300 s (also for a request without one) and at most 3900 s (MAX_TTL plus MAX_WAIT). It replays it to an
+  identical copy instead of running the op twice. Reads
   (`ledger`, `public`, `grants`, `dump`) simply run again. A client that reuses CorrelationData for a different
   request is not mistaken for a duplicate, because the payload is part of the key.
 
@@ -485,8 +516,12 @@ agent writes to it.
   buffer and is retried every 2 s; if the relay dies first, the broker still has it.
 - **No echo.** No Local covers the relay's own connection, and a sender check covers the MCP server's separate
   publishing connection.
-- **Exit.** When its `claude` process ends (checked every second against pid and start ticks) or on SIGTERM.
-  `agent-bridge relay stop` sends the SIGTERM and `agent-bridge relay status` reports whether it is live.
+- **Exit.** When its `claude` process ends (checked every second against pid and start ticks) or on SIGTERM, also
+  while the broker is away: it then waits for the broker in half-second steps, logging `broker unreachable, waiting
+  for it` once, instead of blocking in a call. `agent-bridge relay stop` sends the SIGTERM and `agent-bridge relay
+  status` reports whether it is live; outside a session both need `--session ID`.
+- **Log.** `relay/relay.log` in the state directory: `relaying` and `stopped`, `not delivered, kept queued` when the
+  inbox socket refused a post (retried every 2 s), `broker unreachable, waiting for it` when the broker is away.
 
 **Coexistence with the MCP server.** A live relay always owns the agent's subscribing session. The MCP server checks
 every 0.5 s. While a relay is live, the server publishes over a connection of its own (`Bus(addr, owner=False)`),
@@ -568,7 +603,9 @@ as a dead session. Dead sessions that have not been updated for the stale period
   [README](../README.md#admin-console).
 
 **Death detection.** The pid and start time come from the registry (`pid`, `procStart`), else from presence (`pid`,
-`pid_start`). A session is alive iff `/proc/<pid>` exists, is not a zombie, its comm is `claude`, its start time equals
+`pid_start`), but only from a presence record that names a session or a parent: a session-less agent owns no Claude
+process, whatever an older record carries, so it shows no process, has no liveness and is left out of Capacity. A
+session is alive iff `/proc/<pid>` exists, is not a zombie, its comm is `claude`, its start time equals
 the recorded one, and it belongs to the console's uid. This is checked every 3 s while a page watches. A dead session
 stays listed (greyed, with a toast when it dies) until its presence expires, or, without presence, until its registry
 entry is older than the stale period. Bus agents with neither (CLI-registered scripts, other MCP clients) show "no
@@ -641,7 +678,7 @@ the service.
 | What | Rule |
 |---|---|
 | Names, addresses, rooms, caps | 1-64 ASCII letters, digits, `_`, `-`. Register names at most 57 (room for the suffix). At most 32 caps. |
-| Message text | At most 64 KiB of UTF-8. Tab, newline and CR are kept, and any other C0, DEL or C1 control is refused. |
+| Message text | At most 64 KiB of UTF-8. Tab, newline and CR are kept, and any other C0, DEL or C1 control is refused. `say`, `dm` and `broadcast` refuse empty or whitespace-only text (`text is empty`); a raw `pub` payload may be empty. |
 | Raw topics | At most 256 bytes, no control characters, not under the reserved levels (`agents`, `inbox`, `ledger`, `broadcast`, `rooms`). Wildcards only in `sub`. At most 100 subscriptions per agent. |
 | Incoming messages | Over 256 KiB, not UTF-8, or breaking the rules above: dropped. `"from"` is checked for shape only. |
 | Presence and history lines | Malformed records are skipped, never trusted. |
@@ -649,7 +686,7 @@ the service.
 | `--wait`, `--last` | 0-3600 s, 1-1000. |
 | Broker | `max_packet_size 270000`, `max_connections 1024`, `max_queued_messages 1000` and `max_queued_bytes` 32 MiB per client, `memory_limit` 512 MiB. |
 | ledgerd requests | At most 16 KiB of UTF-8 JSON object, unknown fields rejected, every field type-, charset-, length- and range-checked. Resource names are `[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}`. Descriptions are at most 1024 chars with no control characters except tab and newline. ids are 16 hex chars. Bad requests get `ok: false`, or are dropped without a valid ResponseTopic. |
-| ledgerd quotas | 1000 ledgers, 128 resources per ledger, 64 pending and 512 stored requests per agent (the oldest denied one makes room), 256 leases per agent, 256 waiters per resource. |
+| ledgerd quotas | 1000 ledgers, 128 resources per ledger, 64 pending and 512 stored requests per agent (the oldest denied one makes room), 256 pending requests per owner, 256 leases per agent, 256 waiters per resource. |
 
 ## Persistence and cleanup
 
@@ -674,11 +711,17 @@ the service.
   requests sent while it restarts wait at the broker, and a request is acked only after its transaction commits. `drop`
   removes an agent's ledger. The stale sweep drops any ledger whose owner has no retained presence and has made no
   ledger request for longer than the stale period, and pending or denied requests older than that; granted ones stay.
-  Presence with `keep` protects a ledger indefinitely. Answers kept for redelivery replay expire after 300 s.
+  Presence with `keep` protects a ledger indefinitely. Answers kept for redelivery replay expire with their request's
+  MessageExpiryInterval, after 300 s to 3900 s. Both implementations purge a row 300 s after its `ts`, so ledgerd
+  writes a longer stay as a later `ts`, and the rollback keeps it as long.
 
 ## Troubleshooting
 
 - **`broker unreachable`**: run `docker compose up -d`. Check `docker ps --filter name=agent-bridge`.
+- **`cannot write .../cli.lock: ... belongs to root, not you`**: the state directory (`~/.local/state/agent-bridge`)
+  was created by Docker, which makes a missing bind-mount source root's. Before 0.2.1 the Compose file bound it for
+  historyd's import; that import is now opt-in (`compose.override.example.yaml`). Take it back with the `chown` the
+  message gives.
 - **ledger calls time out**: `docker compose ps` shows ledgerd's health, which is a real `dump` round trip through
   the broker every 30 s, so `unhealthy` means disconnected or wedged, not only exited. Check
   `docker logs agent-bridge-ledgerd`. ledgerd reconnects to the broker on its own.

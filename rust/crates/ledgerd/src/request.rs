@@ -11,6 +11,7 @@ pub struct Bad(pub String);
 pub const ADDR: &str = "[A-Za-z0-9_-]{1,64}";
 const NAME: &str = "[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}";
 const ROWID: &str = "[0-9a-f]{16}";
+const HEX: &str = "[0-9a-f]{2,512}, an even number of digits";
 
 #[derive(Clone, Copy)]
 enum Check {
@@ -18,6 +19,7 @@ enum Check {
     Name,
     Resource,
     RowId,
+    Hex,
     Description,
     Visibility,
     Level,
@@ -34,9 +36,9 @@ enum Fallback {
 
 type Field = (&'static str, Check, Fallback);
 
-pub const OPS: [&str; 15] = [
+pub const OPS: [&str; 16] = [
     "init", "add", "update", "remove", "ledger", "public", "request", "grant", "deny", "grants", "acquire", "renew",
-    "release", "drop", "dump",
+    "release", "cancel", "drop", "dump",
 ];
 
 fn fields(op: &str) -> &'static [Field] {
@@ -67,6 +69,7 @@ fn fields(op: &str) -> &'static [Field] {
         ],
         "renew" => &[("lease_id", C::RowId, D::Required), ("ttl", C::Number(1.0, MAX_TTL), D::Number(60.0))],
         "release" => &[("lease_id", C::RowId, D::Required)],
+        "cancel" => &[("correlation", C::Hex, D::Required)],
         _ => &[],
     }
 }
@@ -105,6 +108,11 @@ fn check(key: &str, v: &Value, c: Check) -> Result<Value, Bad> {
         Check::RowId => {
             pattern(key, v, ROWID, |s| s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
         }
+        Check::Hex => pattern(key, v, HEX, |s| {
+            (2..=512).contains(&s.len())
+                && s.len() % 2 == 0
+                && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        }),
         Check::Description => match v.as_str() {
             Some(s)
                 if s.chars().count() <= 1024
@@ -112,7 +120,7 @@ fn check(key: &str, v: &Value, c: Check) -> Result<Value, Bad> {
             {
                 Ok(v.clone())
             }
-            _ => Err(Bad(format!("{key}: string up to 1024 chars, no control characters"))),
+            _ => Err(Bad(format!("{key}: string up to 1024 chars, no control characters except tab and newline"))),
         },
         Check::Visibility => one_of(key, v, &["public", "private"]),
         Check::Level => one_of(key, v, &["read", "write"]),
@@ -194,7 +202,11 @@ mod tests {
         );
         assert_eq!(
             err(json!({"op": "add", "as": "a", "name": "x", "description": "a\rb"}), None),
-            "description: string up to 1024 chars, no control characters"
+            "description: string up to 1024 chars, no control characters except tab and newline"
+        );
+        assert_eq!(
+            err(json!({"op": "cancel", "as": "a", "correlation": "abc"}), None),
+            "correlation: must match [0-9a-f]{2,512}, an even number of digits"
         );
         assert_eq!(
             err(json!({"op": "add", "as": "a", "name": "x", "visibility": 1}), None),

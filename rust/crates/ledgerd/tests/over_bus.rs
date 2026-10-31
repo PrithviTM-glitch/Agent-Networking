@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 struct World {
     broker: String,
     ledgerd: Child,
+    dir: std::path::PathBuf,
 }
 
 impl Drop for World {
@@ -22,6 +23,7 @@ impl Drop for World {
         let _ = self.ledgerd.kill();
         let _ = self.ledgerd.wait();
         let _ = Command::new("docker").args(["rm", "-f", &self.broker]).output();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -57,7 +59,7 @@ fn start() -> (World, u16) {
     while agent_bridge::ledger::call("init", "probe-0", Map::new(), Some(1.0)).is_err() {
         assert!(Instant::now() < deadline, "ledgerd never answered");
     }
-    (World { broker, ledgerd }, port)
+    (World { broker, ledgerd, dir }, port)
 }
 
 /// Every topic a raw subscriber sees on ledger/resp/#.

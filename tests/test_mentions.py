@@ -66,12 +66,20 @@ def test_names_addresses_and_all_resolve():
     assert logged[0]["mentions"] == bobs
 
 
-def test_unknown_mentions_are_refused():
+def test_unknown_mentions_are_sent_as_text():
+    """An @word that matches no member (a non-member's address included) is sent as written, mentions nobody, and
+    is reported back; names and addresses match without case."""
     outsider = Bus.register("outsider")
-    for body, name in (("hi @nobody", "@nobody"), (f"hi @{outsider.addr}", f"@{outsider.addr}")):
-        with pytest.raises(BridgeError, match=name) as e:
-            S.alice.say(ROOM, body)
-        assert "\n" not in str(e.value)
+    for b in (S.alice, S.bob1, S.bob2, S.carol):
+        heard(b, 0.5)
+    for body, word in (("hi @nobody", "nobody"), (f"hi @{outsider.addr}", outsider.addr)):
+        assert S.alice.say(ROOM, body) == {"mentions": [], "unresolved": [word]}
+        assert heard(S.carol) == [{"body": body}], "plain text: no mentions, no for_me"
+    bobs = sorted([S.bob1.addr, S.bob2.addr])
+    assert S.alice.say(ROOM, "@BOB and @Nobody") == {"mentions": bobs, "unresolved": ["Nobody"]}
+    assert heard(S.bob1)[-1] == {"mentions": bobs, "for_me": True, "body": "@BOB and @Nobody"}
+    for b in (S.bob2, S.carol):
+        heard(b, 0.5)
     outsider.close()
 
 

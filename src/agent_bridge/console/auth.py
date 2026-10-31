@@ -18,6 +18,7 @@ TOKEN_FILE = os.path.join(CONFIG, "admin-token")
 def load_token():
     """The admin token, created on first run in a 0600 file under a 0700 directory."""
     os.makedirs(CONFIG, mode=0o700, exist_ok=True)
+    os.chmod(CONFIG, 0o700)  # makedirs leaves an existing directory's mode alone
     try:
         fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
@@ -42,3 +43,9 @@ def origin_ok(headers):
 
 def token_ok(headers, token):
     return hmac.compare_digest(headers.get("X-Admin-Token", "").encode(), token.encode())
+
+
+def scraper_ok(headers, token):
+    """The token as X-Admin-Token or as a bearer credential, the form a Prometheus scrape config can send."""
+    bearer = headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    return token_ok(headers, token) or hmac.compare_digest(bearer.encode(), token.encode())

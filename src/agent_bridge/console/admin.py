@@ -15,6 +15,9 @@ from .processes import ERRORS, Refused
 BACKLOG = 2000
 MUTATING = ("release", "deny")  # the ledger ops the console's actions apply
 SYS_MAX = 500  # $SYS topics kept: mosquitto publishes about 60, so this only bounds a hostile flood
+# Publishes mosquitto dropped since it started, at its inflight and queue limits: QoS 0 past the queue, and QoS 1 to a
+# connected agent that doesn't drain, while the sender still saw success. The page and status show it.
+DROPPED = "$SYS/broker/publish/messages/dropped"
 held = {"bus": None}
 settings = {}  # room -> its moderation record as rooms_view shows it, from the retained rooms/<room> topics
 broker = {}  # $SYS topic -> its latest text, the broker's own statistics (mosquitto publishes every sys_interval)
@@ -26,7 +29,9 @@ def _dispatch(kind, key, value):
         broker.clear()
     elif kind == "sys":
         if key in broker or len(broker) < SYS_MAX:
-            broker[key] = value
+            old, broker[key] = broker.get(key), value
+            if key == DROPPED and value != old:
+                events.push({"kind": "broker", "dropped": dropped()})
     elif kind == "presence":
         sessions.set_presence(key, value)
         sessions.push_agents()
@@ -71,6 +76,14 @@ def hold_admin():
             print(f"admin: {e}", file=sys.stderr, flush=True)
             held["bus"] = None
             bus.close()
+
+
+def dropped():
+    """mosquitto's dropped-publish count since it started, or None before its first $SYS report."""
+    try:
+        return int(broker[DROPPED])
+    except (KeyError, ValueError):
+        return None
 
 
 def need_bus():

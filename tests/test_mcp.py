@@ -223,7 +223,8 @@ async def sessions():
 
 async def origin():
     """Presence carries the session and the claude process that launched the server; admin stays reserved."""
-    fake = os.path.join(tempfile.mkdtemp(), "claude")
+    tmp = tempfile.mkdtemp()
+    fake = os.path.join(tmp, "claude")
     shutil.copy("/bin/sh", fake)
     sid = str(uuid.uuid4())
     async with server(sid, "admin", claude=fake) as s:
@@ -239,6 +240,7 @@ async def origin():
         await call(s, "leave")
     async with server(None, "delta") as c:
         assert "reserved for the admin console" in await fails(c, "connect", name="admin")
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 async def broadcast():

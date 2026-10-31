@@ -1,15 +1,17 @@
 //! A disposable broker for the Docker tests of this crate.
 
 use agent_bridge::presence;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-pub struct Broker(String);
+/// The container and the temp state dir, both removed when the test ends, failed assertions included.
+pub struct Broker(String, PathBuf);
 
 impl Drop for Broker {
     fn drop(&mut self) {
         let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
+        let _ = std::fs::remove_dir_all(&self.1);
     }
 }
 
@@ -38,5 +40,5 @@ pub fn broker(what: &str) -> Broker {
         assert!(Instant::now() < deadline, "the broker never came up");
         std::thread::sleep(Duration::from_millis(100));
     }
-    Broker(name)
+    Broker(name, dir)
 }

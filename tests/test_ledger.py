@@ -11,7 +11,9 @@ process of the stress test.
 import json
 import os
 import random
+import re
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -184,6 +186,7 @@ def test_functional():
     assert wait_for(lambda: any(pend["id"] in m["body"] and m["from"] == "ledgerd" for m in inbox.json(f"inbox/{a}")))
     note = inbox.json(f"inbox/{a}")[-1]
     assert set(note) == {"from", "body", "ts"}, "same shape as a bus DM"
+    assert f"answer with agent-bridge grant {a} {pend['id']} or agent-bridge deny {a} {pend['id']}" in note["body"]
     assert "no such request" in err("grant", b, request_id=pend["id"])["error"], "only the owner grants"
     assert call("grant", a, request_id=pend["id"])["request"]["status"] == "granted"
     assert wait_for(lambda: any("granted" in m["body"] for m in inbox.json(f"inbox/{b}")))
@@ -257,13 +260,16 @@ def test_functional():
     assert renewed["expires_at"] > got["expires_at"]
     time.sleep(1.2)
     assert err("acquire", a, resource=f"{a}/pubw", level="write")["error"] == "busy", "renew kept it past the first ttl"
-    assert "no such lease" in err("release", c, lease_id=got["lease_id"])["error"], "only holder or owner releases"
-    assert "no such lease" in err("renew", a, lease_id=got["lease_id"])["error"], "only the holder renews"
+    not_yours = f"lease {got['lease_id']} is not yours, {b} holds it"
+    assert err("release", c, lease_id=got["lease_id"])["error"] == not_yours, "only holder or owner releases"
+    assert err("renew", a, lease_id=got["lease_id"])["error"] == not_yours, "only the holder renews"
     call("release", b, lease_id=got["lease_id"])
     assert "no such lease" in err("renew", b, lease_id=got["lease_id"])["error"]
     stuck = call("acquire", b, resource=f"{a}/pubw", level="write", ttl=60)["lease"]
     call("release", a, lease_id=stuck["lease_id"])
     assert "no such lease" in err("release", b, lease_id=stuck["lease_id"])["error"], "the owner can break a lease"
+    broken = f"{a} ended your write lease {stuck['lease_id']} on {a}/pubw"
+    assert wait_for(lambda: any(m["body"] == broken for m in inbox.json(f"inbox/{b}"))), "and its holder is told"
     expiring = call("acquire", b, resource=f"{a}/pubw", level="write", ttl=1)["lease"]
     time.sleep(1.3)
     assert "no such lease" in err("renew", b, lease_id=expiring["lease_id"])["error"], (
@@ -274,6 +280,8 @@ def test_functional():
     held = call("acquire", b, resource=f"{a}/pub", level="write", ttl=60)["lease"]
     call("deny", a, request_id=pend["id"])
     assert "no such lease" in err("renew", b, lease_id=held["lease_id"])["error"]
+    revoked = f"{a} revoked your write grant on {a}/pub (request_id {pend['id']}), ending lease {held['lease_id']}"
+    assert wait_for(lambda: any(m["body"] == revoked for m in inbox.json(f"inbox/{b}")))
     assert call("acquire", b, resource=f"{a}/pub", level="read", ttl=1)["lease"], "the auto read grant remains"
 
     # drop cleans everything
@@ -281,16 +289,19 @@ def test_functional():
     call("request", b, resource=f"{d}/dres", level="read")
     call("request", d, resource=f"{a}/pubw", level="write")
     call("request", d, resource=f"{a}/priv", level="read")
+    call("request", d, resource=f"{a}/pub", level="read")
     dl = call("acquire", d, resource=f"{a}/pubw", level="write", ttl=60)["lease"]
     blocker = call("acquire", d, resource=f"{d}/dres", level="write", ttl=60)["lease"]
+    a_writes = call("acquire", a, resource=f"{a}/pub", level="write", ttl=60, wait=5)["lease"]
     on_dres = background("acquire", b, resource=f"{d}/dres", level="read", ttl=5, wait=10)
-    d_waits = background("acquire", d, resource=f"{a}/pubw", level="write", ttl=5, wait=10)
-    assert queued(f"{d}/dres") and queued(f"{a}/pubw")
+    d_waits = background("acquire", d, resource=f"{a}/pub", level="read", ttl=5, wait=10)
+    assert queued(f"{d}/dres") and queued(f"{a}/pub")
     assert blocker and "reply" not in on_dres and "reply" not in d_waits
     call("drop", d)
     on_dres["thread"].join()
     d_waits["thread"].join()
     assert "dropped" in on_dres["reply"]["error"] and "dropped" in d_waits["reply"]["error"]
+    call("release", a, lease_id=a_writes["lease_id"])
     assert "call init first" in err("ledger", d)["error"]
     assert "no ledger" in err("ledger", a, owner=d)["error"]
     assert not any(r["owner"] == d for r in call("public", a)["resources"])
@@ -575,7 +586,8 @@ def test_topics_and_redelivery():
     leases = [x for x in call("dump", "admin-0")["leases"] if x["resource"] == f"{o}/tr"]
     assert [x["holder"] for x in leases] == [me], "one lease, not two"
     other = send(f"ledger/req/{me}", {**acquire, "ttl": 31}, b"same")
-    assert answers(other, 3)[-1]["error"] == "busy", "same CorrelationData, different payload: a new request"
+    fresh = answers(other, 3)[-1]["error"]
+    assert "you already hold" in fresh, "same CorrelationData, different payload: a new request"
     waiter = {"op": "acquire", "resource": f"{o}/tr", "level": "write", "ttl": 5, "wait": 20}
     send(f"ledger/req/{o}", waiter, b"wait")
     send(f"ledger/req/{o}", waiter, b"wait")
@@ -584,6 +596,122 @@ def test_topics_and_redelivery():
     assert answers(b"wait")[0]["lease"]["holder"] == o
     alive()
     print("topics ok")
+
+
+def test_waiters_that_leave():
+    """A waiter whose client stopped listening is never handed the lease: ledgerd drops it a second before its
+    request's expiry (the client's timeout), and an interrupted command-line acquire cancels its place in the queue,
+    giving back a lease granted just before the cancel."""
+    o, w = "leave-o1", "leave-w1"
+    for x in (o, w):
+        call("init", x)
+    call("add", o, name="lk", visibility="public", max_level="write")
+    call("request", w, resource=f"{o}/lk", level="write")
+    res = f"{o}/lk"
+    held = call("acquire", o, resource=res, level="write", ttl=60)["lease"]
+
+    def raw_acquire(*flags):
+        cmd = [*LEDGER_RAW, "acquire", "--as", w, "--resource", res, "--level", "write", "--ttl", "600", *flags]
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def stop(proc, sig):
+        proc.send_signal(sig)
+        out, errs = proc.communicate(timeout=10)
+        assert proc.returncode == -sig and "Traceback" not in errs and "panicked" not in errs, (out, errs)
+
+    # a timeout shorter than the wait: busy just before the client gives up, and nothing queued afterwards
+    t = time.monotonic()
+    short = err("acquire", w, resource=res, level="write", ttl=600, wait=60, timeout=3)
+    assert short["error"] == "busy" and 1 < time.monotonic() - t < 3, short
+    assert not call("dump", "admin-0")["waiters"]
+
+    # SIGINT and SIGTERM withdraw the queued acquire, a chain of them included
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGINT):
+        proc = raw_acquire("--wait", "60")
+        assert queued(res), "the acquire queued"
+        stop(proc, sig)
+        assert queued(res, 0), f"{sig!r} left the waiter queued"
+    call("release", o, lease_id=held["lease_id"])
+    assert not holders(res), "no lease went to the clients that left"
+
+    # the lease is granted while the cancel is on its way: the client gives it back
+    held = call("acquire", o, resource=res, level="write", ttl=60)["lease"]
+    proc = raw_acquire("--wait", "60")
+    assert queued(res)
+    LD.send_signal(signal.SIGSTOP)  # so the release and the cancel reach ledgerd in that order
+    try:
+        threading.Thread(target=call, args=("release", o), kwargs={"lease_id": held["lease_id"]}).start()
+        time.sleep(0.3)
+        proc.send_signal(signal.SIGINT)
+        time.sleep(0.3)
+    finally:
+        LD.send_signal(signal.SIGCONT)
+    stop(proc, signal.SIGINT)
+    assert wait_for(lambda: not holders(res)), "the lease granted before the cancel was released"
+    assert call("acquire", o, resource=res, level="write", ttl=1)["lease"]
+
+    # cancel itself: only your own waiter, under the same reply topic and correlation
+    assert call("cancel", w, correlation="00ff")["cancelled"] == 0
+    assert "correlation: must match" in err("cancel", w, correlation="0f0")["error"]
+    alive()
+
+
+def test_busy_names_the_holders():
+    """A busy refusal says who holds the resource and for how long, from the command line and from Python, and
+    asking again for a lease you hold says so instead of busy."""
+    cli = str(BIN / "agent-bridge")
+    me = subprocess.run([cli, "register", "busy-owner"], capture_output=True, text=True, check=True).stdout.strip()
+    try:
+        subprocess.run([cli, "add", me, "lk"], capture_output=True, check=True)
+        held = call("acquire", me, resource=f"{me}/lk", level="read", ttl=30)["lease"]
+        other = "busy-w1"
+        call("init", other)
+        call("update", me, name="lk", visibility="public", max_level="write")
+        call("request", other, resource=f"{me}/lk", level="write")
+        try:
+            call("acquire", other, resource=f"{me}/lk", level="write")
+            raise AssertionError("acquired a held resource")
+        except LedgerError as e:
+            assert re.fullmatch(rf"busy, held by {me} \(read, (29|30) s left\)", str(e)), str(e)
+            assert e.reply["error"] == "busy", "the reply itself is unchanged"
+        write = subprocess.run([cli, "acquire", me, f"{me}/lk", "write"], capture_output=True, text=True)
+        assert write.returncode == 1, write
+        assert write.stderr.strip() == (
+            f"ledger: you already hold read lease {held['lease_id']} on {me}/lk; renew it, or release it first"
+        ), write
+        call("release", me, lease_id=held["lease_id"])
+        call("acquire", other, resource=f"{me}/lk", level="write", ttl=30)
+        busy = subprocess.run([cli, "acquire", me, f"{me}/lk", "read"], capture_output=True, text=True)
+        held_by = rf"ledger: busy, held by {other} \(write, (29|30) s left\)\n"
+        assert busy.returncode == 1 and re.fullmatch(held_by, busy.stderr), busy
+    finally:
+        subprocess.run([cli, "leave", me], capture_output=True)
+
+
+def test_replay_window():
+    """A stored answer lives as long as its request can be redelivered: max(300 s, the request's
+    MessageExpiryInterval), capped at MAX_TTL + MAX_WAIT. Rows are purged 300 s after their ts by this ledgerd and by
+    the v0.1.0 rollback alike, so a longer stay is written as a later ts."""
+    me = "replay-r1"
+    call("init", me)
+    raw = connect()
+    replies = Watch("ledger/resp/replay")
+    cap = _native.MAX_TTL + _native.MAX_WAIT
+    for i, (expiry, stay) in enumerate(((None, 300), (60, 300), (1000, 1000), (100000, cap))):
+        props = Properties(PacketTypes.PUBLISH)
+        props.ResponseTopic, props.CorrelationData = "ledger/resp/replay", f"r{i}".encode()
+        if expiry:
+            props.MessageExpiryInterval = expiry
+        body = json.dumps({"op": "add", "name": f"r{i}"})
+        sent = time.time()
+        raw.publish(f"ledger/req/{me}", body, qos=1, properties=props)
+        corr = props.CorrelationData
+        assert wait_for(lambda corr=corr: any(c == corr for _, _, c in replies.msgs))
+        with sqlite3.connect(os.path.join(TMP, "ledger.db")) as conn:
+            (ts,) = conn.execute("SELECT max(ts) FROM replies").fetchone()
+        purged_at = ts + 300
+        assert sent + stay - 2 < purged_at < sent + stay + 2, (expiry, ts - sent)
+    raw.disconnect()
 
 
 def test_bounds():
@@ -600,6 +728,23 @@ def test_bounds():
         call("deny", o, request_id=rq["id"])
     held = call("grants", me)["held"]
     assert len(held) == MAX_REQUESTS and first not in {r["id"] for r in held}, "the oldest denied requests make room"
+
+    # pending requests: MAX_PENDING per requester, MAX_PENDING_PER_OWNER on one owner from everyone
+    per, cap = _native.MAX_PENDING, _native.MAX_PENDING_PER_OWNER
+    flooded = "bound-f1"
+    call("init", flooded)
+    for n in range(per // 2):
+        call("add", flooded, name=f"f{n}")
+    for k in range(cap // per):
+        asker = f"bound-a{k}"
+        call("init", asker)
+        for n in range(per // 2):
+            for lvl in ("read", "write"):
+                assert call("request", asker, resource=f"{flooded}/f{n}", level=lvl)["request"]["status"] == "pending"
+    late = "bound-late"
+    call("init", late)
+    full = err("request", late, resource=f"{flooded}/f0", level="read")["error"]
+    assert full == f"{flooded} has {cap} pending requests; try again once it has answered some", full
     alive()
     print("bounds ok")
 

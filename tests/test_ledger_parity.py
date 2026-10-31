@@ -10,15 +10,15 @@ exactly as long as the README offers that image as the rollback.
 import json
 import os
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
-import tempfile
 import threading
 
 import paho.mqtt.client as mqtt
 import pytest
-from conftest import LEDGERD, _service_env, wait_for
+from conftest import BIN, LEDGERD, _service_env, wait_for
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 
@@ -77,8 +77,13 @@ class Rollback:
 
     def stop(self):
         subprocess.run(["docker", "stop", "-t", "10", self.name], check=True, capture_output=True)
-        gone = subprocess.run(["docker", "inspect", self.name], capture_output=True).returncode != 0
-        assert gone, "the rollback ledgerd is still running, so two writers could share the database"
+
+        def stopped():  # or gone: --rm removes the container only some time after docker stop returns
+            running = ["docker", "inspect", "-f", "{{.State.Running}}", self.name]
+            state = subprocess.run(running, capture_output=True, text=True)
+            return state.returncode != 0 or state.stdout.strip() == "false"
+
+        assert wait_for(stopped, 10), "the rollback ledgerd is still running, so two writers could share the database"
 
     def remove(self):
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
@@ -107,8 +112,8 @@ def state():
     return d
 
 
-def test_rust_and_python_share_one_database(state_dir):
-    data = tempfile.mkdtemp()  # mounted at /data in the rollback container; the Rust ledgerd opens the same file
+def test_rust_and_python_share_one_database(state_dir, tmp_path):
+    data = str(tmp_path)  # mounted at /data in the rollback container; the Rust ledgerd opens the same file
     db, log = os.path.join(data, "ledger.db"), os.path.join(state_dir, "ledgerd.log")
     o, r, w = "paro-o1", "parr-r1", "parw-w1"
     raw = connect()
@@ -180,12 +185,40 @@ def test_rust_and_python_share_one_database(state_dir):
         assert again["token"] > queued["lease"]["token"]
         call("release", o, lease_id=again["lease_id"])
         ledgerd.stop()
+        with sqlite3.connect(db) as conn:
+            assert conn.execute("SELECT value FROM meta WHERE key='schema'").fetchall() == [(1,)], "one schema row, 1"
     finally:
         if rollback:
             rollback.remove()
         raw.disconnect()
         raw.loop_stop()
 
-    with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT value FROM meta WHERE key='schema'").fetchall() == [(1,)], "one schema row, 1"
-    shutil.rmtree(data, ignore_errors=True)
+
+def test_an_interrupted_acquire_against_the_rollback(tmp_path):
+    """cancel is newer than v0.1.0: the Python ledgerd refuses it as an unknown op, and an interrupted command-line
+    acquire still ends quietly by its signal, as it does against the Rust ledgerd."""
+    rollback = Rollback(tmp_path)
+    try:
+        o, w = "parc-o1", "parc-w1"
+        for x in (o, w):
+            call("init", x)
+        call("add", o, name="lk", visibility="public", max_level="write")
+        call("request", w, resource=f"{o}/lk", level="write")
+        call("acquire", o, resource=f"{o}/lk", level="write", ttl=60)
+        proc = subprocess.Popen(
+            [str(BIN / "agent-bridge"), "ledger-raw", "acquire", "--as", w, "--resource", f"{o}/lk", "--level", "write",
+             "--wait", "30"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )  # fmt: skip
+        assert wait_for(lambda: state()["waiters"], 10), "the acquire queued"
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=10)
+        assert proc.returncode == -signal.SIGINT and not out and "Traceback" not in err and "panicked" not in err, (
+            proc.returncode,
+            out,
+            err,
+        )
+    finally:
+        rollback.remove()

@@ -116,28 +116,36 @@ pub fn mention_tokens(body: &str) -> Vec<String> {
     out
 }
 
-/// The addresses body mentions among members (address, presence record): @address, or @name for every member with
-/// that name. None for no mention or @all, which mentions nobody in particular. Errs for anything else.
-pub fn mentions(room: &str, body: &str, members: &[(String, Map)]) -> Result<Option<Vec<String>>> {
+/// What a room message mentions among members (address, presence record): @address, or @name for every member with
+/// that name, both compared without case. @all mentions nobody in particular, like no mention. Any other @word matches
+/// nobody: it stays plain text, and comes back in the second list so the sender can be told.
+pub fn mentions(body: &str, members: &[(String, Map)]) -> Result<(Option<Vec<String>>, Vec<String>)> {
     let mut tokens = mention_tokens(body);
     let mut seen = std::collections::HashSet::new();
-    tokens.retain(|t| seen.insert(t.clone()));
-    if tokens.is_empty() || tokens.iter().any(|t| t.to_lowercase() == "all") {
-        return Ok(None);
-    }
-    let mut found = std::collections::BTreeSet::new();
-    for token in tokens {
-        let named: Vec<&String> =
-            members.iter().filter(|(_, r)| r.get("name").is_some_and(|n| *n == token)).map(|(a, _)| a).collect();
-        if members.iter().any(|(a, _)| *a == token) {
-            found.insert(token);
-        } else if !named.is_empty() {
-            found.extend(named.into_iter().cloned());
+    tokens.retain(|t| seen.insert(t.to_ascii_lowercase()));
+    let all = tokens.iter().any(|t| t.eq_ignore_ascii_case("all"));
+    let (mut found, mut unresolved) = (std::collections::BTreeSet::new(), Vec::new());
+    for token in tokens.into_iter().filter(|t| !t.eq_ignore_ascii_case("all")) {
+        if let Some((addr, _)) = members.iter().find(|(a, _)| a.eq_ignore_ascii_case(&token)) {
+            found.insert(addr.clone());
+            continue;
+        }
+        let named = members
+            .iter()
+            .filter(|(_, r)| r.get("name").and_then(Value::as_str).is_some_and(|n| n.eq_ignore_ascii_case(&token)))
+            .map(|(a, _)| a.clone())
+            .collect::<Vec<_>>();
+        if named.is_empty() {
+            unresolved.push(token);
         } else {
-            return fail(format!("@{token} is neither a member of #{room} nor the name of one"));
+            found.extend(named);
         }
     }
-    check_mentions(&found.into_iter().collect::<Vec<_>>().into()).map(Some)
+    let mentions = match all || found.is_empty() {
+        true => None,
+        false => Some(check_mentions(&found.into_iter().collect::<Vec<_>>().into())?),
+    };
+    Ok((mentions, unresolved))
 }
 
 /// What info shows for a room: its settings, open defaults when it has no record.
@@ -215,12 +223,23 @@ mod tests {
     #[test]
     fn resolve() {
         let members = [member("alice-1", "alice"), member("alice-2", "alice"), member("bob-1", "bob")];
-        assert_eq!(mentions("r", "@alice @bob-1", &members).unwrap().unwrap(), ["alice-1", "alice-2", "bob-1"]);
-        assert_eq!(mentions("r", "@bob-1 and @ALL", &members).unwrap(), None);
+        let none: Vec<String> = vec![];
         assert_eq!(
-            mentions("r", "@carol", &members).unwrap_err().0,
-            "@carol is neither a member of #r nor the name of one"
+            mentions("@alice @bob-1", &members).unwrap(),
+            (Some(vec!["alice-1".into(), "alice-2".into(), "bob-1".into()]), none.clone())
         );
+        assert_eq!(mentions("@bob-1 and @ALL", &members).unwrap(), (None, none.clone()));
+        assert_eq!(
+            mentions("@ALICE and @Bob-1", &members).unwrap().0.unwrap(),
+            ["alice-1", "alice-2", "bob-1"],
+            "no case"
+        );
+        let (m, unresolved) = mentions("@carol, see the @mentions field, @bob", &members).unwrap();
+        assert_eq!(
+            (m.unwrap(), unresolved),
+            (vec!["bob-1".to_owned()], vec!["carol".to_owned(), "mentions".to_owned()])
+        );
+        assert_eq!(mentions("only @nobody @Nobody", &members).unwrap(), (None, vec!["nobody".to_owned()]), "once each");
     }
 
     #[test]

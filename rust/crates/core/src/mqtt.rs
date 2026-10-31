@@ -45,6 +45,8 @@ pub struct Message {
     pub ack: Ack,
     pub response_topic: Option<String>,
     pub correlation: Option<Bytes>,
+    /// MessageExpiryInterval as delivered: the seconds the message had left when the broker sent it.
+    pub expiry: Option<u32>,
 }
 
 pub trait Handler: Send + Sync {
@@ -445,6 +447,7 @@ impl Conn {
                     ack,
                     response_topic: props.response_topic,
                     correlation: props.correlation_data,
+                    expiry: props.message_expiry_interval,
                 };
                 self.0.handler.message(self, msg);
                 if !self.0.opts.manual_ack {

@@ -20,10 +20,44 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).expect("a free port")
 }
 
-fn temp_dir(what: &str) -> PathBuf {
+/// A temp dir removed when the test ends, failed assertions included.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// A running service killed when the test ends, failed assertions included: a Child is not killed on drop.
+struct Killed(Option<Child>);
+
+impl Killed {
+    fn take(&mut self) -> Child {
+        self.0.take().expect("still ours")
+    }
+}
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn temp_dir(what: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!("agent-bridge-ledgerd-{what}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a temp dir");
-    dir
+    TempDir(dir)
 }
 
 fn ledgerd(port: u16, dir: &Path, args: &[&str]) -> Command {
@@ -80,7 +114,6 @@ fn arguments_never_start_the_service() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("agent-bridge-ledgerd: unhealthy: broker unreachable"));
     assert!(!dir.join("ledger.db").exists(), "no argument opens the ledger");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -97,7 +130,7 @@ fn health_answers_and_a_second_ledgerd_takes_over() {
         .expect("docker runs");
     assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
     let _broker = Removed(name);
-    let first = ledgerd(port, &dir, &[]).spawn().expect("ledgerd runs");
+    let mut first = Killed(Some(ledgerd(port, &dir, &[]).spawn().expect("ledgerd runs")));
     let deadline = Instant::now() + Duration::from_secs(15);
     let healthy = loop {
         let ok = run(port, &dir, &["--health"], Duration::from_secs(12)).status.code() == Some(0);
@@ -107,12 +140,10 @@ fn health_answers_and_a_second_ledgerd_takes_over() {
         std::thread::sleep(Duration::from_millis(200));
     };
     // The broker ends the first one's session with e0 01 8e (reason 142, no properties): it steps aside.
-    let mut second = ledgerd(port, &dir, &[]).stderr(Stdio::null()).spawn().expect("ledgerd runs");
-    let stepped_aside = finishes(first, Duration::from_secs(10));
-    let _ = second.kill();
-    let _ = second.wait();
+    let second = Killed(Some(ledgerd(port, &dir, &[]).stderr(Stdio::null()).spawn().expect("ledgerd runs")));
+    let stepped_aside = finishes(first.take(), Duration::from_secs(10));
+    drop(second);
     let after = run(port, &dir, &["--health"], Duration::from_secs(12));
-    let _ = std::fs::remove_dir_all(dir);
     assert!(healthy, "a running ledgerd answers the probe");
     assert_eq!(stepped_aside.status.code(), Some(1));
     let err = String::from_utf8_lossy(&stepped_aside.stderr);

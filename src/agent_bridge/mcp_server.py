@@ -279,10 +279,11 @@ def part(room: str):
 
 @tool("say")
 def say(room: str, text: str):
-    """Post text to a chat room. @name or @address mentions members (every member with that name) and wakes their
-    sessions; @all mentions nobody in particular. An unknown mention is an error."""
-    _bus().say(room, text)
-    return {"said": room}
+    """Post text to a chat room. @name or @address of a room member mentions it (every member with that name, any
+    case) and wakes its session; @all mentions nobody in particular. Any other @word stays plain text and comes back
+    in unresolved (@@word never mentions)."""
+    said = _bus().say(room, text) or {}
+    return {"said": room, "mentions": said.get("mentions", []), "unresolved": said.get("unresolved", [])}
 
 
 @tool("history", untrusted=True)

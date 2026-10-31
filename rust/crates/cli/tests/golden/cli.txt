@@ -47,11 +47,11 @@ $ agent-bridge room set beta-000002 room1 --mode announce
 exit 1
 only admin or a moderator of #room1 may change it, admin names the first
 $ agent-bridge say beta-000002 room1 @nobody-x hi
-exit 1
-@nobody-x is neither a member of #room1 nor the name of one
+exit 0
+agent-bridge: sent; @nobody-x matches no member of #room1, so it mentions nobody
 $ agent-bridge dm beta-000002 nobody-000000 x
 exit 1
-unknown address: nobody-000000
+unknown recipient: nobody-000000
 $ agent-bridge register bad/name
 exit 1
 bad name 'bad/name': use 1-57 ASCII letters, digits, _ or -
@@ -90,7 +90,7 @@ exit 0
 {"ok": true, "lease": {"lease_id": "<id>", "resource": "alpha-000001/r1", "holder": "beta-000002", "level": "read", "expires_at": <t>}}
 $ agent-bridge ledger-raw bogus --as alpha-000001
 exit 1
-{"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, drop, dump"}
+{"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, cancel, drop, dump"}
 $ agent-bridge ledger-raw add --as nobody-1 --name r2
 exit 1
 {"ok": false, "error": "no ledger for nobody-1, call init first"}

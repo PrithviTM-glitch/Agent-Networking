@@ -354,11 +354,27 @@ fn messages<P: Params>(db: &Connection, filter: &str, args: P) -> rusqlite::Resu
 mod tests {
     use super::*;
 
-    fn temp(name: &str) -> PathBuf {
+    /// A temp dir removed when the test ends, failed assertions included.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn temp(name: &str) -> TempDir {
         let dir = std::env::temp_dir().join(format!("agent-bridge-historyd-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a temp dir");
-        dir
+        TempDir(dir)
     }
 
     /// The reply to one request, as JSON.
@@ -415,7 +431,6 @@ mod tests {
         assert_eq!(reply["truncated"], true);
         assert!(dumps(&reply).len() < MAX_REPLY && bodies(&reply).len() < 7);
         assert!(bodies(&reply).last().is_some_and(|b| b.ends_with('6')), "the newest are kept");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -443,7 +458,6 @@ mod tests {
             ["new"],
             "received now, though its ts is old"
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -463,7 +477,6 @@ mod tests {
         let db = Connection::open(&path).expect("reopens");
         let index = db.query_row("SELECT count(*) FROM sqlite_master WHERE name='messages_topic'", [], |r| r.get(0));
         assert_eq!(index, Ok(0), "nothing was written");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -500,6 +513,5 @@ mod tests {
         }
         h.trim().expect("trims");
         assert_eq!(count(&h), 10, "within both caps nothing goes");
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

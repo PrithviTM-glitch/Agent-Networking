@@ -20,7 +20,9 @@ pub fn health() -> i32 {
     match call("ping", None, Map::new(), HEALTH_TIMEOUT) {
         Ok(_) => 0,
         Err(e) => {
-            eprintln!("historyd: {e}");
+            // worded as ledgerd's; the history client's own "history: " prefix would only repeat the name
+            let reason = e.to_string();
+            eprintln!("agent-bridge-historyd: unhealthy: {}", reason.strip_prefix("history: ").unwrap_or(&reason));
             1
         }
     }

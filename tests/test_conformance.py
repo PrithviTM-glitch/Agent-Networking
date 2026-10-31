@@ -480,7 +480,7 @@ def test_presence_cache_resets_on_reconnect(api):
         "ghost still retained": ghost.addr in (retained := {x["addr"] for x in api.agents()}),
         "retained agents": len(retained),
     }
-    assert (kind, text) == ("BridgeError", f"unknown address: {ghost.addr}"), (kind, text, timeline)
+    assert (kind, text) == ("BridgeError", f"unknown recipient: {ghost.addr}"), (kind, text, timeline)
 
 
 def test_recv_marks_mentions_for_me(api):

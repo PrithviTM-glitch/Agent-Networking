@@ -125,9 +125,20 @@ impl Bus {
         call(py, &self.0, move |b| b.unsub(&topic))
     }
 
-    fn say(&self, py: Python<'_>, room: &Bound<'_, PyAny>, body: &Bound<'_, PyAny>) -> PyResult<()> {
+    /// Post to a room; returns {"mentions": [addr, ...], "unresolved": [word, ...]}: whom it mentioned, and the @words
+    /// that matched no member of the room (sent as plain text, mentioning nobody).
+    fn say<'py>(
+        &self,
+        py: Python<'py>,
+        room: &Bound<'py, PyAny>,
+        body: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
         let (room, body) = (ident(room, "room")?, text(body, "text")?);
-        call(py, &self.0, move |b| b.say(&room, &body))
+        let said = call(py, &self.0, move |b| b.say(&room, &body))?;
+        let mut out = Map::new();
+        out.insert("mentions".into(), said.mentions.into());
+        out.insert("unresolved".into(), said.unresolved.into());
+        dict(py, &out)
     }
 
     fn dm(&self, py: Python<'_>, to: &Bound<'_, PyAny>, body: &Bound<'_, PyAny>) -> PyResult<()> {

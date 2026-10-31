@@ -103,10 +103,10 @@ extern "C" fn on_term(_: libc::c_int) {
     DONE.store(true, Ordering::SeqCst);
 }
 
-/// Sleep up to d, returning early (true) on SIGTERM.
-fn done_within(d: Duration) -> bool {
+/// Sleep up to d, returning early (true) on SIGTERM or once alive() is false.
+fn done_within(d: Duration, alive: &dyn Fn() -> bool) -> bool {
     let end = Instant::now() + d;
-    while !DONE.load(Ordering::SeqCst) {
+    while !DONE.load(Ordering::SeqCst) && alive() {
         let left = end.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return false;
@@ -146,9 +146,13 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
     };
     let path = lock_path(&session)?;
     let dir = path.parent().unwrap_or(&path);
-    std::fs::create_dir_all(dir).map_err(|e| os_error(&e, Some(dir)))?;
-    let mut lock =
-        OpenOptions::new().read(true).append(true).create(true).open(&path).map_err(|e| os_error(&e, Some(&path)))?;
+    std::fs::create_dir_all(dir).map_err(|e| config::data_error(&e, dir))?;
+    let mut lock = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(&path)
+        .map_err(|e| config::data_error(&e, &path))?;
     match lock.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
@@ -181,6 +185,8 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
 
     let me = bus.addr.clone();
     let mut backlog: VecDeque<Map> = VecDeque::new();
+    // set when the inbox refused a post, so the log can tell that from the broker being unreachable
+    let undelivered = std::cell::Cell::new(false);
     let mut deliver = |msgs: &[Map]| -> Result<()> {
         // Another connection acting as this agent (the MCP server's publisher) is not covered by no-local.
         let mine: Vec<&Map> = msgs.iter().filter(|m| m["from"] != *me).collect();
@@ -197,17 +203,39 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
             return Ok(());
         }
         let all: Vec<&Map> = backlog.iter().chain(quiet).collect();
-        h.deliver(&frame(&wake, &all[all.len().saturating_sub(BACKLOG)..])).map_err(|e| Error(os_text(&e)))?;
+        h.deliver(&frame(&wake, &all[all.len().saturating_sub(BACKLOG)..])).map_err(|e| {
+            undelivered.set(true);
+            Error(os_text(&e))
+        })?;
         backlog.clear();
         Ok(())
     };
-    while !DONE.load(Ordering::SeqCst) && host::stat(claude_pid).is_some_and(|p| p.start == claude_start) {
-        if arrived.wait(Duration::from_secs(1)) && !done_within(COALESCE) {
+    let alive = || host::stat(claude_pid).is_some_and(|p| p.start == claude_start);
+    let mut down = false;
+    while !DONE.load(Ordering::SeqCst) && alive() {
+        if arrived.wait(Duration::from_secs(1)) && !done_within(COALESCE, &alive) {
             arrived.clear();
         }
+        // recv would wait up to 10 s for the broker; waiting here keeps checking the claude process
+        if !bus.connected() {
+            if !down {
+                log("broker unreachable, waiting for it");
+                down = true;
+            }
+            // straight on to recv once the broker is back (within 50 ms), as recv's own wait would: what queued up
+            // meanwhile goes out at once, not after another coalesce window
+            done_within(Duration::from_millis(500), &|| alive() && !bus.connected());
+            if !bus.connected() {
+                continue;
+            }
+        }
+        down = false;
         if let Err(e) = bus.recv(0.0, Some(BATCH), Some(&mut deliver)) {
-            log(&format!("not delivered, kept queued: {e}"));
-            done_within(RETRY);
+            match undelivered.replace(false) {
+                true => log(&format!("not delivered, kept queued: {e}")),
+                false => log(&format!("broker unreachable, retrying: {e}")),
+            }
+            done_within(RETRY, &alive);
         }
     }
     bus.close();
@@ -236,9 +264,9 @@ fn try_start() -> Result<()> {
         return Ok(());
     }
     let dir = config::data_path(&["relay"])?;
-    std::fs::create_dir_all(&dir).map_err(|e| os_error(&e, Some(&dir)))?;
+    std::fs::create_dir_all(&dir).map_err(|e| config::data_error(&e, &dir))?;
     let log = dir.join("relay.log");
-    let out = OpenOptions::new().append(true).create(true).open(&log).map_err(|e| os_error(&e, Some(&log)))?;
+    let out = OpenOptions::new().append(true).create(true).open(&log).map_err(|e| config::data_error(&e, &log))?;
     let err = out.try_clone().map_err(|e| os_error(&e, Some(&log)))?;
     let exe = std::env::current_exe().map_err(|e| os_error(&e, None))?;
     let mut cmd = Command::new(exe);
@@ -268,8 +296,14 @@ pub fn command(action: RelayAction, run_args: &[String], session: Option<String>
             _ => fail("agent-bridge: relay run takes the claude process's pid and start time in clock ticks"),
         },
         RelayAction::Stop | RelayAction::Status => {
-            let env = std::env::var(claude::SESSION_ENV).ok();
-            let session = check_session(session.as_deref().or(env.as_deref()))?;
+            let env = std::env::var(claude::SESSION_ENV).ok().filter(|s| !s.is_empty());
+            let Some(given) = session.as_deref().or(env.as_deref()) else {
+                return fail(format!(
+                    "no session: run it inside a Claude Code session ({}) or pass --session ID",
+                    claude::SESSION_ENV
+                ));
+            };
+            let session = check_session(Some(given))?;
             if action == RelayAction::Stop && !stop(session, Duration::from_secs(5))? {
                 return fail("the relay did not stop within 5 s");
             }

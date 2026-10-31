@@ -46,11 +46,10 @@ services:
     environment:
       AGENT_BRIDGE_HOST: mosquitto
       HISTORY_DB: /data/history.db
-      HISTORY_IMPORT: /import/history.jsonl
     volumes:
+      # Importing a legacy history.jsonl is opt-in: compose.override.example.yaml. A bind of the host's state dir here
+      # would make Docker create it as root on a new machine, and the CLI could then not write its lock file.
       - history:/data
-      # The host's legacy history log, imported once on the first start and never changed (read-only).
-      - ${HOME}/.local/state/agent-bridge:/import:ro
     healthcheck:
       # A round trip through the broker, so it fails when historyd is disconnected or wedged, not just when it exits.
       test: ["CMD", "/agent-bridge-historyd", "--health"]

@@ -37,6 +37,29 @@ def _str(body, key, optional=False):
     return v
 
 
+def request_target(path, b):
+    """A request's audit target before it runs, in the form its success entry takes wherever that form follows from the
+    request alone, so a target filter finds refusals and successes alike."""
+
+    def s(key):
+        return v[:200] if isinstance(v := b.get(key), str) else None
+
+    room, addr = s("room"), s("addr")
+    if path == "/api/send" and b.get("kind") in ("room", "dm", "topic") and s("target"):
+        return f"{b['kind']}:{s('target')}"
+    if path == "/api/broadcast":
+        return "broadcast"
+    if path in ("/api/room/kill", "/api/room/settings") and room:
+        return f"room:{room}"
+    if path in ("/api/room/member", "/api/room/moderator") and room and addr:
+        return f"{room}:{addr}"
+    if path == "/api/leaks/process" and is_count(b.get("pid"), 4194304):
+        return f"pid {b['pid']}"
+    return next(
+        (v for k in ("addr", "session", "target", "room", "lease_id", "request_id", "name") if (v := s(k))), None
+    )
+
+
 def _name(v):
     return v["addr"] or v["session"]
 
@@ -46,7 +69,15 @@ def send(b, _peer=None):
     if kind not in ("room", "dm", "topic"):
         raise Refused("kind must be room, dm or topic")
     target = _str(b, "target")
-    {"room": console.say, "dm": console.dm, "topic": console.pub}[kind](target, _str(b, "text"))
+    said = {"room": console.say, "dm": console.dm, "topic": console.pub}[kind](target, _str(b, "text")) or {}
+    if unresolved := said.get("unresolved"):
+        words = ", ".join(f"@{w}" for w in unresolved)  # the wording of the CLI's say notice
+        verb = (
+            "matches no member of #{}, so it mentions"
+            if len(unresolved) == 1
+            else "match no member of #{}, so they mention"
+        )
+        return f"{kind}:{target}", f"sent; {words} {verb.format(target)} nobody"
     return f"{kind}:{target}", "sent"
 
 

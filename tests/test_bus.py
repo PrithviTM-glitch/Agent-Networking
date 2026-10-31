@@ -7,7 +7,6 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -309,7 +308,7 @@ def test_presence_cache(s):
         "a cleared record leaves the cache",
         {"retained": _native.presence_find(newcomer), "cached": lib.cached_agent(newcomer)},
     )
-    with pytest.raises(BridgeError, match="unknown address"):
+    with pytest.raises(BridgeError, match="unknown recipient"):
         lib.dm(newcomer, "gone")
     lib.part(room)
     while lib.recv(0.5):  # the newcomer's room notices, so later tests start from an empty buffer
@@ -390,7 +389,7 @@ def test_forged_presence(s):
     raises(Bus.attach, f"forged-many-{RUN}")
     s.victim2 = victim2 = run("register", "victim2")
     raw_pub(evil, f"agents/{victim2}", b"{garbage", retain=True)
-    assert "unknown address" in fails("recv", victim2), "junk over a real presence reads as gone"
+    assert "is not registered" in fails("recv", victim2), "junk over a real presence reads as gone"
     assert run("register", "victim2", "--addr", victim2) == victim2 and lines("recv", victim2) == []
     for t in [f"agents/{x}" for x in forged] + odd_topics:
         raw_pub(evil, t, b"", retain=True)
@@ -418,10 +417,10 @@ def test_ledger_commands(s):
     run("leave", user)
 
 
-def test_presence_origin(s):
+def test_presence_origin(s, tmp_path):
     """Presence names the Claude Code session and process an agent runs under, for the admin console."""
     good = s.good
-    fake = os.path.join(tempfile.mkdtemp(), "claude")
+    fake = str(tmp_path / "claude")
     shutil.copy("/bin/sh", fake)
     sid = str(uuid.uuid4())
     p = subprocess.Popen(
@@ -466,15 +465,17 @@ def test_presence_origin(s):
     evil.loop_stop()
 
 
-def test_subagents_and_write_once_origin(s):
+def test_subagents_and_write_once_origin(s, tmp_path):
     """A subagent's agent is marked as one and stays one; no later attach gives any agent a session it lacked."""
     sid = str(uuid.uuid4())
     in_session = {"CLAUDE_CODE_SESSION_ID": sid}
-    plain = run("register", "plain")
+    plain = run("register", "plain")  # this test process may well run under a claude, but in no session
     run("join", plain, DEMO, env_extra=in_session)
-    assert not {"session", "parent", "kind"} & set(agents()[plain]), "registered outside a session, stays outside"
+    assert not {"session", "parent", "kind", "pid", "pid_start"} & set(agents()[plain]), (
+        "registered outside a session, stays outside, and owns no session's process"
+    )
 
-    fake = os.path.join(tempfile.mkdtemp(), "claude")
+    fake = str(tmp_path / "claude")
     shutil.copy("/bin/sh", fake)
     p = subprocess.Popen(
         [fake, "-c", f'"{BRIDGE}" register helper --subagent; exit $?'],
@@ -610,6 +611,56 @@ BAD_ENV = [
     {"AGENT_BRIDGE_STALE_DAYS": "-1"},
     {"AGENT_BRIDGE_STALE_DAYS": "1e400"},
 ]
+
+
+def test_message_rules(s):
+    """Empty text, a DM to yourself and an @word that matches nobody: each is told plainly, none is silently lost."""
+    a, lib, console = s.a, s.lib, s.console
+    room = f"rules-{RUN}"
+    lib.join(room)
+    run("join", a, room)
+    while lib.recv(0.5):
+        pass
+    for args, error in (
+        (["say", a, room, ""], "text is empty"),
+        (["say", a, room, " \n\t"], "text is empty"),
+        (["dm", a, lib.addr, ""], "text is empty"),
+        (["dm", a, a, "note to self"], "cannot DM yourself: your own messages never reach you"),
+        (["dm", a, f"nobody-{RUN}", "x"], f"unknown recipient: nobody-{RUN}"),
+        (["recv", f"nobody-{RUN}"], f"nobody-{RUN} is not registered (or it left): register it first"),
+    ):
+        assert fails(*args) == error, args
+    for fn, args in ((lib.say, (room, "  ")), (lib.dm, (lib.addr, "self")), (console.broadcast, (" ",))):
+        raises(fn, *args)
+    run("pub", a, f"rules{RUN}/t", "")  # a raw payload may still be empty
+    said = lib.say(room, "see the @mentions field, @ALICE")
+    assert said == {"mentions": [a], "unresolved": ["mentions"]}, "sent anyway; names match without case"
+    assert lib.say(room, "plain") == {"mentions": [], "unresolved": []}
+    p = subprocess.run([BRIDGE, "say", a, room, "ask @nobody"], env=env(), capture_output=True, text=True)
+    assert p.returncode == 0 and p.stdout == "" and "@nobody" in p.stderr, (p.returncode, p.stdout, p.stderr)
+    got = [(m["body"], m.get("mentions")) for m in lib.recv(5) + lib.recv(0.5) if m["topic"] == f"room/{room}"]
+    assert got == [("ask @nobody", None)], "an unresolved @word is plain text, sent as written"
+    lib.part(room)
+
+
+def test_retained_replay_precedes_the_barrier(s):
+    """A Bus's caches are complete once it is synced: with 3000 retained presence records on the broker, every one is
+    in a new Bus's cache at its first read. This pins mosquitto delivering a subscription's retained records before
+    the next SUBACK, which the cache barrier relies on."""
+    evil = raw_client()
+    rec = json.dumps({**s.good, "seen": time.time()})
+    addrs = [f"bulk{i}-{RUN}" for i in range(3000)]
+    for info in [evil.publish(f"agents/{x}", rec, qos=1, retain=True) for x in addrs]:
+        info.wait_for_publish(10)
+    fresh = Bus.register("fresh")
+    try:
+        missing = [x for x in addrs if fresh.cached_agent(x) is None]
+        assert missing == [], f"{len(missing)} of {len(addrs)} retained records missing at the first read"
+    finally:
+        fresh.leave()
+        for info in [evil.publish(f"agents/{x}", b"", qos=1, retain=True) for x in addrs]:
+            info.wait_for_publish(10)
+        evil.loop_stop()
 
 
 def test_bad_arguments(s):

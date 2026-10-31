@@ -18,3 +18,5 @@ src/agent_bridge/THIRD_PARTY_LICENSES.md
 src/agent_bridge.data/scripts/agent-bridge
 src/agent_bridge.data/scripts/agent-bridge-ledgerd
 src/agent_bridge.data/scripts/agent-bridge-historyd
+# A machine-local compose override (see compose.override.example.yaml)
+compose.override.yaml

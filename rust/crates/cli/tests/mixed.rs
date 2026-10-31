@@ -196,6 +196,58 @@ fn the_cli_matches_the_golden_transcript() {
     assert_eq!(got.lines().count(), want.lines().count(), "line count");
 }
 
+/// A process killed when the test ends, failed assertions included.
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A relay notices its claude process ending even while the broker is gone: it waits for the broker in short steps
+/// instead of inside a call that blocks for seconds, and its log says the broker is unreachable.
+#[test]
+#[ignore = "needs Docker"]
+fn a_relay_ends_with_its_claude_while_the_broker_is_down() {
+    let w = start();
+    let session = "8f1c1b8e-2d64-4a51-9a3c-6f0e5b7d2a11";
+    // a shell named claude, the relay's ancestor; it lives while its stdin is open
+    let claude = w.dir.join("claude");
+    std::fs::copy("/bin/sh", &claude).expect("a fake claude");
+    let mut fake = w.cmd(&claude);
+    fake.args(["-c", &format!("{RUST} relay start; read _")])
+        .env("CLAUDE_CODE_SESSION_ID", session)
+        .env("CLAUDE_CODE_MESSAGING_SOCKET", w.dir.join("inbox.sock"))
+        .stdin(Stdio::piped());
+    let fake = Killed(fake.spawn().expect("the fake claude runs"));
+    let lock = w.dir.join("relay").join(format!("{session}.lock"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let live = || {
+        String::from_utf8_lossy(&w.run(&["relay", "status", "--session", session]).stdout).contains("\"live\": true")
+    };
+    let relay = loop {
+        let pid = std::fs::read_to_string(&lock).ok().and_then(|l| l.lines().next()?.parse::<i32>().ok());
+        if let Some(pid) = pid.filter(|_| live()) {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the relay never came up");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = Command::new("docker").args(["rm", "-f", &w.broker]).output();
+    std::thread::sleep(Duration::from_secs(3));
+    let ended = Instant::now();
+    drop(fake);
+    while Path::new(&format!("/proc/{relay}")).exists() && ended.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let took = ended.elapsed();
+    let log = std::fs::read_to_string(w.dir.join("relay").join("relay.log")).unwrap_or_default();
+    assert!(took < Duration::from_secs(2), "the relay took {took:?} to notice its claude ended\n{log}");
+    assert!(log.contains("broker unreachable, waiting for it"), "{log}");
+}
+
 #[test]
 fn normalises_times_and_ids() {
     let text = r#"{"ts": 1793294701.3971186, "id": "0123456789abcdef", "token": 3, "n": 12345678901}"#;

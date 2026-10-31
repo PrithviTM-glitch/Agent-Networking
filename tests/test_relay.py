@@ -407,7 +407,10 @@ def test_mentions_wake_only_the_mentioned(s):
         other = Bus.register("other")
         other.join(room)
         s.sender.join(room)
-        time.sleep(1.5)  # the CLI took the relay's session over; let it reconnect
+        # The CLI took the relay's session over. The join notices wake the session once the relay is back, and the
+        # quiet window below starts only after their post, however long the reconnect takes.
+        joined = f"[joined #{room}] {s.sender.addr.rsplit('-', 1)[0]}"
+        until(lambda: any(joined in p[1]["message"]["content"] for p in s.inbox.posts), what="the join notices' post")
         before = len(s.inbox.posts)
         s.sender.say(room, f"@{other.addr} just for other")
         time.sleep(2.5)

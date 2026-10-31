@@ -14,8 +14,13 @@ fn main() {
     // A hook must never block or break a session: whatever happens, it exits 0 and says nothing.
     if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
         std::panic::set_hook(Box::new(|_| std::process::exit(0)));
-        if let Ok(cli) = args::Cli::try_parse() {
-            let _ = commands::run(cli.cmd);
+        match args::Cli::try_parse() {
+            Ok(cli) => {
+                let _ = commands::run(cli.cmd);
+            }
+            // asked for by a person, not by Claude Code: the help prints as anywhere else
+            Err(e) if e.kind() == ErrorKind::DisplayHelp => e.exit(),
+            Err(_) => {}
         }
         return;
     }
@@ -29,6 +34,7 @@ fn main() {
         eprintln!("internal error: {}", what.split_whitespace().collect::<Vec<_>>().join(" "));
         std::process::exit(1);
     }));
+    agent_bridge::ledger::cancel_on_signals();
     if let Err(e) = agent_bridge::config::get() {
         eprintln!("{e}");
         std::process::exit(1);

@@ -6,7 +6,8 @@
 use crate::request::{Bad, parse};
 use agent_bridge::json::{Map, dumps, dumps_map, float, loads, now};
 use agent_bridge::ledger::{
-    MAX_LEASES, MAX_LEDGERS, MAX_PENDING, MAX_REQUESTS, MAX_RESOURCES, MAX_WAITERS, random_hex,
+    MAX_LEASES, MAX_LEDGERS, MAX_PENDING, MAX_PENDING_PER_OWNER, MAX_REQUESTS, MAX_RESOURCES, MAX_TTL, MAX_WAIT,
+    MAX_WAITERS, random_hex,
 };
 use agent_bridge::stamp::stamp;
 use agent_bridge::validation::is_ident;
@@ -20,8 +21,12 @@ const MAX_PAYLOAD: usize = 16384;
 const MAX_CORR: usize = 256;
 /// Under config/mosquitto.conf max_packet_size 270000: a bigger publish gets ledgerd disconnected, then resent forever.
 const MAX_REPLY: usize = 240_000;
-/// how long a mutating request's answer is kept to replay to a redelivered copy
+/// how long a mutating request's answer is kept to replay to a redelivered copy, at least; a request whose
+/// MessageExpiryInterval is longer keeps its answer that long, up to MAX_KEEP
 const DEDUPE_S: f64 = 300.0;
+const MAX_KEEP: f64 = MAX_TTL + MAX_WAIT;
+/// A waiter is dropped this long before its client stops listening, so its lease reply still reaches it.
+const REPLY_MARGIN: f64 = 1.0;
 const READ_ONLY: [&str; 4] = ["ledger", "public", "grants", "dump"];
 const WAITER: &str = "SELECT seq, resource, holder, level, topic, ttl, corr FROM waiters";
 
@@ -101,6 +106,13 @@ pub type Outgoing = (String, String, Option<Vec<u8>>);
 
 /// A waiter's seq, its fields, and the CorrelationData to answer it with.
 type Waiter = (i64, Map, Option<Vec<u8>>);
+
+/// Where a request's answer goes, and how long its client listens (the request's remaining MessageExpiryInterval).
+struct Req<'a> {
+    topic: &'a str,
+    corr: &'a [u8],
+    expiry: Option<f64>,
+}
 
 pub struct Ledger {
     db: Connection,
@@ -232,6 +244,7 @@ impl Ledger {
         topic: Option<&str>,
         corr: Option<&[u8]>,
         via: Option<&str>,
+        expiry: Option<u32>,
     ) {
         let Some(topic) = topic.filter(|t| t.strip_prefix("ledger/resp/").is_some_and(|id| is_ident(id, 128))) else {
             return log("dropped request without a ResponseTopic under ledger/resp/");
@@ -241,7 +254,7 @@ impl Ledger {
             publish((topic.to_owned(), dumps(&body), None));
             return;
         };
-        let body = match self.answer(publish, payload, topic, corr, via) {
+        let body = match self.answer(publish, payload, topic, corr, via, expiry.map(f64::from)) {
             Ok(body) => body,
             Err(Fail::Bad(e)) => Some(error(&e)),
             Err(Fail::Internal(e)) => {
@@ -264,6 +277,7 @@ impl Ledger {
         topic: &str,
         corr: &[u8],
         via: Option<&str>,
+        expiry: Option<f64>,
     ) -> Res<Option<Map>> {
         if payload.len() > MAX_PAYLOAD {
             return bad(format!("payload over {MAX_PAYLOAD} bytes"));
@@ -272,17 +286,18 @@ impl Ledger {
             return bad("payload must be UTF-8 JSON");
         };
         let (op, me, args) = parse(&req, via)?;
-        self.run(publish, |l| l.serve(op, &me, &args, topic, corr, payload))
+        let req = Req { topic, corr, expiry };
+        self.run(publish, |l| l.serve(op, &me, &args, &req, payload))
     }
 
     /// dispatch, once: a redelivered copy of a mutating request (ledgerd crashed or reconnected before acking it) gets
     /// the first answer again instead of a second lease or request. The key includes the payload, so a client that
     /// reuses CorrelationData for different requests is not mistaken for a duplicate.
-    fn serve(&mut self, op: &str, me: &str, args: &Map, topic: &str, corr: &[u8], payload: &[u8]) -> Res<Option<Map>> {
+    fn serve(&mut self, op: &str, me: &str, args: &Map, req: &Req, payload: &[u8]) -> Res<Option<Map>> {
         if READ_ONLY.contains(&op) {
-            return self.dispatch(op, me, args, topic, corr);
+            return self.dispatch(op, me, args, req);
         }
-        let key = Sha256::digest([topic.as_bytes(), corr, payload].join(&0u8)).to_vec();
+        let key = Sha256::digest([req.topic.as_bytes(), req.corr, payload].join(&0u8)).to_vec();
         let stored: Option<Option<String>> = self
             .db
             .prepare_cached("SELECT body FROM replies WHERE key=?")?
@@ -292,13 +307,16 @@ impl Ledger {
         if let Some(body) = stored {
             return Ok(body.and_then(|b| loads(b.as_bytes())).and_then(|v| v.as_object().cloned()));
         }
-        let body = self.dispatch(op, me, args, topic, corr)?;
+        let body = self.dispatch(op, me, args, req)?;
         let text = body.as_ref().map(dumps_map);
-        self.exec("INSERT INTO replies VALUES (?, ?, ?)", params![key, text, now()])?;
+        // The broker can redeliver the request until its expiry, so the answer is kept at least that long. Rows are
+        // purged DEDUPE_S after ts, here and in the v0.1.0 rollback alike, so a longer stay moves ts forward.
+        let keep = req.expiry.map_or(DEDUPE_S, |e| e.clamp(DEDUPE_S, MAX_KEEP));
+        self.exec("INSERT INTO replies VALUES (?, ?, ?)", params![key, text, now() + keep - DEDUPE_S])?;
         Ok(body)
     }
 
-    fn dispatch(&mut self, op: &str, me: &str, args: &Map, topic: &str, corr: &[u8]) -> Res<Option<Map>> {
+    fn dispatch(&mut self, op: &str, me: &str, args: &Map, req: &Req) -> Res<Option<Map>> {
         let now = now();
         let body = match op {
             "init" => self.op_init(me, now)?,
@@ -323,13 +341,14 @@ impl Ledger {
                     "grants" => self.op_grants(me)?,
                     "acquire" => {
                         let (res, lvl) = (a("resource").unwrap_or_default(), a("level").unwrap_or_default());
-                        match self.op_acquire(me, now, res, lvl, n("ttl"), n("wait"), topic, corr)? {
+                        match self.op_acquire(me, now, res, lvl, n("ttl"), n("wait"), req)? {
                             Some(body) => body,
                             None => return Ok(None),
                         }
                     }
                     "renew" => self.op_renew(me, now, a("lease_id").unwrap_or_default(), n("ttl"))?,
                     "release" => self.op_release(me, a("lease_id").unwrap_or_default())?,
+                    "cancel" => self.op_cancel(me, req.topic, a("correlation").unwrap_or_default())?,
                     "drop" => {
                         self.drop_ledger(me)?;
                         Map::new()
@@ -457,13 +476,20 @@ impl Ledger {
                 return bad(format!("at most {MAX_REQUESTS} requests per agent"));
             }
         }
-        if !auto
-            && self.count("SELECT count(*) FROM requests WHERE holder=? AND status='pending'", [me])? >= MAX_PENDING
-        {
-            return bad(format!("at most {MAX_PENDING} pending requests per agent"));
+        let owner = s(&res, "owner").to_owned();
+        if !auto {
+            if self.count("SELECT count(*) FROM requests WHERE holder=? AND status='pending'", [me])? >= MAX_PENDING {
+                return bad(format!("at most {MAX_PENDING} pending requests per agent"));
+            }
+            // each pending request DMs the owner, so its inbox is bounded too
+            let waiting = self.count("SELECT count(*) FROM requests WHERE owner=? AND status='pending'", [&owner])?;
+            if waiting >= MAX_PENDING_PER_OWNER {
+                return bad(format!(
+                    "{owner} has {MAX_PENDING_PER_OWNER} pending requests; try again once it has answered some"
+                ));
+            }
         }
         let rq = random_hex(8);
-        let owner = s(&res, "owner").to_owned();
         let status = if auto { "granted" } else { "pending" };
         self.exec(
             "INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -473,44 +499,53 @@ impl Ledger {
             self.notify(
                 &owner,
                 format!(
-                    "{me} requests {lvl} access to {resource} (request_id {rq}); answer with ledger grant or deny \
-                     request_id={rq}"
+                    "{me} requests {lvl} access to {resource} (request_id {rq}); answer with agent-bridge grant \
+                     {owner} {rq} or agent-bridge deny {owner} {rq}"
                 ),
             );
         }
         self.request_body(&rq)
     }
 
-    fn decide(&mut self, me: &str, rq: &str, status: &str) -> Res<Map> {
+    /// The request rq on one of me's resources, set to status; None when it already had that status.
+    fn decide(&mut self, me: &str, rq: &str, status: &str) -> Res<Option<Map>> {
         let Some(row) = self.one("SELECT * FROM requests WHERE id=? AND owner=?", [rq, me])? else {
             return bad(format!("no such request: {rq}"));
         };
-        if s(&row, "status") != status {
-            self.exec("UPDATE requests SET status=?, ts=? WHERE id=?", params![status, now(), rq])?;
-            let text = format!(
-                "{me} {status} your {} request for {} (request_id {rq})",
-                s(&row, "level"),
-                s(&row, "resource")
-            );
-            self.notify(s(&row, "holder"), text);
+        if s(&row, "status") == status {
+            return Ok(None);
         }
-        Ok(row)
+        self.exec("UPDATE requests SET status=?, ts=? WHERE id=?", params![status, now(), rq])?;
+        Ok(Some(row))
     }
 
     fn op_grant(&mut self, me: &str, rq: &str) -> Res<Map> {
-        self.decide(me, rq, "granted")?;
+        if let Some(row) = self.decide(me, rq, "granted")? {
+            let text =
+                format!("{me} granted your {} request for {} (request_id {rq})", s(&row, "level"), s(&row, "resource"));
+            self.notify(s(&row, "holder"), text);
+        }
         self.request_body(rq)
     }
 
     fn op_deny(&mut self, me: &str, rq: &str) -> Res<Map> {
-        let row = self.decide(me, rq, "denied")?;
-        let (holder, resource) = (s(&row, "holder"), s(&row, "resource"));
+        let Some(row) = self.decide(me, rq, "denied")? else { return self.request_body(rq) };
+        let (holder, resource, lvl) = (s(&row, "holder"), s(&row, "resource"), s(&row, "level"));
         let left = self.held(holder, resource)?;
+        let mut ended = Vec::new();
         for lease in self.rows("SELECT * FROM leases WHERE resource=? AND holder=?", [resource, holder])? {
             if level(s(&lease, "level")) > left {
                 self.exec("DELETE FROM leases WHERE id=?", [s(&lease, "id")])?;
+                ended.push(s(&lease, "id").to_owned());
             }
         }
+        let text = if s(&row, "status") == "granted" {
+            let ending = if ended.is_empty() { String::new() } else { format!(", ending lease {}", ended.join(", ")) };
+            format!("{me} revoked your {lvl} grant on {resource} (request_id {rq}){ending}")
+        } else {
+            format!("{me} denied your {lvl} request for {resource} (request_id {rq})")
+        };
+        self.notify(holder, text);
         self.pump(resource)?;
         self.request_body(rq)
     }
@@ -573,8 +608,7 @@ impl Ledger {
         lvl: &str,
         ttl: f64,
         wait: f64,
-        topic: &str,
-        corr: &[u8],
+        req: &Req,
     ) -> Res<Option<Map>> {
         self.resource(resource, None)?;
         if self.held(me, resource)? < level(lvl) {
@@ -586,7 +620,20 @@ impl Ledger {
         if self.one("SELECT 1 FROM waiters WHERE resource=?", [resource])?.is_none() && self.free(resource, lvl)? {
             return Ok(Some(obj(json!({"lease": self.lease(resource, me, lvl, ttl)?}))));
         }
-        if wait == 0.0 {
+        let busy = if lvl == "write" { "" } else { " AND level='write'" };
+        let blocking =
+            self.rows(&format!("SELECT id, holder, level FROM leases WHERE resource=?{busy}"), [resource])?;
+        if !blocking.is_empty() && blocking.iter().all(|l| s(l, "holder") == me) {
+            let mine = &blocking[0];
+            return bad(format!(
+                "you already hold {} lease {} on {resource}; renew it, or release it first",
+                s(mine, "level"),
+                s(mine, "id")
+            ));
+        }
+        // Not past the moment the client stops listening (its request's expiry), or the lease would go to nobody.
+        let wait = req.expiry.map_or(wait, |e| wait.min(e - REPLY_MARGIN));
+        if wait <= 0.0 {
             return Ok(Some(obj(json!({"ok": false, "error": "busy", "holders": self.holders(resource)?}))));
         }
         if self.count("SELECT count(*) FROM waiters WHERE resource=?", [resource])? >= MAX_WAITERS {
@@ -594,14 +641,14 @@ impl Ledger {
         }
         self.exec(
             "INSERT INTO waiters(resource, holder, level, ttl, deadline, topic, corr, queued) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![resource, me, lvl, ttl, now + wait, topic, corr, now],
+            params![resource, me, lvl, ttl, now + wait, req.topic, req.corr, now],
         )?;
         Ok(None)
     }
 
     fn op_renew(&mut self, me: &str, now: f64, lease_id: &str, ttl: f64) -> Res<Map> {
         if self.exec("UPDATE leases SET expires=? WHERE id=? AND holder=?", params![now + ttl, lease_id, me])? == 0 {
-            return bad(format!("no such lease: {lease_id} (it may have expired)"));
+            return self.no_lease(lease_id);
         }
         let row = self.one("SELECT * FROM leases WHERE id=?", [lease_id])?.unwrap_or_default();
         Ok(obj(json!({"lease": lease_view(&row)})))
@@ -609,15 +656,43 @@ impl Ledger {
 
     fn op_release(&mut self, me: &str, lease_id: &str) -> Res<Map> {
         let Some(row) = self.one(
-            "SELECT l.resource FROM leases l JOIN resources r ON r.id=l.resource WHERE l.id=? AND (l.holder=? OR r.owner=?)",
+            "SELECT l.resource, l.holder, l.level FROM leases l JOIN resources r ON r.id=l.resource \
+             WHERE l.id=? AND (l.holder=? OR r.owner=?)",
             [lease_id, me, me],
         )?
         else {
-            return bad(format!("no such lease: {lease_id} (it may have expired)"));
+            return self.no_lease(lease_id);
         };
         self.exec("DELETE FROM leases WHERE id=?", [lease_id])?;
-        self.pump(s(&row, "resource"))?;
+        let (resource, holder) = (s(&row, "resource"), s(&row, "holder"));
+        if holder != me {
+            self.notify(holder, format!("{me} ended your {} lease {lease_id} on {resource}", s(&row, "level")));
+        }
+        self.pump(resource)?;
         Ok(Map::new())
+    }
+
+    /// The refusal for a lease me may not touch: another agent's, or one that is gone.
+    fn no_lease<T>(&self, lease_id: &str) -> Res<T> {
+        match self.one("SELECT holder FROM leases WHERE id=?", [lease_id])? {
+            Some(row) => bad(format!("lease {lease_id} is not yours, {} holds it", s(&row, "holder"))),
+            None => bad(format!("no such lease: {lease_id} (it may have expired)")),
+        }
+    }
+
+    /// Drop me's waiter queued under this ResponseTopic and correlation (hex), so a client that stops waiting is never
+    /// handed a lease. A lease already granted to it went out on topic before this reply, so the client sees it first.
+    fn op_cancel(&mut self, me: &str, topic: &str, correlation: &str) -> Res<Map> {
+        let corr: Vec<u8> = (0..correlation.len() / 2)
+            .filter_map(|i| u8::from_str_radix(&correlation[2 * i..2 * i + 2], 16).ok())
+            .collect();
+        let queued = format!("{WAITER} WHERE holder=? AND topic=? AND corr=?");
+        let mut cancelled = 0;
+        for (seq, w, _) in self.waiters(&queued, params![me, topic, corr])? {
+            cancelled += self.exec("DELETE FROM waiters WHERE seq=?", [seq])?;
+            self.pump(s(&w, "resource"))?;
+        }
+        Ok(obj(json!({"cancelled": cancelled})))
     }
 
     /// The waiters of resource with what answering them needs.
@@ -838,9 +913,27 @@ fn lease_view(row: &Map) -> Map {
 mod tests {
     use super::*;
 
+    /// A temp dir removed when the test ends, a failed one too.
+    struct Dir(std::path::PathBuf);
+
+    impl Dir {
+        fn new(name: &str) -> Dir {
+            Dir(std::env::temp_dir().join(format!("ledgerd-{name}-{}", std::process::id())))
+        }
+        fn join(&self, file: &str) -> std::path::PathBuf {
+            self.0.join(file)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn schema_row_and_dump_names_the_implementation() {
-        let dir = std::env::temp_dir().join(format!("ledgerd-store-{}", std::process::id()));
+        let dir = Dir::new("store");
         let mut ledger = Ledger::open(&dir.join("ledger.db"), 3.0).ok().expect("opens");
         assert_eq!(ledger.count("SELECT value FROM meta WHERE key='schema'", []).ok(), Some(1));
         let dump = ledger.run(&mut |_| {}, |l| l.op_dump(now())).ok().expect("dump");
@@ -848,12 +941,11 @@ mod tests {
         drop(ledger);
         let reopened = Ledger::open(&dir.join("ledger.db"), 3.0).ok().expect("opens");
         assert_eq!(reopened.count("SELECT count(*) FROM meta WHERE key='schema'", []).ok(), Some(1));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_newer_schema_is_refused_before_anything_is_written() {
-        let dir = std::env::temp_dir().join(format!("ledgerd-schema-{}", std::process::id()));
+        let dir = Dir::new("schema");
         let path = dir.join("ledger.db");
         drop(Ledger::open(&path, 3.0).ok().expect("opens"));
         let db = Connection::open(&path).expect("reopens");
@@ -866,6 +958,5 @@ mod tests {
         let db = Connection::open(&path).expect("reopens");
         let index = db.query_row("SELECT count(*) FROM sqlite_master WHERE name='resources_owner'", [], |r| r.get(0));
         assert_eq!(index, Ok(0), "nothing was written");
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

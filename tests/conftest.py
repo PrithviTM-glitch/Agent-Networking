@@ -1,12 +1,14 @@
 """Shared fixtures: a disposable mosquitto in Docker on a free port, a state directory per module, and ledgerd.
 
 One test run at a time per user: a run waits for the lock of any other run on this machine. Test containers carry
-the user's uid as a label; every run removes them on exit, and the next run also removes any a killed run left.
+the user's uid as a label, and a run's temp directory its pid; every run removes both on exit, and the next run also
+removes any a killed run left.
 """
 
 import atexit
 import fcntl
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -59,6 +61,32 @@ def _remove_containers():
         subprocess.run(["docker", "rm", "-f", *ids], capture_output=True)
 
 
+TMP_PREFIX = "agent-bridge-test-"
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # another user's process
+        return True
+    return True
+
+
+def _sweep_stale_dirs(parent=None):
+    """Remove this user's run directories whose run is gone: SIGKILL skips atexit, so the next run cleans up."""
+    for entry in os.scandir(parent or tempfile.gettempdir()):
+        m = re.fullmatch(rf"{TMP_PREFIX}(\d+)-\w+", entry.name)
+        if (
+            m
+            and entry.is_dir(follow_symlinks=False)
+            and entry.stat(follow_symlinks=False).st_uid == os.getuid()
+            and not _alive(int(m[1]))
+        ):
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
 def _one_run_at_a_time(config):
     """Hold this user's test lock for the life of the process, waiting while another run holds it."""
     path = os.path.join(
@@ -85,14 +113,15 @@ def _interrupted(signum, _frame):
 
 def pytest_configure(config):
     _one_run_at_a_time(config)
-    # Holding the lock, any container with our label is left over from a run that was killed.
+    # Holding the lock, any container with our label, or run directory of a dead pid, is left over from a killed run.
     _remove_containers()
+    _sweep_stale_dirs()
     atexit.register(_remove_containers)
     # pytest tears fixtures down on KeyboardInterrupt but not on these, so they become one.
     for signum in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, _interrupted)
     # agent_bridge reads its settings at import, so they are fixed here, before any test module imports it.
-    tmp = tempfile.mkdtemp(prefix="agent-bridge-test-")
+    tmp = tempfile.mkdtemp(prefix=f"{TMP_PREFIX}{os.getpid()}-")
     atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     for name in (
         "CLAUDE_CODE_SESSION_ID",

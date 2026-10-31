@@ -315,7 +315,7 @@ def test_security():
     assert post("/api/broadcast", {"text": "nope"}, token=None)[0] == 401
     assert post("/api/broadcast", {"text": "nope"}, token="wrong")[0] == 401
     assert req("OPTIONS", "/api/broadcast")[0] == 405
-    assert post("/api/broadcast", None, raw=b"text=x", ctype="application/x-www-form-urlencoded")[0] == 400
+    assert post("/api/broadcast", None, raw=b"text=x", ctype="application/x-www-form-urlencoded")[0] == 415
     assert post("/api/broadcast", None, raw=b"[1]")[0] == 400
     assert post("/api/broadcast", None, raw=b"{bad")[0] == 400
     assert post("/api/nope", {"x": 1})[0] == 404
@@ -352,7 +352,13 @@ def test_messaging():
         ("t/x", "admin", "hello topic"),
         ("broadcast", "admin", "everyone stop pushing to main"),
     }, got
-    refused("/api/send", {"kind": "dm", "target": "nobody-1", "text": "x"}, "unknown address")
+    refused("/api/send", {"kind": "dm", "target": "nobody-1", "text": "x"}, "unknown recipient")
+    # C1: an @word that names no member is sent as plain text, and the result says so.
+    j = ok("/api/send", {"kind": "room", "target": "ops", "text": "ask @nobody-x or someone@example.com"})
+    assert j["result"] == "sent; @nobody-x matches no member of #ops, so it mentions nobody", j
+    # Q13: the reason for a wrong content type, not the generic one.
+    code, j = req("POST", "/api/send", {"kind": "room", "target": "ops", "text": "x"}, ctype="text/plain")
+    assert code == 415 and "Content-Type: application/json" in j["error"], (code, j)
     refused("/api/send", {"kind": "room", "target": "bad room", "text": "x"}, "bad room")
     refused("/api/send", {"kind": "topic", "target": "agents/x", "text": "x"}, "reserved")
     refused("/api/send", {"kind": "topic", "target": "broadcast", "text": "x"}, "reserved")
@@ -462,7 +468,8 @@ def test_agents():
     assert wait_for(lambda: agent("other-1")["friendly"] == "login-fix · Add a dark theme to the")
     d = wait_for(lambda: (x := agent("desk-1")) and x["kind"] == "desktop" and x)
     assert d["alive"] is True and d["friendly"] == "desktop task", d
-    assert agent("reuse-1")["alive"] is False and agent("plain-1")["alive"] is False
+    # plain-1 names no session: since 0.2.1 its pid is not taken as its process (C10, Q6), so liveness is unknown.
+    assert agent("reuse-1")["alive"] is False and agent("plain-1")["alive"] is None
     assert agent("bob-1")["alive"] is None and agent("bob-1")["friendly"] == "bob-1"
     adm = agent("admin")
     assert adm["pid"] is None and adm["alive"] is None, adm
@@ -489,7 +496,7 @@ def test_agents():
     assert req("GET", "/api/agent?addr=nobody-1")[0] == 400 and req("GET", "/api/agent?addr=%3Cx%3E")[0] == 400
 
     refused("/api/signal", {"addr": "reuse-1", "signal": "kill"}, "is dead")
-    refused("/api/signal", {"addr": "plain-1", "signal": "kill"}, "is dead")
+    refused("/api/signal", {"addr": "plain-1", "signal": "kill"}, "not a claude session")
     refused("/api/signal", {"addr": "bob-1", "signal": "kill"}, "not a claude session")
     refused("/api/signal", {"addr": "cli-1", "signal": "hup"}, "signal must be")
     time.sleep(0.2)
@@ -511,7 +518,7 @@ def test_agents():
     assert wait_for(lambda: agent("desk-1")["alive"] is False)
     refused("/api/restart/terminal", {"addr": "desk-1"}, "reopen it in the Claude Desktop app")
     refused("/api/restart/resume", {"addr": "desk-1", "text": "hi"}, "reopen it in the Claude Desktop app")
-    refused("/api/restart/terminal", {"addr": "plain-1"}, "unknown")
+    refused("/api/restart/terminal", {"addr": "plain-1"}, "not a claude session")
     refused("/api/restart/terminal", {"addr": "bob-1"}, "not a claude session")
 
     ok("/api/restart/terminal", {"addr": "cli-1"})
@@ -876,7 +883,7 @@ def test_room_kill():
         ("red2:sub-2", "subagent stopped"),
         ("room:red", "terminate: 1 session, 3 subagent, 2 unverifiable"),
         ("room:red", "kill, whole sessions too: 1 session, 1 unverifiable"),
-        ("red", "refused: type the room name"),
+        ("room:red", "refused: type the room name"),
         (None, "refused: bad Origin"),
     ]:
         assert any(t == target and r.startswith(result) for t, r in kills), (target, result, kills)
@@ -894,8 +901,10 @@ def test_admin_mentions():
     ok("/api/send", {"kind": "room", "target": "men", "text": "@men-a1b2c3 please look"})
     got = wait_for(lambda: [m for m in seen if m["body"] == "@men-a1b2c3 please look"])
     assert got and got[0]["from"] == "admin" and got[0]["mentions"] == ["men-a1b2c3"], got
-    code, j = post("/api/send", {"kind": "room", "target": "men", "text": "@nobody-zzz9 hello"})
-    assert code == 400, j
+    # C1: an unknown @word no longer refuses the post; it goes out as plain text and the result says so.
+    j = ok("/api/send", {"kind": "room", "target": "men", "text": "@nobody-zzz9 hello"})
+    assert j["result"] == "sent; @nobody-zzz9 matches no member of #men, so it mentions nobody", j
+    assert wait_for(lambda: [m for m in seen if m["body"] == "@nobody-zzz9 hello" and not m.get("mentions")])
     shown = [m for m in req("GET", "/api/state")[1]["messages"] if m["body"] == "@men-a1b2c3 please look"]
     assert shown and shown[0]["mentions"] == ["men-a1b2c3"], shown
     w.disconnect()
@@ -1076,11 +1085,19 @@ def test_audit_filters():
     assert recent and all(e["action"] == "room/kill" for e in recent)
     assert req("GET", "/api/audit?since=yesterday")[0] == 400
     assert req("GET", "/api/audit", token=None)[0] == 401
+    ops = req("GET", "/api/audit?action=send&target=room:ops")[1]["entries"]
+    assert any(e["result"] == "sent" for e in ops) and any(e["result"].startswith("refused: ") for e in ops), ops
+    dms = req("GET", "/api/audit?action=send&target=dm:nobody-1")[1]["entries"]
+    assert dms and all(e["result"].startswith("refused: unknown recipient") for e in dms), dms
+    # Q13: an empty query value is shown as the empty string it is, not as None.
+    code, j = req("GET", "/api/agent?addr=")
+    assert code == 400 and "bad address ''" in j["error"], j
 
 
 def scraped(name):
-    """The console's current /metrics samples for name, as label dicts with the value under "="."""
-    return [labels | {"=": value} for labels, value in series(scrape()[2]).get(name, [])]
+    """The console's current /metrics samples for name, as label dicts with the value under "=", names included."""
+    named = {"Authorization": f"Bearer {state['token']}"}
+    return [labels | {"=": value} for labels, value in series(scrape(headers=named)[2]).get(name, [])]
 
 
 def test_usage():
@@ -1135,7 +1152,7 @@ SAMPLE = re.compile(r'([a-z_]+)(\{(?:[a-z_]+="(?:[^"\\]|\\.)*",?)*\})? (-?[0-9.e
 
 def scrape(**kw):
     c = http.client.HTTPConnection("127.0.0.1", kw.pop("port", WEB), timeout=30)
-    c.request("GET", "/metrics", headers={"Host": kw.pop("host", HOST)})
+    c.request("GET", "/metrics", headers={"Host": kw.pop("host", HOST), **kw.pop("headers", {})})
     r = c.getresponse()
     return r.status, r.getheader("Content-Type"), r.read().decode()
 
@@ -1173,6 +1190,14 @@ def test_metrics():
     sids = [lab["session_id"] for lab, _ in s["agent_bridge_session"]]
     assert len(sids) == len(set(sids)), "one agent_bridge_session series per session"
     assert "hello room" not in text and "please look" not in text, "no message text in metrics"
+    named = ("agent_bridge_agent", "agent_bridge_membership", "agent_bridge_session")
+    assert not any("name" in lab for n in named for lab, _ in s.get(n, [])), "names only with the token"
+    with_token = series(scrape(headers={"X-Admin-Token": state["token"]})[2])
+    assert any(lab.get("name") for lab, _ in with_token["agent_bridge_agent"]), "the token brings the names back"
+    assert scrape(headers={"Authorization": "Bearer wrong"})[0] == 200, "a wrong token only means no names"
+    assert not any(
+        "name" in lab for lab, _ in series(scrape(headers={"Authorization": "Bearer x"})[2])["agent_bridge_agent"]
+    )
     assert not any(k.startswith("claude_code") for k in s), "Claude's own metrics are not re-exported"
 
 
@@ -1232,7 +1257,8 @@ def test_admin_cli():
     assert "paho" not in imports and "agent_bridge.bus" not in imports, "the CLI must never open a bus of its own"
 
     [st] = cli_ok("status")
-    assert st["connected"] is True and st["on_bus"] >= 3 and st["sessions"] >= st["on_bus"], st
+    assert st["connected"] is True and st["on_bus"] >= 3 and st["entries"] >= st["on_bus"], st
+    assert st["sessions"] <= st["entries"] and "dropped" in st, st
     addrs = {a["addr"] for a in cli_ok("agents")}
     assert {"admin", "bob-1"} <= addrs, addrs
     seen = []
@@ -1261,7 +1287,7 @@ def test_admin_cli():
     assert info["mode"] == "announce" and info["moderators"] == ["cli-mod-a1b2c3"] and info["muted"] == ["cli-sub"], (
         info
     )
-    assert sorted(info["members"]) == ["cli-mod-a1b2c3", "cli-sub"], info
+    assert info["who"] == ["cli-mod-a1b2c3", "cli-sub"] and info["members"] == 2, info
     cli_ok("unmute", "cli-room", "cli-sub")
     assert any(r["room"] == "cli-room" and r["mode"] == "announce" for r in cli_ok("rooms"))
 
@@ -1291,9 +1317,24 @@ def test_admin_cli():
         and any(e["target"] == "cli-room:cli-sub" for e in kills)
     )
     assert cli_ok("audit", "--since", str(time.time() + 100)) == []
+    assert cli_ok("audit", "--action", "kill-room", "--since", "10m") == kills, "command names alias the action"
+    muted = cli_ok("audit", "--action", "mute", "--target", "cli-room:cli-sub")
+    assert muted and {e["action"] for e in muted} == {"room/member"}, muted
+    for bad, want in (
+        (["--action", "nope"], "no audit action 'nope'"),
+        (["--last", "0"], "must be a positive whole number"),
+        (["--since", "-5"], "bad time '-5'"),
+    ):
+        code, _, err = admin_cli("audit", *bad)
+        assert code == 1 and want in err, (bad, err)
+    h = subprocess.run(
+        [sys.executable, "-m", "agent_bridge.console.cli", "audit", "--help"], capture_output=True, text=True
+    )
+    assert h.returncode == 0 and "room/member" in h.stdout and "room:ops" in h.stdout, h.stdout
     [machine, *_] = cli_ok("capacity")
     assert machine["machine"]["cpus"] >= 1
-    assert "busy" in cli_ok("leftovers")[0]
+    assert {"busy", "containers", "processes"} <= set(cli_ok("leftovers")[0])
+    assert all(isinstance(r["members"], int) and len(r["who"]) == r["members"] for r in cli_ok("rooms"))
     code, text, _ = admin_cli("metrics")
     assert code == 0 and "agent_bridge_console_uptime_seconds" in text
 
@@ -1302,7 +1343,7 @@ def test_admin_cli():
     assert code == 1 and out == [] and err.strip().startswith("bad room") and err.count("\n") == 1, err
     code, _, err = admin_cli("status", port=free_port())
     assert code == 1 and "no admin console on 127.0.0.1:" in err and "agent-bridge-console" in err, err
-    code, _, err = admin_cli("status", home=tempfile.mkdtemp())
+    code, _, err = admin_cli("status", home=os.path.join(TMP, "no-home"))
     assert code == 1 and "no admin token at" in err, err
     code, _, err = admin_cli("audit", "--since", "yesterday")
     assert code == 1 and "bad time" in err, err
@@ -1342,6 +1383,61 @@ def test_audits():
             for e in log
         ), (action, target, result)
     print("audit ok")
+
+
+def test_sessionless_agent_owns_no_process():
+    """An agent with no session and no parent owns no Claude process, whatever pid its record carries (records written
+    before 0.2.1 kept the registering shell's claude): the page shows no process or liveness, and Capacity skips it."""
+    with open("/proc/self/stat") as f:
+        start = int(f.read().rsplit(")", 1)[1].split()[19])
+    presence("lone-a1b2c3", pid=os.getpid(), pid_start=start)
+    assert wait_for(lambda: agent("lone-a1b2c3"))
+    v = req("GET", "/api/agent?addr=lone-a1b2c3")[1]["agent"]
+    assert v["pid"] is None and v["alive"] is None, v
+
+
+def test_token_dir_tightened(monkeypatch, tmp_path):
+    from agent_bridge.console import auth
+
+    cfg = tmp_path / "agent-bridge"
+    cfg.mkdir()
+    os.chmod(cfg, 0o755)
+    monkeypatch.setattr(auth, "CONFIG", str(cfg))
+    monkeypatch.setattr(auth, "TOKEN_FILE", str(cfg / "admin-token"))
+    assert auth.load_token()
+    assert stat.S_IMODE(os.stat(cfg).st_mode) == 0o700, "an existing token directory is tightened on start"
+    assert stat.S_IMODE(os.stat(cfg / "admin-token").st_mode) == 0o600
+
+
+def test_dropped_counter(monkeypatch):
+    """mosquitto's dropped-publish count reaches the page as it changes, and only then."""
+    from agent_bridge.console import admin, events
+
+    pushed = []
+    monkeypatch.setattr(events, "push", pushed.append)
+    monkeypatch.setattr(admin, "broker", {})
+    assert admin.dropped() is None
+    for text in ("3", "3", "5"):
+        admin._dispatch("sys", admin.DROPPED, text)
+    assert admin.dropped() == 5 and pushed == [{"kind": "broker", "dropped": 3}, {"kind": "broker", "dropped": 5}]
+
+
+def test_leftovers_skip_a_running_stack(monkeypatch):
+    """A temp-log service whose broker is up and is not a test broker is a stack in use, not a leftover."""
+    from agent_bridge.console import leaks, processes
+
+    procs = {4242: {"uid": os.getuid(), "comm": "agent-bridge-hi", "argv": ["/x/agent-bridge-historyd"], "ppid": 1}}
+    procs[4242] |= {"start": 7, "rss": 1}
+    env = {"AGENT_BRIDGE_LOG": os.path.join(tempfile.gettempdir(), "qa", "history.jsonl"), "AGENT_BRIDGE_PORT": "18999"}
+    up = {"v": True}
+    monkeypatch.setattr(processes, "lineage", lambda pid=None: set())
+    monkeypatch.setattr(processes, "session_names", lambda: set())
+    monkeypatch.setattr(leaks, "_environ", lambda pid: env)
+    monkeypatch.setattr(leaks, "_listening", lambda port: up["v"])
+    assert leaks.orphans(procs, {}, frozenset()) == [], "its broker is up and is no test broker"
+    assert [o["pid"] for o in leaks.orphans(procs, {}, frozenset({18999}))] == [4242], "its broker is a test leftover"
+    up["v"] = False
+    assert [o["pid"] for o in leaks.orphans(procs, {}, frozenset())] == [4242], "its broker is gone"
 
 
 def test_ledger_no_reply_wording(monkeypatch):

@@ -50,6 +50,7 @@ def state(_query):
         "jobs": processes.job_list(),
         "connected": admin.held["bus"] is not None,
         "rooms": admin.settings,
+        "broker": {"dropped": admin.dropped()},
     }
 
 
@@ -93,9 +94,11 @@ class Handler(BaseHTTPRequestHandler):
         if not auth.host_ok(self.headers):
             return self.send_error(403)
         if url.path == "/metrics":
-            # Read-only and loopback-only like the page itself, so a scraper needs no token.
+            # Read-only and loopback-only like the page itself, so a scraper needs no token; session and agent names
+            # (titles, branches) only go to one that sends it.
+            names = auth.scraper_ok(self.headers, self.token)
             return self.reply(
-                200, metrics.exposition(metrics.collect()).encode(), "text/plain; version=0.0.4; charset=utf-8"
+                200, metrics.exposition(metrics.collect(names)).encode(), "text/plain; version=0.0.4; charset=utf-8"
             )
         if url.path in STATIC and self.headless:
             return self.json(404, {"error": "headless console: no web page, use the API or agent-bridge-admin"})
@@ -105,7 +108,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, f.read(), f"{ctype}; charset=utf-8")
         if not auth.token_ok(self.headers, self.token):
             return self.json(401, {"error": "admin token required"})
-        query = {k: v[0] for k, v in parse_qs(url.query).items()}
+        query = {k: v[0] for k, v in parse_qs(url.query, keep_blank_values=True).items()}
         try:
             if url.path == "/api/stream":
                 return self.stream()
@@ -127,18 +130,18 @@ class Handler(BaseHTTPRequestHandler):
         if not auth.token_ok(self.headers, self.token):
             actions.audit("unknown", peer, action, None, "refused: bad admin token")
             return self.json(401, {"error": "admin token required"})
+        if self.headers.get_content_type() != "application/json":
+            return self.json(415, {"error": "send Content-Type: application/json"})
         try:
             size = int(self.headers.get("Content-Length", ""))
-            if not 0 < size <= REQUEST_MAX or self.headers.get_content_type() != "application/json":
+            if not 0 < size <= REQUEST_MAX:
                 raise ValueError
             body = json.loads(self.rfile.read(size))
             if not isinstance(body, dict):
                 raise ValueError
         except (ValueError, RecursionError):
             return self.json(400, {"error": f"send a JSON object of at most {REQUEST_MAX} bytes"})
-        keys = ("addr", "session", "target", "room", "lease_id", "request_id")
-        target = next((body[k] for k in keys if k in body), None)
-        target = target[:200] if isinstance(target, str) else None
+        target = actions.request_target(self.path, body)
         try:
             target, result, *extra = actions.ROUTES[self.path](body, peer)
         except ERRORS as e:

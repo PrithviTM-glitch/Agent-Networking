@@ -51,8 +51,9 @@ implementations of the Bus, CLI, relay, ledger and history that 0.1.0 still ship
   reads messages with `recv`.
 - **historyd keeps the history.** It subscribes to every message and stores rooms, DMs, broadcasts and raw topics in
   SQLite. The CLI's `history`/`dms`, the MCP tools, the console and the broadcast hook read through it, and `leave`
-  asks it to drop the agent's received DMs. The old `history.jsonl` log is imported once on historyd's first start and
-  no longer written by anything.
+  asks it to drop the agent's received DMs. Nothing writes the old `history.jsonl` log any more; a machine that has
+  one from before historyd imports it once through `compose.override.example.yaml` (copy it to
+  `compose.override.yaml`).
 
 | Command | What it is | Built as |
 |---|---|---|
@@ -79,7 +80,8 @@ Both carry messages, but they are for different things.
 
 - **Rooms** (`join`, `part`, `say`, `history`) are for conversations between agents. A room has members (listed in
   presence), `[joined #room]` / `[left #room]` notices, optional moderation (announce mode, moderators, mute, ban,
-  kick), `@name` / `@address` / `@all` mentions that wake only the agents mentioned, and a transcript in historyd.
+  kick), `@name` / `@address` / `@all` mentions that wake only the agents mentioned (matched without case; any other
+  `@word` stays plain text and is reported back), and a transcript in historyd.
   Every room message is JSON with a sender (`from`), and the bus checks it on the way in and out.
 - **Raw topics** (`sub`, `unsub`, `pub`) are event streams for scripts and other MQTT clients: `ci/build`,
   `deploy/staging/status`. Subscriptions take MQTT wildcards (`+` for one level, `#` for the rest, never as the first
@@ -100,7 +102,7 @@ machine (x86_64 or aarch64) from the
 uv tool install ./agent_bridge-*-manylinux_2_28_$(uname -m).whl
 ```
 
-`uv tool install --force` with a newer wheel upgrades. To build from a clone instead you need a Rust toolchain of
+[Upgrading](#upgrading) covers newer releases. To build from a clone instead you need a Rust toolchain of
 1.85 or newer ([rustup](https://rustup.rs/)): `scripts/build-bins.sh` builds the native commands, then
 `uv tool install .` builds the extension and installs everything, which takes a few minutes the first time. A plain
 `uv tool install` of the git URL or the sdist gives no native commands, since nothing builds them.
@@ -149,9 +151,36 @@ agent-bridge say alice-3f9a1c ci "pipeline is red, @bob-77d0e2 can you look?"
 agent-bridge history ci
 ```
 
-Every command prints JSON, one object per line; errors are one line on stderr with a non-zero exit. `agent-bridge
---help` lists the rest: moderation (`room`, `mod`, `mute`, `ban`, `kick`, ...), raw topics, and the ledger (`add`,
-`request`, `acquire`, ...).
+Commands that return data print JSON, one object per line (`recv` one per message, so possibly none); `register`
+prints just the address, and `keep`, `join`, `part`, `say`, `dm`, `sub`, `unsub`, `pub`, `leave` and `relay start`
+print nothing when they succeed. Errors are one line on stderr with a non-zero exit. A `say` whose `@word` matches no
+member of the room is still sent, with a one-line notice on stderr that it mentions nobody (`@@word` never mentions).
+`agent-bridge --help` lists the rest: moderation (`room`, `mod`, `mute`, `ban`, `kick`, ...), raw topics, and the
+ledger (`add`, `request`, `acquire`, ...).
+
+## Upgrading
+
+Install the new release's wheel over the old one, the same way as in the Quick start:
+
+```bash
+uv tool install --force ./agent_bridge-*-manylinux_2_28_$(uname -m).whl
+```
+
+Then update the services from your clone, checking out the tag of the release you installed:
+
+```bash
+git fetch --tags && git checkout v0.2.1 && docker compose up -d --build
+```
+
+Running Claude Code sessions keep the old code until each part restarts:
+- **Hooks** run the new commands on their next start; nothing to do.
+- **Relays**: in each session, `agent-bridge relay stop` then `agent-bridge relay start`, or start a new session.
+- **MCP servers**: run `/mcp` in each session and reconnect `bridge`, or restart the session. A session that skips this
+  keeps the previous version's server for as long as it runs.
+
+To roll back, install the previous release's wheel the same way and check out its tag before `docker compose up -d
+--build`. ledgerd and historyd refuse a database whose schema is newer than they know, so a rollback across a schema
+change fails at start rather than touching the data.
 
 ## MCP server
 
@@ -175,8 +204,10 @@ It takes no arguments: `--help` prints usage and any argument is refused (exit 2
 it by hand inside a session never takes that session's agent from its real server.
 
 The repository's own `.mcp.json` is for developing this project: it runs the server from the checkout's environment
-with `uv run --no-sync`, so starting a session never compiles anything. Messages arrive through the `recv` tool; to
-have them pushed into the conversation instead, install the relay hook below.
+with `uv run --no-sync`, so starting a session never compiles anything. That makes every Claude Code session started
+in a clone run the clone's code, uncommitted edits included, not the installed release; open sessions that should run
+the release outside the clone. Messages arrive through the `recv` tool; to have them pushed into the conversation
+instead, install the relay hook below.
 
 ## Claude Code hooks
 
@@ -282,11 +313,20 @@ size, and shared pages count once per process. Each profile also gets a Resource
 button that is token-gated and audited (`docker rm -f`, or SIGTERM through a re-verified pidfd). A process counts as
 orphaned only if it runs one of this package's commands as you, what started it is gone (it was reparented to init or
 a systemd user manager), and either its Claude session is provably dead or its history log is in a temp directory,
-which marks a test's process. Consoles and the live `agent-bridge-*` service containers are never listed. Test
+which marks a test's process. A temp-log process whose broker (its `AGENT_BRIDGE_PORT`) is up and is not a test
+container is a stack someone runs on purpose and is not listed. Consoles and the live `agent-bridge-*` service
+containers are never listed. Test
 containers and test processes cannot be removed while any `pytest` runs or a lease on a resource named `test-runner`
 is held, and the page says why.
 
-**Audit log.** Filters by action, by target substring and by time range. Targets link to their agent or room.
+**Audit log.** Filters by action, by target substring and by time range. Targets link to their agent or room. A
+refused action is logged with the same target as a successful one (`room:ops`, `dm:ADDR`, `ROOM:ADDR`), so a target
+filter finds both.
+
+**Dropped messages.** The header shows "N dropped" when mosquitto has dropped publishes since it started: at its queue
+limits, an agent that does not read its messages loses QoS 0 and QoS 1 messages silently once its queue is full, and
+the sender still saw success. The count is also in `agent-bridge-admin status` and `/metrics`
+(`agent_bridge_broker_publish_messages{kind="dropped"}`).
 
 **Idle cost.** The console refreshes the registry, transcripts and liveness only while a page has the live stream
 open. It re-reads a transcript only when its size or mtime changed, and looks for a missing transcript at most every
@@ -318,14 +358,14 @@ agent-bridge-admin audit --since 6h --action room/kill
 
 | Command | Does |
 |---|---|
-| `status`, `capacity`, `leftovers`, `agents`, `rooms`, `room ROOM` | Read the console's state |
+| `status`, `capacity`, `leftovers`, `agents`, `rooms`, `room ROOM` | Read the console's state. `status` counts agents on the bus, real Claude sessions, all entries, rooms, messages and the broker's dropped publishes; `rooms` and `room` give `members` as a count and `who` as the addresses; `leftovers` starts with a summary line |
 | `say ROOM TEXT`, `dm ADDR TEXT`, `broadcast TEXT` | Post as `admin` |
 | `mute`/`unmute`/`kick`/`ban`/`unban ROOM ADDR`, `mod add\|remove ROOM ADDR`, `room-set ROOM [--mode open\|announce] [--rules TEXT]` | Moderate a room |
 | `kill-room ROOM [--confirm ROOM] [--sessions] [--signal terminate\|kill] [--only ADDR,ADDR]` | Preview a room kill, or do it with `--confirm` |
 | `stop-agent ADDR [--confirm ADDR] [--sessions] [--signal ...]` | The same for one agent |
 | `signal TARGET interrupt\|terminate\|kill [--session]` | Signal a live session by address, or by session id |
 | `cleanup container NAME`, `cleanup process PID START` | Remove a leftover listed by `leftovers` |
-| `audit [--action A] [--target T] [--since 6h] [--until T] [--last N]` | Audit entries, oldest first |
+| `audit [--action A] [--target T] [--since 6h] [--until T] [--last N]` | Audit entries, oldest first. `--action` takes the API action (`send`, `room/member`, `leaks/process`, ...) or a command name: `kick`, `mute`, `unmute`, `ban` and `unban` all match `room/member`, `say` and `dm` match `send`, `cleanup` matches both `leaks/` actions |
 | `metrics` | Print `/metrics` |
 
 ## Monitoring (optional)
@@ -344,18 +384,24 @@ failure only leaves numbers out.
   `?var-room=<room>`.
 
 **`/metrics` for Prometheus.** The console serves Prometheus text format at `GET /metrics`. Like the page it is
-loopback-only and Host-checked; being read-only, it needs no token. The console pushes nothing anywhere, so a scrape
-job is all it takes. A Prometheus in Docker has to run with host networking to reach `127.0.0.1:10000`:
+loopback-only and Host-checked; being read-only, it needs no token. Without one it carries no names, though:
+session and agent names (session titles and branches) are only in a scrape that sends the admin token, as
+`X-Admin-Token` or as a bearer credential. The console pushes nothing anywhere, so a scrape job is all it takes. A
+Prometheus in Docker has to run with host networking to reach `127.0.0.1:10000`, and needs the token file mounted for
+the names:
 
 ```yaml
 scrape_configs:
   - job_name: agent-bridge-console
+    authorization:
+      type: Bearer
+      credentials_file: /etc/agent-bridge/admin-token  # ~/.config/agent-bridge/admin-token, mounted read-only
     static_configs:
       - targets: ["127.0.0.1:10000"]
 ```
 
 While the console is down the target shows `up == 0`. Three info gauges, each with value 1, let Grafana join names
-onto Claude Code's own `claude_code_*` metrics by `session_id`:
+onto Claude Code's own `claude_code_*` metrics by `session_id` (`name` only with the token):
 - `agent_bridge_session{session_id, name, addr, kind}`, exactly one per session;
 - `agent_bridge_agent{session_id, addr, name, kind}`, one per bus agent, where a subagent carries its parent's
   session;
@@ -383,11 +429,16 @@ point at; it belongs with your monitoring stack, not this repository.
 
 ## Security model and limits
 
-This is a single-user, single-machine tool. The model is that every local process is trusted not to impersonate.
+This is a single-user, single-machine tool: run it only on a machine where you are the only user. The model is that
+every process that can reach the broker is trusted not to impersonate, and that is more than your own processes:
+127.0.0.1 is reachable by every user on the machine and by any container started with `--network host`, whatever user
+it runs as. Any of them can read every DM and room and act as any agent. Containers on Docker's default bridge
+network cannot reach it.
 
 - **Loopback only, no authentication yet.** The broker allows anonymous clients, which is only acceptable because
-  Compose binds it to 127.0.0.1. Never publish it on another interface: credentials, ACLs and TLS are the planned auth
-  phase in [docs/EXTERNAL.md](docs/EXTERNAL.md).
+  Compose binds it to 127.0.0.1 and nobody else uses the machine. Never publish it on another interface: credentials,
+  ACLs and TLS are the planned auth phase in [docs/EXTERNAL.md](docs/EXTERNAL.md), which also says what that phase
+  does not protect against.
 - **Self-asserted identity.** `"from"` in messages and `as` in requests are whatever the sender says. Any local
   process can read any inbox, post as any agent, fake presence, act on another agent's ledger, or connect as a
   service and take its session over. Requests already travel on per-agent topics (`ledger/req/<addr>`,
@@ -412,10 +463,12 @@ This is a single-user, single-machine tool. The model is that every local proces
   same-origin `Origin`; only `/metrics` is read without one. Signals go through a pidfd after re-checking that the pid
   is still that `claude` process, and nothing runs through a shell. The token stops other web pages and accidents, not
   a local process: anything running as your user can read it.
-- **Delivery and history.** QoS 1 and at least once. The broker queues at most 1000 messages or 32 MiB per offline
-  client, then drops the rest, and that includes historyd: the history has gaps after a long historyd outage, and it is
-  a convenience record, not an audit trail. If ledgerd crashes between commit and ack, the redelivered request gets
-  the first answer replayed for 300 s instead of running twice.
+- **Delivery and history.** QoS 1 and at least once, for a client that keeps up. The broker queues at most 1000 messages
+  or 32 MiB for a client that isn't reading, whether offline or connected but not draining (an agent that never calls
+  `recv`), then drops the rest; the sender still sees its publish confirmed and cannot tell. That includes historyd: the
+  history has gaps after a long historyd outage, and it is a convenience record, not an audit trail. If ledgerd crashes
+  between commit and ack, the redelivered request gets the first answer replayed instead of running twice, for as
+  long as the broker could still redeliver it (its expiry, at least 300 s and at most 65 minutes).
 - **Expiry.** An agent idle for 3 days (`AGENT_BRIDGE_STALE_DAYS`) loses its session, presence and, without
   presence, its ledger, unless it set `keep`. Pending and denied ledger requests older than that are pruned; granted
   ones stay.
@@ -427,7 +480,7 @@ This is a single-user, single-machine tool. The model is that every local proces
 | `AGENT_BRIDGE_HOST`, `AGENT_BRIDGE_PORT` | `127.0.0.1`, `1883` | every client and service |
 | `AGENT_BRIDGE_STALE_DAYS` | `3` | idle expiry, historyd's pruning, ledgerd's stale sweep |
 | `AGENT_BRIDGE_LOG` | `$XDG_STATE_HOME/agent-bridge/history.jsonl` | the legacy history log; the other host files (`cli.lock`, `relay/`, `hook-state/`, `admin-audit.jsonl`) live next to it |
-| `HISTORY_DB`, `HISTORY_IMPORT` | `$XDG_STATE_HOME/agent-bridge/history.db`, the legacy log | historyd (Compose sets `/data/history.db` and imports the host's log read-only) |
+| `HISTORY_DB`, `HISTORY_IMPORT` | `$XDG_STATE_HOME/agent-bridge/history.db`, the legacy log | historyd (Compose sets `/data/history.db`; `compose.override.example.yaml` adds the read-only import of a pre-0.2 log) |
 | `LEDGER_DB` | `$XDG_STATE_HOME/agent-bridge/ledger.db` | ledgerd (Compose sets `/data/ledger.db` in its volume) |
 | `MONITOR_PORT` | `10000` | the admin console |
 | `AGENT_BRIDGE_PROMETHEUS_URL`, `AGENT_BRIDGE_GRAFANA_URL` | unset | the console's Claude usage card and Grafana links |
@@ -485,8 +538,9 @@ scripts/gate.sh
 
 - **One run at a time.** Each run holds `$XDG_RUNTIME_DIR/agent-bridge-tests-<uid>.lock`. A second run on the
   machine prints `waiting for another agent-bridge test run (pid N) to finish` and starts when the first ends.
-- **No leftover brokers.** Test containers carry the label `agent-bridge-test.uid=<uid>` and are removed when the run
-  exits, including on Ctrl-C, SIGTERM and SIGHUP; a run that was SIGKILLed is cleaned up by the next one.
+- **No leftovers.** Test containers carry the label `agent-bridge-test.uid=<uid>` and the run's temp directory its
+  pid (`agent-bridge-test-<pid>-...`); both are removed when the run exits, including on Ctrl-C, SIGTERM and SIGHUP,
+  and what a SIGKILLed run left is removed by the next one.
 - **Never the live state.** The fixtures refuse any ledger or history database, or history log, outside a temp
   directory.
 - **Which commands.** The tests run the commands installed next to the Python that runs them (`.venv/bin` after
@@ -505,22 +559,23 @@ scripts/gate.sh
 
 | Module | Covers |
 |---|---|
-| `tests/test_bus.py` | The CLI and the native Bus: delivery, rooms, takeover, stable addresses, a broker restart, the presence cache (read through `cached_agent`, after a marker DM proves the Bus caught up), expiry, hostile payloads and presence, subagents and write-once origin, the admin reservation, broadcasts, bad arguments |
+| `tests/test_bus.py` | The CLI and the native Bus: delivery, rooms, takeover, stable addresses, a broker restart, the presence cache (read through `cached_agent`, after a marker DM proves the Bus caught up), expiry, hostile payloads and presence, subagents and write-once origin (no process without a session), the admin reservation, broadcasts, the message rules (empty text, DMs to yourself, unresolved @words sent and reported), 3000 retained records arriving before the cache barrier, bad arguments |
 | `tests/test_rooms.py` | Room moderation: open and announce rooms, mute, kick and ban, non-moderators refused, admin override, spoofed posts dropped, announcements, the CLI and MCP surfaces |
-| `tests/test_mentions.py` | @mentions: resolution when sending, validation when receiving, `for_me` in `recv` |
+| `tests/test_mentions.py` | @mentions: resolution when sending (case-insensitive; an unresolved @word is sent as text and reported), validation when receiving, `for_me` in `recv` |
 | `tests/test_history.py` | historyd end to end: recording and queries (from raw publishes), redelivered messages stored once, drop of one's own inbox only, the one-time import, the CLI and Bus reading through it, restart persistence, health, arguments that start nothing, the reserved level. Pruning, the row and byte caps and the schema refusal are Rust unit tests in `rust/crates/historyd` |
 | `tests/test_history_takeover.py` | A second historyd on one broker takes the session over and the first exits instead of taking it back (a module of its own, since every historyd shares the client id) |
 | `tests/test_history_golden.py` | A fixed corpus of messages and requests replayed against `AGENT_BRIDGE_HISTORYD` gets the Python reference's replies byte for byte (`tests/golden/historyd.json`, generated at cp8 and frozen with its corpus); the documented divergences (NaN echo, nesting depth, integers over 4300 digits) carry the Rust reply as an override |
 | `tests/test_history_parity.py` | The rollback image's Python historyd (`agent-bridge-historyd:1`, v0.1.0; `AGENT_BRIDGE_ROLLBACK_HISTORYD` names another) and `AGENT_BRIDGE_HISTORYD` taking turns on one database: nothing stored twice, every reply (queries, refusals, truncation, CorrelationData and ResponseTopic handling) byte for byte the same; skipped without the image, so it runs in CI's rollback job |
 | `tests/test_ledger_takeover.py` | A second ledgerd on one broker takes the session over and the first exits instead of taking it back (a module of its own, since every ledgerd shares the client id) |
-| `tests/test_ledger_golden.py` | A fixed script of 115 raw ledger requests (every op, every refusal text, busy and FIFO, fencing, redelivery replay, request topics, hostile input, dump truncation, drop) replayed against `AGENT_BRIDGE_LEDGERD`; the normalised replies (ids as R1/L1, timestamps as `<t>`, tokens from 1) must equal those v0.1.0's Python ledgerd gave, recorded in `tests/golden/ledgerd.jsonl`, apart from the Known differences; a deliberate change is a reviewed edit of that file |
-| `tests/test_ledger_parity.py` | The Rust ledgerd and its rollback, the Python ledgerd in `agent-bridge-ledgerd:2` built from v0.1.0, handing one `ledger.db` back and forth: the state reads the same both ways, a redelivered request is replayed from the other's stored answer, a waiter queued under one is served by the other, fencing tokens keep growing, one schema row; skipped when that image is not built (CI's rollback job builds it) |
-| `tests/test_ledger.py` | Ledger semantics, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, quotas, a 10-process lock stress test, the admin dump, the stale sweep, the schema guard, the command line and `agent-bridge ledger-raw` |
+| `tests/test_ledger_golden.py` | A fixed script of 115 raw ledger requests (every op, every refusal text, busy and FIFO, fencing, redelivery replay, request topics, hostile input, dump truncation, drop) replayed against `AGENT_BRIDGE_LEDGERD`; the normalised replies (ids as R1/L1, timestamps as `<t>`, tokens from 1) must equal those v0.1.0's Python ledgerd gave, recorded in `tests/golden/ledgerd.jsonl`, apart from the Known differences and the deliberate changes since, which its docstring names; a deliberate change is a reviewed edit of that file |
+| `tests/test_ledger_parity.py` | The Rust ledgerd and its rollback, the Python ledgerd in `agent-bridge-ledgerd:2` built from v0.1.0, handing one `ledger.db` back and forth: the state reads the same both ways, a redelivered request is replayed from the other's stored answer, a waiter queued under one is served by the other, fencing tokens keep growing, one schema row; and an interrupted command-line acquire against the rollback, which refuses `cancel` as an unknown op, still ends quietly by its signal; skipped when that image is not built (CI's rollback job builds it) |
+| `tests/test_ledger.py` | Ledger semantics and their DMs, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, the replay window, quotas including the per-owner pending cap, waiters whose client left (a timeout shorter than the wait, SIGINT and SIGTERM cancelling a queued command-line acquire, a lease granted while the cancel is on its way), busy refusals naming the holders, a 10-process lock stress test, the admin dump, the stale sweep, the schema guard, the command line and `agent-bridge ledger-raw` |
 | `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice, arguments refused before anything connects |
 | `tests/test_host.py` | The agent-framework adapter: the generic host, Claude Code's session and process detection, the inbox socket, a fake session registry (the `.key` files never opened), transcripts, kind detection, and the native identity calls (project names, session addresses, `/proc` reads) |
 | `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, one channel notice per arrival across the relay taking the session and handing it back, adopting a CLI-registered agent, mentions waking only the mentioned agent |
 | `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho and none of the Python bus, CLI, relay, hooks, ledger or history modules |
 | `tests/test_conformance.py` | The `_native` contract listed above, with the bus behaviours summary |
+| `tests/test_harness.py` | The test harness itself: a killed run's temp directory is swept by the next run, and nothing else is |
 
 CI (`.github/workflows/ci.yml`, GitHub Actions) runs ruff; the Rust formatter, clippy and tests, including the ones
 that need Docker; builds manylinux wheels for x86_64 and aarch64, with the native binaries built inside the manylinux
@@ -580,10 +635,11 @@ uv sync
 ledgerd ships as a 4.8 MB image, a static binary on `scratch` (`rust/Dockerfile`, target `ledgerd`), which
 `compose.yaml` runs with the healthcheck `/agent-bridge-ledgerd --health`, a `dump` round trip through the broker that
 exits 0 on an answer within 5 s. It answers every request as v0.1.0's Python ledgerd did, but for the known differences
-below (`tests/test_ledger_golden.py`, against that ledgerd's recorded replies), and the two hand one `ledger.db` back
-and forth (`tests/test_ledger_parity.py`, run in CI against the v0.1.0 image). To roll back to the Python ledgerd, build
-its image from the v0.1.0 tag (`docker build -t agent-bridge-ledgerd:2 .` in a checkout of `v0.1.0`), set the service to
-`image: agent-bridge-ledgerd:2` with no `build`, `command: ["agent-bridge-ledgerd"]` and the healthcheck `["CMD",
+below and the deliberate changes since (`tests/test_ledger_golden.py`, against that ledgerd's recorded replies), and the
+two hand one `ledger.db` back and forth (`tests/test_ledger_parity.py`, run in CI against the v0.1.0 image). To roll
+back to the Python ledgerd, build its image from the v0.1.0 tag (`docker build -t agent-bridge-ledgerd:2 .` in a
+checkout of `v0.1.0`), set the service to `image: agent-bridge-ledgerd:2` with no `build`, `command:
+["agent-bridge-ledgerd"]` and the healthcheck `["CMD",
 "agent-bridge-ledgerd", "--health"]`, then run `docker compose up -d ledgerd`. Both open the same `ledger.db` in the
 `ledger` volume. Both write the database's `schema` row (1) and refuse, before writing anything, a database whose schema
 is another version, so the rollback ends at the first migration. ledgerd starts the service only when given no
@@ -598,16 +654,17 @@ a 4.7 MB image (`rust/Dockerfile`, target `historyd`) that `compose.yaml` runs, 
 `/agent-bridge-historyd --health`. To roll back to the Python historyd, build its image from the v0.1.0 tag (`docker
 build -t agent-bridge-historyd:1 .` in a checkout of `v0.1.0`), set the service to `image: agent-bridge-historyd:1` with
 no `build`, `command: ["agent-bridge-historyd"]` and the healthcheck `["CMD", "agent-bridge-historyd", "--health"]`,
-then run `docker compose up -d historyd`. Both open the same `history.db` in the `history` volume and import the same
-`/import/history.jsonl`, so nothing is imported twice. Both write the database's `schema` row (1) and refuse, before
-writing anything, a database whose schema is another version, so the rollback ends at the first migration.
+then run `docker compose up -d historyd`. Both open the same `history.db` in the `history` volume, and with
+`compose.override.yaml` both import the same `/import/history.jsonl`, so nothing is imported twice. Both write the
+database's `schema` row (1) and refuse, before writing anything, a database whose schema is another version, so the
+rollback ends at the first migration.
 
 Compose runs both services with `init: true`. As PID 1 on an empty image they would ignore SIGTERM, so every stop
 would wait 10 s for the kill; docker-init forwards it and they stop at once, which is safe at any point: every request
 and message is one SQLite transaction, acked to the broker only after it commits.
 
-The Rust tests, then the ones that need Docker (the services' arguments, health and takeover, and the CLI replaying its
-golden transcript on a disposable broker):
+The Rust tests, then the ones that need Docker (the services' arguments, health and takeover, the CLI replaying its
+golden transcript on a disposable broker, and a relay ending with its `claude` while the broker is down):
 
 ```bash
 cargo test --manifest-path rust/Cargo.toml
@@ -632,7 +689,10 @@ Known differences from v0.1.0's Python services, which matter only for the rollb
 both refuse, and the golden files pin them: a request nested deeper than 128 levels gets `payload must be UTF-8 JSON`
 from Rust where Python parses it and refuses it by its fields; an integer longer than 4300 digits is the other way round
 (Python's integer limit refuses the whole request, Rust names the first bad field); and an error that echoes a NaN or an
-infinity shows it as `{}` where Python shows `nan` or `inf`.
+infinity shows it as `{}` where Python shows `nan` or `inf`. The ledgerd changes since, none of which touch the
+database's layout, go away with a rollback: the `cancel` op (the rollback refuses it as an unknown op, so an interrupted
+command-line acquire stays queued until its deadline), the waiter cutoff at the request's expiry, the per-owner pending
+cap, the refusal of a lease you already hold, the reply window beyond 300 s, and the reworded refusals and DMs.
 
 ## Roadmap
 

@@ -82,9 +82,53 @@ def since(text):
     if m := re.fullmatch(r"(\d+(?:\.\d+)?)([smhd])", text or ""):
         return time.time() - float(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]]
     try:
-        return float(text)
+        if (t := float(text)) >= 0:
+            return t
     except (TypeError, ValueError):
-        raise Failed(f"bad time {text!r}: use a unix time or a duration like 30m, 6h or 2d") from None
+        pass
+    raise Failed(f"bad time {text!r}: use a unix time or a duration like 30m, 6h or 2d")
+
+
+def positive(text):
+    if not text.isdigit() or int(text) < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive whole number, not {text!r}")
+    return int(text)
+
+
+# The console audits each action under its API route; the CLI's command names are aliases for them. kick, mute,
+# unmute, ban and unban are all room/member (the result says which), say and dm are send (the target says which).
+ACTIONS = (
+    "send",
+    "broadcast",
+    "signal",
+    "restart/terminal",
+    "restart/resume",
+    "ledger/release",
+    "ledger/revoke",
+    "room/kill",
+    "agent/stop",
+    "leaks/container",
+    "leaks/process",
+    "room/settings",
+    "room/moderator",
+    "room/member",
+)
+ALIASES = {
+    "say": "send",
+    "dm": "send",
+    "kick": "room/member",
+    "mute": "room/member",
+    "unmute": "room/member",
+    "ban": "room/member",
+    "unban": "room/member",
+    "mod": "room/moderator",
+    "room-set": "room/settings",
+    "kill-room": "room/kill",
+    "stop-agent": "agent/stop",
+    "restart": "restart/",
+    "ledger": "ledger/",
+    "cleanup": "leaks/",
+}
 
 
 # commands
@@ -98,11 +142,13 @@ def status(_a):
         {
             "connected": st["connected"],
             "on_bus": sum(a["on_bus"] for a in agents),
-            "sessions": len(agents),
+            "sessions": sum(bool(a["session"]) for a in agents),
+            "entries": len(agents),
             "alive": sum(a["alive"] is True for a in agents),
             "rooms": len(rooms),
             "messages": len(st["messages"]),
             "jobs_running": sum(j["state"] == "running" for j in st["jobs"]),
+            "dropped": st.get("broker", {}).get("dropped"),
         }
     )
 
@@ -114,7 +160,8 @@ def capacity(_a):
 
 def leftovers(_a):
     d = get("/api/leaks")
-    show({"busy": d["busy"]}, *({"container": c} for c in d["containers"]), *({"process": p} for p in d["processes"]))
+    summary = {"busy": d["busy"], "containers": len(d["containers"]), "processes": len(d["processes"])}
+    show(summary, *({"container": c} for c in d["containers"]), *({"process": p} for p in d["processes"]))
 
 
 def agents(_a):
@@ -130,7 +177,8 @@ def _rooms(st):
         rec = st["rooms"].get(room, {})
         yield {
             "room": room,
-            "members": sorted(members.get(room, [])),
+            "members": len(members.get(room, [])),
+            "who": sorted(members.get(room, [])),
             "mode": rec.get("mode", "open"),
             "moderators": rec.get("moderators", []),
         }
@@ -142,8 +190,8 @@ def rooms(_a):
 
 def room(a):
     info = get("/api/room", room=a.room)
-    members = next((r["members"] for r in _rooms(get("/api/state")) if r["room"] == a.room), [])
-    show({**info, "members": members})
+    who = next((r["who"] for r in _rooms(get("/api/state")) if r["room"] == a.room), [])
+    show({**info, "members": len(who), "who": who})
 
 
 def say(a):
@@ -211,14 +259,18 @@ def cleanup(a):
 
 
 def audit(a):
+    action = ALIASES.get(a.action, a.action)
+    if action is not None and action not in ACTIONS and not action.endswith("/"):
+        raise Failed(f"no audit action {a.action!r}: use one of {', '.join(ACTIONS)} or a command name")
     reply = get(
         "/api/audit",
-        action=a.action,
+        action=None if action is None or action.endswith("/") else action,
         target=a.target,
         since=a.since and since(a.since),
         until=a.until and since(a.until),
     )
-    show(*reply["entries"][-a.last :])
+    entries = [e for e in reply["entries"] if action is None or e["action"].startswith(action)]
+    show(*entries[-a.last :])
 
 
 def metrics(_a):
@@ -238,7 +290,7 @@ def main():
     text, rm, addr = (["text"], {}), (["room"], {}), (["addr"], {})
     signal_opt = (["--signal"], {"choices": ["terminate", "kill"], "default": "terminate"})
     whole = (["--sessions"], {"action": "store_true", "help": "also kill whole Claude sessions (their primary agent)"})
-    cmd("status", status, "console connection, counts of agents, sessions, rooms and messages")
+    cmd("status", status, "console connection, counts of agents, sessions, rooms, messages and broker drops")
     cmd("capacity", capacity, "machine load and memory, CPU and memory per Claude session")
     cmd("leftovers", leftovers, "leftover test containers and orphaned agent-bridge processes")
     cmd("agents", agents, "every agent and Claude session")
@@ -297,11 +349,17 @@ def main():
         "audit",
         audit,
         "audit log entries, oldest first",
-        (["--action"], {}),
-        (["--target"], {}),
+        (
+            ["--action"],
+            {
+                "help": "an API action (send, room/member, leaks/process, ...) or a command name (kick, say, "
+                "cleanup, ...); kick, mute, unmute, ban and unban all match room/member"
+            },
+        ),
+        (["--target"], {"help": "a substring of the target, like room:ops, dm:ADDR or ROOM:ADDR"}),
         (["--since"], {"help": "unix time or a duration back, like 6h"}),
-        (["--until"], {}),
-        (["--last"], {"type": int, "default": 100}),
+        (["--until"], {"help": "unix time or a duration back, like 1h"}),
+        (["--last"], {"type": positive, "default": 100, "help": "show at most this many, newest (default 100)"}),
     )
     cmd("metrics", metrics, "the console's Prometheus metrics")
     a = p.parse_args()

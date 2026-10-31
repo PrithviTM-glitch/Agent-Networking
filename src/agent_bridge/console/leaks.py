@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 
@@ -93,13 +94,28 @@ def containers():
             continue
         name = c.get("Names", "")
         if TEST_CONTAINER.fullmatch(name) and name not in KEEP:
-            rows.append({"name": name, "status": c.get("Status", ""), "created": c.get("RunningFor", "")})
+            port = re.search(r":(\d+)->1883/", c.get("Ports", ""))
+            row = {"name": name, "status": c.get("Status", ""), "created": c.get("RunningFor", "")}
+            rows.append({**row, "port": int(port[1]) if port else None})
     return rows
 
 
-def orphans(procs, regs):
-    """Processes of ours that outlived what started them, each with the reason it counts as orphaned."""
+def _listening(port):
+    """True if something accepts connections on 127.0.0.1:port right now."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def orphans(procs, regs, test_ports=None):
+    """Processes of ours that outlived what started them, each with the reason it counts as orphaned. A test-like
+    process (temp history log) whose broker is up and is not a test broker belongs to a stack someone runs on purpose,
+    so it is left out; one whose broker is gone, or is a leftover test broker, is listed."""
     mine, tmp, uid, names = processes.lineage(), tempfile.gettempdir() + os.sep, os.getuid(), processes.session_names()
+    if test_ports is None:
+        test_ports = frozenset(c["port"] for c in containers() if c["port"])
     out = []
     for pid, i in procs.items():
         # A console, this one or another, is never a leftover: it is what the admin is using.
@@ -114,6 +130,9 @@ def orphans(procs, regs):
         if reg and reg["pid"] and not processes.verified(reg["pid"], reg["pid_start"]):
             kind, why = "session", f"its session {session} ended (claude pid {reg['pid']} is gone)"
         elif not session and env.get("AGENT_BRIDGE_LOG", "").startswith(tmp):
+            port = env.get("AGENT_BRIDGE_PORT", "")
+            if port.isdigit() and int(port) not in test_ports and _listening(int(port)):
+                continue
             kind, why = "test", "a test's process that outlived its run: its history log is in a temp directory"
         else:
             continue
@@ -131,8 +150,9 @@ def orphans(procs, regs):
 
 
 def report():
-    procs = processes.table()
-    return {"busy": busy(procs), "containers": containers(), "processes": orphans(procs, sessions.read_registry())}
+    procs, boxes = processes.table(), containers()
+    ports = frozenset(c["port"] for c in boxes if c["port"])
+    return {"busy": busy(procs), "containers": boxes, "processes": orphans(procs, sessions.read_registry(), ports)}
 
 
 def remove_container(name):

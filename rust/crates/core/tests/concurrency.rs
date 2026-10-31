@@ -33,7 +33,7 @@ fn one_bus_many_threads() {
     };
     std::thread::sleep(Duration::from_millis(300));
     quick("join", || a.join("conc-room"));
-    quick("say", || a.say("conc-room", "while recv waits"));
+    quick("say", || a.say("conc-room", "while recv waits").map(drop));
     quick("dm", || a.dm(&b.addr, "while recv waits"));
     b.dm(&a.addr, "wake").expect("b's dm");
     let got = waiting.join().expect("the waiting thread").expect("recv");

@@ -34,8 +34,8 @@
 {"step": "acquire busy", "reply": {"ok": false, "error": "busy", "holders": [{"holder": "gold-r1", "level": "read", "expires_at": "<t>"}]}}
 {"step": "dump with waiter", "reply": {"ok": true, "ledgers": [{"owner": "gold-h1", "since": "<t>", "last_seen": "<t>"}, {"owner": "gold-o1", "since": "<t>", "last_seen": "<t>"}, {"owner": "gold-r1", "since": "<t>", "last_seen": "<t>"}, {"owner": "gold-w1", "since": "<t>", "last_seen": "<t>"}], "resources": [{"id": "gold-o1/priv", "owner": "gold-o1", "name": "priv", "description": "still", "visibility": "private", "max_level": "read", "created": "<t>", "updated": "<t>"}, {"id": "gold-o1/pub", "owner": "gold-o1", "name": "pub", "description": "shared", "visibility": "public", "max_level": "write", "created": "<t>", "updated": "<t>"}], "requests": [{"id": "R4", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-w1", "level": "write", "status": "granted", "ts": "<t>"}, {"id": "R3", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-w1", "level": "write", "status": "denied", "ts": "<t>"}, {"id": "R2", "resource": "gold-o1/priv", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}, {"id": "R1", "resource": "gold-o1/pub", "owner": "gold-o1", "holder": "gold-r1", "level": "read", "status": "granted", "ts": "<t>"}], "leases": [{"lease_id": "L1", "resource": "gold-o1/pub", "holder": "gold-r1", "level": "read", "expires_at": "<t>"}], "waiters": [{"resource": "gold-o1/pub", "holder": "gold-w1", "level": "write", "queued_at": "<t>", "deadline": "<t>"}], "ts": "<t>"}}
 {"step": "renew", "reply": {"ok": true, "lease": {"lease_id": "L1", "resource": "gold-o1/pub", "holder": "gold-r1", "level": "read", "expires_at": "<t>"}}}
-{"step": "renew not holder", "reply": {"ok": false, "error": "no such lease: L1 (it may have expired)"}}
-{"step": "release not holder", "reply": {"ok": false, "error": "no such lease: L1 (it may have expired)"}}
+{"step": "renew not holder", "reply": {"ok": false, "error": "lease L1 is not yours, gold-r1 holds it"}}
+{"step": "release not holder", "reply": {"ok": false, "error": "lease L1 is not yours, gold-r1 holds it"}}
 {"step": "release read", "reply": {"ok": true}}
 {"step": "waiter served", "reply": {"ok": true, "lease": {"lease_id": "L2", "resource": "gold-o1/pub", "holder": "gold-w1", "level": "write", "expires_at": "<t>", "token": 1}}}
 {"step": "acquire behind writer", "reply": {"ok": false, "error": "busy", "holders": [{"holder": "gold-w1", "level": "write", "expires_at": "<t>"}]}}
@@ -67,8 +67,8 @@
 {"step": "junk infinity", "reply": {"ok": false, "error": "ttl: number between 1 and 3600"}}
 {"step": "junk overflow", "reply": {"ok": false, "error": "ttl: number between 1 and 3600"}}
 {"step": "junk depth 200", "reply": {"ok": false, "error": "unknown fields for init: x"}}
-{"step": "junk op int", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, drop, dump"}}
-{"step": "junk op null", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, drop, dump"}}
+{"step": "junk op int", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, cancel, drop, dump"}}
+{"step": "junk op null", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, cancel, drop, dump"}}
 {"step": "junk as missing", "reply": {"ok": false, "error": "as: required"}}
 {"step": "junk as slash", "reply": {"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}}
 {"step": "junk as empty", "reply": {"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}}
@@ -77,17 +77,17 @@
 {"step": "junk as unicode", "reply": {"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}}
 {"step": "junk as plus", "reply": {"ok": false, "error": "as: must match [A-Za-z0-9_-]{1,64}"}}
 {"step": "junk extra field", "reply": {"ok": false, "error": "unknown fields for init: extra"}}
-{"step": "junk dunder op", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, drop, dump"}}
-{"step": "junk long op", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, drop, dump"}}
+{"step": "junk dunder op", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, cancel, drop, dump"}}
+{"step": "junk long op", "reply": {"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, cancel, drop, dump"}}
 {"step": "junk name slash", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
 {"step": "junk name hash", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
 {"step": "junk name empty", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
 {"step": "junk name dot", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
 {"step": "junk name int", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
 {"step": "junk name dict", "reply": {"ok": false, "error": "name: must match [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"}}
-{"step": "junk description bell", "reply": {"ok": false, "error": "description: string up to 1024 chars, no control characters"}}
-{"step": "junk description surrogate", "reply": {"ok": false, "error": "description: string up to 1024 chars, no control characters"}}
-{"step": "junk description long", "reply": {"ok": false, "error": "description: string up to 1024 chars, no control characters"}}
+{"step": "junk description bell", "reply": {"ok": false, "error": "description: string up to 1024 chars, no control characters except tab and newline"}}
+{"step": "junk description surrogate", "reply": {"ok": false, "error": "description: string up to 1024 chars, no control characters except tab and newline"}}
+{"step": "junk description long", "reply": {"ok": false, "error": "description: string up to 1024 chars, no control characters except tab and newline"}}
 {"step": "junk visibility bad", "reply": {"ok": false, "error": "visibility: one of public, private"}}
 {"step": "junk level bad", "reply": {"ok": false, "error": "max_level: one of read, write"}}
 {"step": "junk level list", "reply": {"ok": false, "error": "max_level: one of read, write"}}

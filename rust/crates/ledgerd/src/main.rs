@@ -167,7 +167,7 @@ fn handle(ledger: &mut Ledger, publish: &mut dyn FnMut(Outgoing), m: &Message) {
     let Some(topic) = m.topic.as_deref() else { return };
     if topic == "ledger/req" || topic.starts_with("ledger/req/") {
         let via = topic.strip_prefix("ledger/req/").filter(|v| !v.is_empty());
-        ledger.handle(publish, &m.payload, m.response_topic.as_deref(), m.correlation.as_deref(), via);
+        ledger.handle(publish, &m.payload, m.response_topic.as_deref(), m.correlation.as_deref(), via, m.expiry);
     } else if let Some(who) = topic.strip_prefix("agents/").filter(|a| is_addr(a)) {
         let payload = m.payload.clone();
         if let Err(store::Fail::Bad(e) | store::Fail::Internal(e)) = ledger.run(publish, |l| l.presence(who, &payload))

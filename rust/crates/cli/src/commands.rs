@@ -42,7 +42,7 @@ fn crc32(data: &[u8]) -> u32 {
 fn turn(addr: &str) -> Result<File> {
     let addr = check_ident(addr, "address")?;
     let path = config::data_dir()?.join("cli.lock");
-    let f = OpenOptions::new().append(true).create(true).open(&path).map_err(|e| os_error(&e, Some(&path)))?;
+    let f = OpenOptions::new().append(true).create(true).open(&path).map_err(|e| config::data_error(&e, &path))?;
     // One byte per address hash: a single lock file serves every address, collisions only cost waiting.
     let byte = libc::flock {
         l_type: libc::F_WRLCK as libc::c_short,
@@ -141,7 +141,16 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::Rooms => rooms::listing().map(|r| show_all(&r)),
         Cmd::Join { addr, room } => attached(&addr, true, |b| b.join(&room)),
         Cmd::Part { addr, room } => attached(&addr, true, |b| b.part(&room)),
-        Cmd::Say { addr, room, text } => attached(&addr, true, |b| b.say(&room, &text)),
+        Cmd::Say { addr, room, text } => {
+            let said = attached(&addr, true, |b| b.say(&room, &text))?;
+            if !said.unresolved.is_empty() {
+                let words: Vec<String> = said.unresolved.iter().map(|w| format!("@{w}")).collect();
+                let (verb, pronoun) =
+                    if words.len() == 1 { ("matches", "it mentions") } else { ("match", "they mention") };
+                eprintln!("agent-bridge: sent; {} {verb} no member of #{room}, so {pronoun} nobody", words.join(", "));
+            }
+            Ok(())
+        }
         Cmd::Room { action: RoomCmd::Info { room } } => rooms::info(&room).map(|r| show_all(&[r])),
         Cmd::Room { action: RoomCmd::Set { addr, room, mode, rules } } => {
             let mode = mode.map(|m| m.name());

@@ -11,7 +11,7 @@ use rumqttc::v5::mqttbytes::v5::PublishProperties;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Replies awaited on one connection, by CorrelationData.
 #[derive(Default)]
@@ -34,15 +34,39 @@ impl Replies {
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).insert(corr.to_vec(), None);
     }
 
-    /// The reply to corr within timeout; the slot is gone afterwards either way.
-    fn wait(&self, corr: &[u8], timeout: Duration) -> Option<Bytes> {
-        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        let (mut slots, _) = self
-            .cv
-            .wait_timeout_while(slots, timeout, |s| s.get(corr).is_some_and(Option::is_none))
-            .unwrap_or_else(|e| e.into_inner());
-        slots.remove(corr).flatten()
+    /// The reply to corr within timeout, checking stop every 100 ms. The slot is gone afterwards unless stop ended
+    /// the wait, so a reply still on its way is kept for take.
+    fn wait(&self, corr: &[u8], timeout: Duration, stop: &dyn Fn() -> bool) -> Sent {
+        let deadline = Instant::now() + timeout;
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(Some(_)) = slots.get(corr) {
+                return slots.remove(corr).flatten().map_or(Sent::Timeout, Sent::Reply);
+            }
+            if stop() {
+                return Sent::Stopped(corr.to_vec());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                slots.remove(corr);
+                return Sent::Timeout;
+            }
+            slots =
+                self.cv.wait_timeout(slots, left.min(Duration::from_millis(100))).unwrap_or_else(|e| e.into_inner()).0;
+        }
     }
+
+    /// The reply to a stopped request if it has come, forgetting the slot.
+    pub fn take(&self, corr: &[u8]) -> Option<Bytes> {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).remove(corr).flatten()
+    }
+}
+
+/// What became of a request: its reply, none within the timeout, or stopped, with the CorrelationData it went with.
+pub enum Sent {
+    Reply(Bytes),
+    Timeout,
+    Stopped(Vec<u8>),
 }
 
 /// The reply topic of a client: named after its client id, so a persistent session never piles up subscriptions.
@@ -61,6 +85,24 @@ pub fn send(
     body: String,
     timeout: f64,
 ) -> Option<Bytes> {
+    match send_until(conn, replies, reply_topic, service, as_, body, timeout, &|| false) {
+        Sent::Reply(reply) => Some(reply),
+        _ => None,
+    }
+}
+
+/// send, giving up early once stop() is true.
+#[allow(clippy::too_many_arguments)]
+pub fn send_until(
+    conn: &Conn,
+    replies: &Replies,
+    reply_topic: &str,
+    service: &str,
+    as_: Option<&Value>,
+    body: String,
+    timeout: f64,
+    stop: &dyn Fn() -> bool,
+) -> Sent {
     let corr = random_bytes(16);
     replies.expect(&corr);
     // Resubscribed every call: the broker may have lost the session since; it handles this before the request.
@@ -78,5 +120,5 @@ pub fn send(
         None => format!("{service}/req"),
     };
     let _ = conn.publish(&topic, body, true, false, Some(properties), false);
-    replies.wait(&corr, Duration::from_secs_f64(timeout))
+    replies.wait(&corr, Duration::from_secs_f64(timeout), stop)
 }

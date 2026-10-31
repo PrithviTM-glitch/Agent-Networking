@@ -10,7 +10,7 @@ use crate::protocol::{BROADCAST, parse_message, parse_presence};
 use crate::request::Replies;
 use crate::validation::{
     ADMIN, Error, ID_MAX, NAME_MAX, Result, TOPICS_MAX, check_body, check_caps, check_ident, check_ident_cap,
-    check_topic, check_wait, fail, is_ident, not_admin,
+    check_message, check_topic, check_wait, fail, is_ident, not_admin,
 };
 use crate::{config, history, identity, ledger, presence, rooms};
 use serde_json::Value;
@@ -28,6 +28,13 @@ type Deliver<'a> = &'a mut dyn FnMut(&[Map]) -> Result<()>;
 /// Every method takes &self, so one Bus serves several threads at once, and no call holds a lock while it waits on
 /// the broker or for messages, with one exception: the calls that rewrite the agent's presence (sub, unsub, join,
 /// part, keep, touch) take turns on `writing` across their broker round trip, so concurrent ones never lose a topic.
+/// What say sent: the addresses it mentioned, and the @words that matched no member (sent as plain text).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Said {
+    pub mentions: Vec<String>,
+    pub unresolved: Vec<String>,
+}
+
 pub struct Bus {
     pub addr: String,
     rec: Mutex<Map>,
@@ -227,7 +234,8 @@ impl Bus {
     /// agent's session (subscriptions, queued messages) to the process that owns it, such as its relay.
     pub fn attach_as(addr: &str, owner: bool) -> Result<Bus> {
         let addr = check_ident(addr, "address")?;
-        let rec = presence::need(addr)?;
+        let rec = presence::find(addr)?
+            .ok_or_else(|| Error(format!("{addr} is not registered (or it left): register it first")))?;
         let bus = Bus::open(addr, rec, owner)?;
         let rec = bus.rec();
         if bus.fresh_pid(&rec).iter().any(|(k, v)| rec.get(k) != Some(v)) {
@@ -255,8 +263,14 @@ impl Bus {
         rec.insert("caps".into(), check_caps(caps)?.into());
         rec.insert("topics".into(), Value::Array(vec![]));
         rec.insert("keep".into(), keep.into());
-        // Origin fields are written here, once; later attaches only refresh pid and pid_start (see fresh_pid).
+        // Origin fields are written here, once; later attaches only refresh pid and pid_start (see fresh_pid). The
+        // process comes only with a session: a script started from a session's shell without one is not that session,
+        // and must not be shown as owning its claude process.
         let mut here = identity::origin().clone();
+        if !here.contains_key("session") {
+            here.shift_remove("pid");
+            here.shift_remove("pid_start");
+        }
         if subagent {
             rec.insert("kind".into(), "subagent".into());
             if let Some(session) = here.shift_remove("session") {
@@ -446,6 +460,13 @@ impl Bus {
         self.shared.owner
     }
 
+    /// Connected with both caches complete, right now, without waiting: what a call would find before it blocks in
+    /// ready(). For a caller that must stay responsive while the broker is away (the relay watching its claude).
+    pub fn connected(&self) -> bool {
+        let c = self.shared.lock();
+        c.up && c.synced && !c.closed
+    }
+
     /// One ledgerd request over this connection, as this agent or, for the console, as_ (an owner it acts for).
     /// Replies come back on ledger/resp/<this client id>, acked by the reader thread and never buffered.
     pub fn ledger(
@@ -606,19 +627,20 @@ impl Bus {
         if !self.admin {
             return fail("only the admin console can broadcast");
         }
-        self.send(BROADCAST, body, None)
+        self.send(BROADCAST, check_message(body)?, None)
     }
 
-    /// Post to a room. @address or @name (every member with that name) mentions members: their relays wake for it,
-    /// other relays keep it quiet. @all mentions nobody in particular, like no mention.
-    pub fn say(&self, room: &str, body: &str) -> Result<()> {
+    /// Post to a room. @address or @name (every member with that name, both without case) mentions members: their
+    /// relays wake for it, other relays keep it quiet. @all mentions nobody in particular, like no mention. Any other
+    /// @word is sent as plain text and returned in `unresolved`, so the caller can say it mentioned nobody.
+    pub fn say(&self, room: &str, body: &str) -> Result<Said> {
         self.ready()?;
         let room = check_ident(room, "room")?;
         if let Some(why) = rooms::refusal(self.room_rec(room).as_ref(), &self.addr) {
             return fail(format!("you may not post in #{room}: {why}"));
         }
-        let mut mentions = None;
-        if !rooms::mention_tokens(check_body(body)?).is_empty() {
+        let (mut mentions, mut unresolved) = (None, Vec::new());
+        if !rooms::mention_tokens(check_message(body)?).is_empty() {
             let members: Vec<(String, Map)> = {
                 let c = self.shared.lock();
                 c.agents
@@ -627,15 +649,20 @@ impl Bus {
                     .map(|(a, r)| (a.clone(), r.clone()))
                     .collect()
             };
-            mentions = rooms::mentions(room, body, &members)?;
+            (mentions, unresolved) = rooms::mentions(body, &members)?;
         }
-        self.send(&format!("room/{room}"), body, mentions)
+        self.send(&format!("room/{room}"), body, mentions.clone())?;
+        Ok(Said { mentions: mentions.unwrap_or_default(), unresolved })
     }
 
     pub fn dm(&self, to: &str, body: &str) -> Result<()> {
-        check_body(body)?;
-        if self.seen(check_ident(to, "address")?)?.is_none() {
-            return fail(format!("unknown address: {to}"));
+        check_message(body)?;
+        let to = check_ident(to, "address")?;
+        if to == self.addr {
+            return fail("cannot DM yourself: your own messages never reach you");
+        }
+        if self.seen(to)?.is_none() {
+            return fail(format!("unknown recipient: {to}"));
         }
         self.send(&format!("inbox/{to}"), body, None)
     }
