@@ -123,14 +123,25 @@ on the network read every DM and take every lock.
     containers, and remote devices; it does not make one local agent's DMs private from another local agent of the
     same user. That would need an OS user per agent, or a broker-side identity the agent cannot read, and is out of
     scope.
-11. **Features that take another agent's session over.** Several features connect with an agent's own client id,
-    which takes its MQTT session over: `kick` (the room's moderator drops the member), `keep`, `sub` and `unsub` from
-    a second process (the CLI, or the MCP server's publish-only Bus while the relay owns the session), the console's
-    stop and wipe, and `leave`'s final connect. MQTT takeover is by client id, not by username, so with credentials
-    but no pinning any authenticated agent can take any other agent's session over, a denial of service. Phase 1
-    therefore pins every agent's client id to its username, which breaks all of these, and moves each to an explicit
-    path: the admin disconnects a client through dynamic security (kick, stop, wipe), and changes to an agent's own
-    subscriptions or keep go through the connection that owns the session.
+11. **Session takeovers, client-id pinning and helper connections.** MQTT takeover is by client id, not by username,
+    so with credentials but no pinning any authenticated agent can take any other agent's session over, a denial of
+    service. Phase 1 therefore pins each identity to its client id. Today's connections then fall into three kinds:
+    - **Same identity, same client id:** an agent's own processes taking its own session over, such as the CLI's
+      `join`, `part`, `sub`, `unsub`, `keep` and `leave` while the relay owns the session (and `say`, `dm` and `pub`
+      when no relay is live). They connect with the agent's own credentials and client id, so pinning allows them and
+      they keep working.
+    - **Another identity's client id:** a moderator's `kick` and the console's stop and wipe connect with the target
+      agent's client id under their own credentials. Pinning refuses them, so they move to the admin disconnecting
+      the client through dynamic security.
+    - **Helper connections under a client id of their own:** the MCP server's publish-only Bus and the CLI's `say`,
+      `dm` and `pub` while a relay is live; the one-shot ledger and history calls (every CLI ledger command,
+      `ledger-raw`, `_native.ledger_call` and `history_call`, on random client ids); and the console's Observer and
+      helper reads under the admin identity. Exact-match pinning refuses them all, and one fixed second id per agent
+      is not enough, since two publishers of one agent (the CLI and the MCP server) would take each other over.
+      **Requirement:** either a helper role that lets an identity's credentials connect under any client id that is
+      not the identity's own (the topic ACLs, keyed on the username, still carry the identity), or an auth plugin
+      that can match client-id patterns (`<addr>-<per-process suffix>`). Phase 1 verifies which one dynamic security
+      can express before pinning anything.
 12. **Revocation also clears retained records.** Revoking an agent's credentials disconnects it, but its retained
     presence on `agents/<addr>` and the room records it wrote stay on the broker and keep being served. Set
     `check_retain_source true` (mosquitto re-checks the publisher's ACL before serving a retained message, the fix
@@ -239,7 +250,7 @@ reply that would pass about 239 KB leaves out the oldest entries and adds `"trun
 | Phase | Build | Test before moving on |
 |---|---|---|
 | 0. Contract | Freeze section 4. Add a conformance script that drives the bus and ledger with only `mosquitto_pub`/`mosquitto_sub`, no Python. | Register, DM, room, recv with ack, ledger init/acquire/release, leave, all from the non-Python client. Existing suites green. |
-| 1. Auth on loopback | `allow_anonymous false`, dynamic-security plugin, an admin-side `register` that creates the client, ACLs from section 2, `inbox/<to>/<from>` with the Bus reading identity from the topic, the services' and every agent's client ids pinned, with kick, stop, wipe and second-process keep/sub/unsub moved to the paths in section 2 item 11, `check_retain_source true`. Reply topics move to `<svc>/resp/<addr>/<connection>`, reader-first so running clients keep their replies: (1) ledgerd and historyd accept both the one-level and the two-level form; (2) both clients, owner and publish-only, switch to two levels; (3) only once no running process still uses the old client (MCP servers and relays keep their code until their session restarts) do the services refuse a first level that isn't the request topic's address, and the ACL lands. Plain `ledger/req` retires. The admin path from section 2 item 6, whichever the user picks. | Negative tests for each ACL row: write another's presence, read another's inbox, ledger request as another, subscribe `ledger/resp/#` or `history/resp/#` or another agent's `ledger/resp/<addr>/#`, a reply topic naming another agent, `dms`/`drop` for another agent on either history topic, `recent` from a non-admin, connect as `ledgerd` or `historyd`, anonymous connect. All must fail. Positive suites green with credentials. Admin release/deny still works and is logged. Disabling a client disconnects it. |
+| 1. Auth on loopback | `allow_anonymous false`, dynamic-security plugin, an admin-side `register` that creates the client, ACLs from section 2, `inbox/<to>/<from>` with the Bus reading identity from the topic, the services' and every identity's client ids pinned, with kick, stop and wipe moved to the admin path and the helper connections allowed (section 2 item 11), `check_retain_source true`. Reply topics move to `<svc>/resp/<addr>/<connection>`, reader-first so running clients keep their replies: (1) ledgerd and historyd accept both the one-level and the two-level form; (2) both clients, owner and publish-only, switch to two levels; (3) only once no running process still uses the old client (MCP servers and relays keep their code until their session restarts) do the services refuse a first level that isn't the request topic's address, and the ACL lands. Plain `ledger/req` retires. The admin path from section 2 item 6, whichever the user picks. | Negative tests for each ACL row: write another's presence, read another's inbox, ledger request as another, subscribe `ledger/resp/#` or `history/resp/#` or another agent's `ledger/resp/<addr>/#`, a reply topic naming another agent, `dms`/`drop` for another agent on either history topic, `recent` from a non-admin, connect as `ledgerd` or `historyd`, anonymous connect. All must fail. Positive suites green with credentials. Admin release/deny still works and is logged. Disabling a client disconnects it. |
 | 2. TLS off-host | A TLS listener on the tailnet address only, a certificate from a local CA, and a tailnet ACL allowing only the broker port. | Plaintext and wrong-CA connections refused. A second device completes the full flow. Queued delivery survives a dropped link and a broker restart. Latency stays near the loopback figure. |
 | 3. Remote agents | Credential provisioning for a new device (one-time enrollment token or admin CLI) and MCP server config pointing at the remote broker. historyd already replaces per-host `history.jsonl`; it only needs its role from phase 1. | A Claude session on another device registers, chats, and takes and fences a lock. Its DMs and room posts appear in historyd from every device. Revoking the device's credentials cuts it off within seconds and removes its retained presence and room entries (section 2 item 12). |
 | 4. WebSocket (if needed) | A `protocol websockets` listener behind TLS with the same auth. | An mqtt.js client passes the phase 0 conformance flow and the phase 1 negative tests. |

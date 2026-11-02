@@ -206,16 +206,13 @@ impl Drop for Killed {
     }
 }
 
-/// A relay notices its claude process ending even while the broker is gone: it waits for the broker in short steps
-/// instead of inside a call that blocks for seconds, and its log says the broker is unreachable.
-#[test]
-#[ignore = "needs Docker"]
-fn a_relay_ends_with_its_claude_while_the_broker_is_down() {
-    let w = start();
-    let session = "8f1c1b8e-2d64-4a51-9a3c-6f0e5b7d2a11";
-    // a shell named claude, the relay's ancestor; it lives while its stdin is open
+/// A shell named claude, the relay's ancestor, running `relay start` for session; it lives while its stdin is open.
+/// Returns it and the relay's pid once the relay is live.
+fn relayed(w: &World, session: &str) -> (Killed, i32) {
     let claude = w.dir.join("claude");
-    std::fs::copy("/bin/sh", &claude).expect("a fake claude");
+    if !claude.exists() {
+        std::fs::copy("/bin/sh", &claude).expect("a fake claude");
+    }
     let mut fake = w.cmd(&claude);
     fake.args(["-c", &format!("{RUST} relay start; read _")])
         .env("CLAUDE_CODE_SESSION_ID", session)
@@ -227,14 +224,29 @@ fn a_relay_ends_with_its_claude_while_the_broker_is_down() {
     let live = || {
         String::from_utf8_lossy(&w.run(&["relay", "status", "--session", session]).stdout).contains("\"live\": true")
     };
-    let relay = loop {
-        let pid = std::fs::read_to_string(&lock).ok().and_then(|l| l.lines().next()?.parse::<i32>().ok());
-        if let Some(pid) = pid.filter(|_| live()) {
-            break pid;
+    loop {
+        let text = std::fs::read_to_string(&lock).unwrap_or_default();
+        let pid = text.lines().next().and_then(|l| l.parse::<i32>().ok());
+        // the second line, its address, is written once it has registered
+        if let Some(pid) = pid.filter(|_| text.lines().nth(1).is_some() && live()) {
+            return (fake, pid);
         }
         assert!(Instant::now() < deadline, "the relay never came up");
         std::thread::sleep(Duration::from_millis(50));
-    };
+    }
+}
+
+fn relay_log(w: &World) -> String {
+    std::fs::read_to_string(w.dir.join("relay").join("relay.log")).unwrap_or_default()
+}
+
+/// A relay notices its claude process ending even while the broker is gone: it waits for the broker in short steps
+/// instead of inside a call that blocks for seconds, and its log says the broker is unreachable.
+#[test]
+#[ignore = "needs Docker"]
+fn a_relay_ends_with_its_claude_while_the_broker_is_down() {
+    let w = start();
+    let (fake, relay) = relayed(&w, "8f1c1b8e-2d64-4a51-9a3c-6f0e5b7d2a11");
     let _ = Command::new("docker").args(["rm", "-f", &w.broker]).output();
     std::thread::sleep(Duration::from_secs(3));
     let ended = Instant::now();
@@ -243,9 +255,56 @@ fn a_relay_ends_with_its_claude_while_the_broker_is_down() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let took = ended.elapsed();
-    let log = std::fs::read_to_string(w.dir.join("relay").join("relay.log")).unwrap_or_default();
+    let log = relay_log(&w);
     assert!(took < Duration::from_secs(2), "the relay took {took:?} to notice its claude ended\n{log}");
     assert!(log.contains("broker unreachable, waiting for it"), "{log}");
+}
+
+/// While a session's relay is live, say, dm and pub from that session post over a connection of their own and never
+/// take the relay's session over; join still does (it changes the session's subscriptions), and the relay takes it
+/// back without logging an outage. The broker's log counts the takeovers.
+#[test]
+#[ignore = "needs Docker"]
+fn posting_from_the_shell_leaves_the_relay_its_session() {
+    let w = start();
+    let session = "0d3f6a52-91b7-4c2e-8a45-3e7b9c1d2f60";
+    let (_fake, _) = relayed(&w, session);
+    let addr = std::fs::read_to_string(w.dir.join("relay").join(format!("{session}.lock")))
+        .ok()
+        .and_then(|t| t.lines().nth(1).map(str::to_owned))
+        .expect("the relay's address");
+    let peer = String::from_utf8_lossy(&w.run(&["register", "peer"]).stdout).trim().to_owned();
+    let takeovers = || {
+        let logs = Command::new("docker").args(["logs", &w.broker]).output().expect("docker logs");
+        let text = String::from_utf8_lossy(&logs.stderr).into_owned() + &String::from_utf8_lossy(&logs.stdout);
+        text.lines().filter(|l| l.contains(&format!("Client {addr} already connected"))).count()
+    };
+    let in_session = |args: &[&str]| {
+        let out = w.cmd(Path::new(RUST)).args(args).env("CLAUDE_CODE_SESSION_ID", session).output().expect("the CLI");
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    in_session(&["join", &addr, "room1"]);
+    in_session(&["join", &peer, "room1"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while takeovers() == 0 {
+        assert!(Instant::now() < deadline, "join never took the relay's session over: the count is broken");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // the relay takes its session back about a second after a takeover
+    std::thread::sleep(Duration::from_secs(2));
+    let before = takeovers();
+    in_session(&["say", &addr, "room1", "hello from the shell"]);
+    in_session(&["dm", &addr, &peer, "a dm from the shell"]);
+    in_session(&["pub", &addr, "topic/a", "a raw post"]);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(takeovers(), before, "a post took the relay's session over");
+    let said = String::from_utf8_lossy(&w.run(&["history", "room1"]).stdout).into_owned();
+    assert!(said.contains("hello from the shell"), "{said}");
+    let got = String::from_utf8_lossy(&w.run(&["recv", &peer]).stdout).into_owned();
+    assert!(got.contains("a dm from the shell") && got.contains(&format!("\"from\": \"{addr}\"")), "{got}");
+    let log = relay_log(&w);
+    assert!(!log.contains("broker unreachable"), "a takeover was logged as an outage\n{log}");
+    assert!(log.lines().all(|l| l.contains(&format!(" {addr}: ")) || l.contains(" session ")), "{log}");
 }
 
 #[test]

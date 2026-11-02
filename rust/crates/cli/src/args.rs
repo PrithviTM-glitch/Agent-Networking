@@ -228,6 +228,9 @@ pub enum Cmd {
     },
     /// this Claude Code session's relay into its inbox: start (the SessionStart hook), stop, status; run PID START
     /// is what start launches
+    ///
+    /// status prints {"session", "live", "lock"}. stop prints that same line once the relay has stopped, so its
+    /// "live" is false: the state after the stop, not before it. start prints nothing.
     Relay {
         #[arg(default_value = "start")]
         action: RelayAction,

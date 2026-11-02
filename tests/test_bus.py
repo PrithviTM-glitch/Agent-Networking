@@ -643,6 +643,34 @@ def test_message_rules(s):
     lib.part(room)
 
 
+def test_own_posts_from_another_connection_are_not_received(s):
+    """No-local keeps a connection's own posts off that connection; posts made as this agent over another one (the
+    CLI's or the MCP server's publish-only Bus) are dropped by the receiving Bus too, so nobody hears themselves."""
+    a, lib = s.a, s.lib
+    room, topic = f"self-{RUN}", f"self{RUN}/t"
+    lib.join(room)
+    lib.sub(topic)
+    run("join", a, room)
+    while lib.recv(0.5):
+        pass
+    _, seq = lib.wait_arrival(0)
+    publisher = Bus.attach(lib.addr, owner=False)
+    try:
+        publisher.say(room, "said over my other connection")
+        publisher.pub(topic, "published over my other connection")
+    finally:
+        publisher.close()
+    run("say", a, room, "from alice")  # after both: once it arrives, anything of lib's would have too
+    got = []
+    while not any(m["body"] == "from alice" for m in got) and (batch := lib.recv(10)):
+        got += batch
+    assert [m["body"] for m in got] == ["from alice"], got
+    assert lib.pending() == 0 and lib.wait_arrival(0)[1] == seq + 1, "dropped before they count as an arrival"
+    assert "said over my other connection" in bodies("recv", a), "others still get it"
+    lib.part(room)
+    lib.unsub(topic)
+
+
 def test_retained_replay_precedes_the_barrier(s):
     """A Bus's caches are complete once it is synced: with 3000 retained presence records on the broker, every one is
     in a new Bus's cache at its first read. This pins mosquitto delivering a subscription's retained records before

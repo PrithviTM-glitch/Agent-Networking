@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 pub const KEEP_ALIVE: u16 = 60;
 pub const TIMEOUT: Duration = Duration::from_secs(5);
+/// DISCONNECT reason 0x8E: another client connected with this client id and took the session over.
+pub const SESSION_TAKEN_OVER: u8 = 142;
 const TICK: Duration = Duration::from_secs(5);
 
 pub struct Options {

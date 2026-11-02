@@ -5,7 +5,7 @@ use crate::relay;
 use agent_bridge::bus::Bus;
 use agent_bridge::json::{Map, dumps_map, float};
 use agent_bridge::validation::{check_ident, check_wait, not_admin, os_error};
-use agent_bridge::{Error, Result, config, history, ledger, presence, rooms};
+use agent_bridge::{Error, Result, claude, config, history, ledger, presence, rooms};
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -59,6 +59,17 @@ fn attached<T>(addr: &str, take_turn: bool, f: impl FnOnce(&Bus) -> Result<T>) -
     not_admin(Some(addr), "address")?;
     let _turn = if take_turn { Some(turn(addr)?) } else { None };
     f(&Bus::attach(addr)?)
+}
+
+/// say, dm and pub while this session's relay holds addr: a publish-only connection of their own, so the relay keeps
+/// its session. Otherwise the owner connection, under whose no-local the agent does not get its own posts back.
+fn posted<T>(addr: &str, f: impl FnOnce(&Bus) -> Result<T>) -> Result<T> {
+    let session = std::env::var(claude::SESSION_ENV).unwrap_or_default();
+    if agent_bridge::relay::held(&session).is_some_and(|held| held == addr) {
+        not_admin(Some(addr), "address")?;
+        return f(&Bus::attach_as(addr, false)?);
+    }
+    attached(addr, true, f)
 }
 
 fn shown(addr: &str, f: impl FnOnce(&Bus) -> Result<Map>) -> Result<()> {
@@ -142,7 +153,7 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::Join { addr, room } => attached(&addr, true, |b| b.join(&room)),
         Cmd::Part { addr, room } => attached(&addr, true, |b| b.part(&room)),
         Cmd::Say { addr, room, text } => {
-            let said = attached(&addr, true, |b| b.say(&room, &text))?;
+            let said = posted(&addr, |b| b.say(&room, &text))?;
             if !said.unresolved.is_empty() {
                 let words: Vec<String> = said.unresolved.iter().map(|w| format!("@{w}")).collect();
                 let (verb, pronoun) =
@@ -163,11 +174,11 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::Unban(m) => moderation("unban", &m),
         Cmd::Kick(m) => moderation("kick", &m),
         Cmd::History { room, last } => history::client::room(&room, last, None).map(|h| show_all(&h)),
-        Cmd::Dm { addr, to, text } => attached(&addr, true, |b| b.dm(&to, &text)),
+        Cmd::Dm { addr, to, text } => posted(&addr, |b| b.dm(&to, &text)),
         Cmd::Dms { addr, peer, last } => history::client::dms(&addr, peer.as_deref(), last).map(|h| show_all(&h)),
         Cmd::Sub { addr, topic } => attached(&addr, true, |b| b.sub(&topic)),
         Cmd::Unsub { addr, topic } => attached(&addr, true, |b| b.unsub(&topic)),
-        Cmd::Pub { addr, topic, text } => attached(&addr, true, |b| b.publish(&topic, &text)),
+        Cmd::Pub { addr, topic, text } => posted(&addr, |b| b.publish(&topic, &text)),
         // A waiting recv can be long, so it does not take a turn: other commands take its session over and it
         // reconnects.
         Cmd::Recv { addr, wait } => recv(&addr, wait),

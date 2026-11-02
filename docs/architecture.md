@@ -122,7 +122,7 @@ the lock files and the SQLite schema.
 | `dms` | `MY_ADDR [--with PEER] [--last N]` | Shows your DMs in both directions, from historyd. |
 | `sub` / `unsub` | `MY_ADDR TOPIC` | Subscribes to or unsubscribes from a raw topic. `+` and `#` work as whole levels, `#` only last, never as the first level. |
 | `pub` | `MY_ADDR TOPIC TEXT` | Publishes to a raw topic. |
-| `recv` | `MY_ADDR [--wait N]` | Prints new room, DM and topic messages and acks them. `--wait` blocks up to N seconds (max 3600) for the first message. |
+| `recv` | `MY_ADDR [--wait N]` | Prints new room, DM and topic messages and acks them, never the agent's own (not even those it posted over another connection). `--wait` blocks up to N seconds (max 3600) for the first message. |
 
 Ledger commands. Each one runs `init` for `MY_ADDR` first. They print the ledgerd reply (see [Resource ledger](#resource-ledger)).
 
@@ -164,8 +164,8 @@ conformance and golden tests pinned.
 
 - **`Bus`**: `Bus.register(name, caps=(), keep=False, addr=None, admin=False, owner=True, subagent=False)`,
   `Bus.register_admin()` for the console, and `Bus.attach(addr, owner=True)`. With `owner=False` the Bus publishes as
-  the agent over a client id of its own and never receives (the MCP server uses that while the session's relay is
-  live); `sub`, `unsub` and `keep` then briefly take the agent's session over. The
+  the agent over a client id of its own and never receives (the MCP server and the CLI's `say`, `dm` and `pub` use
+  that while the session's relay is live); `sub`, `unsub` and `keep` then briefly take the agent's session over. The
   methods are listed in the CLI reference above; `ledger(op, **fields)` and `history_call(op, **fields)` go over the
   Bus's own connection (replies on `<service>/resp/<addr>` for an owning Bus, a random reply id for a publisher; acked
   at once and never buffered). `wait_arrival(timeout, after_seq=0) -> (pending, seq)` returns as soon as a message
@@ -514,22 +514,28 @@ agent writes to it.
   inside its line.
 - **Acks.** A message is acked to the broker only after the socket write succeeds. On failure it goes back to the
   buffer and is retried every 2 s; if the relay dies first, the broker still has it.
-- **No echo.** No Local covers the relay's own connection, and a sender check covers the MCP server's separate
-  publishing connection.
+- **No echo.** No Local covers the relay's own connection, and a sender check covers the separate publishing
+  connections of the MCP server and the CLI.
 - **Exit.** When its `claude` process ends (checked every second against pid and start ticks) or on SIGTERM, also
   while the broker is away: it then waits for the broker in half-second steps, logging `broker unreachable, waiting
   for it` once, instead of blocking in a call. `agent-bridge relay stop` sends the SIGTERM and `agent-bridge relay
-  status` reports whether it is live; outside a session both need `--session ID`.
-- **Log.** `relay/relay.log` in the state directory: `relaying` and `stopped`, `not delivered, kept queued` when the
-  inbox socket refused a post (retried every 2 s), `broker unreachable, waiting for it` when the broker is away.
+  status` reports whether it is live; outside a session both need `--session ID`. Both print
+  `{"session", "live", "lock"}`, `stop` once the relay has stopped, so its `"live": false` is the state after the stop.
+- **Log.** `relay/relay.log` in the state directory, shared by every session's relay: each line is a time, the relay's
+  address (or `session <id>` before it has one), then `relaying for claude pid N` and `stopped`, `not delivered, kept
+  queued` when the inbox socket refused a post (retried every 2 s), or `broker unreachable, waiting for it` when the
+  broker is away. A takeover of the relay's session (a CLI `join`, `sub` or `keep` for its address, which it takes
+  back about a second later) is not an outage and logs nothing.
 
 **Coexistence with the MCP server.** A live relay always owns the agent's subscribing session. The MCP server checks
-every 0.5 s. While a relay is live, the server publishes over a connection of its own (`Bus(addr, owner=False)`),
-`recv` says the relay delivers, and `whoami` reports `"delivery": "relay"`; `join`, `sub` and `keep` briefly take the
-session over and the relay reconnects. `leave` stops the relay first. When the relay ends, the MCP server takes the
-session back and anything not yet acked moves with it, so each message reaches the session once. Known gap: if a
-relay starts while the MCP server owns the session, they can take it from each other for up to 0.5 s, and a message
-caught in that window could in principle arrive twice.
+every 0.5 s. While a relay is live, the server publishes over a connection of its own (`Bus(addr, owner=False)`), `recv`
+says the relay delivers, and `whoami` reports `"delivery": "relay"`; `join`, `sub` and `keep` briefly take the session
+over and the relay reconnects. The CLI's `say`, `dm` and `pub` also publish over a connection of their own while this
+session's relay holds their address, so posting from the shell never interrupts the relay; without a live relay they use
+the agent's own connection, whose No Local keeps its posts out of its own queue. `leave` stops the relay first. When the
+relay ends, the MCP server takes the session back and anything not yet acked moves with it, so each message reaches the
+session once. Known gap: if a relay starts while the MCP server owns the session, they can take it from each other for
+up to 0.5 s, and a message caught in that window could in principle arrive twice.
 
 ## Admin console
 
@@ -736,11 +742,12 @@ the service.
 - **Every request/response takes 40-80 ms**: Nagle plus delayed ACK. The broker needs `set_tcp_nodelay true` (in
   mosquitto.conf) and each client should set `TCP_NODELAY` on its socket (paho: `on_socket_open`). The native core
   does on every connection. Measured: 82 ms per ledger call with neither, 41 ms with the client side only, 1.8 ms with both.
-- **A long-running Bus keeps reconnecting**: a CLI command for the same address takes its session over, since there
-  is one client id per address. The Bus reconnects about 1 s later and its unacked messages are resent, not lost or
-  doubled. CLI commands for one address take turns through a lock on `cli.lock`, except `recv --wait N`, which
-  is meant to be taken over. The MCP server's Bus does not take that lock. Known gap: a `keep` change made from the
-  CLI while a Bus is connected shows in presence, but that Bus's reconnects still use its old session expiry.
+- **A long-running Bus keeps reconnecting**: a CLI command for the same address takes its session over, since there is
+  one client id per address (except `say`, `dm` and `pub` while the session's relay holds the address). The Bus
+  reconnects about 1 s later and its unacked messages are resent, not lost or doubled. CLI commands for one address take
+  turns through a lock on `cli.lock`, except `recv --wait N`, which is meant to be taken over. The MCP server's Bus does
+  not take that lock. Known gap: a `keep` change made from the CLI while a Bus is connected shows in presence, but that
+  Bus's reconnects still use its old session expiry.
 - **An agent stops receiving anything**: it has unacked QoS 1 messages filling its receive window. The Bus runs with
   `manual_ack` and acks only what `recv` hands out. Any extra callback on the same client must ack what it consumes
   with `client.ack(mid, qos)`, which the ledger client does.

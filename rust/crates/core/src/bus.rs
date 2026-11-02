@@ -76,6 +76,8 @@ struct Cache {
     topics: Vec<String>,
     up: bool,
     closed: bool,
+    /// down because another client took the session over (DISCONNECT 142), not because the broker is away
+    taken: bool,
     /// set once both caches hold every retained record of this connection
     synced: bool,
     barrier: Option<u16>,
@@ -95,6 +97,7 @@ impl Handler for Shared {
             c.rooms.clear();
             c.agents.clear();
             c.synced = false;
+            c.taken = false;
             // A surviving session resends everything not yet acked; a lost one never will, so keep those unacked.
             c.buf = std::mem::take(&mut c.buf)
                 .into_iter()
@@ -122,10 +125,11 @@ impl Handler for Shared {
         self.cv.notify_all();
     }
 
-    fn disconnected(&self, _reason: Option<u8>) {
+    fn disconnected(&self, reason: Option<u8>) {
         let mut c = self.lock();
         c.up = false;
         c.synced = false;
+        c.taken = reason == Some(crate::mqtt::SESSION_TAKEN_OVER);
         self.cv.notify_all();
     }
 
@@ -161,7 +165,10 @@ impl Handler for Shared {
                 return conn.ack(m.ack);
             }
         }
-        if let Some(msg) = parse_message(&topic, &m.payload) {
+        // This agent's own posts: no-local keeps them off the connection that sent them, but not off this one when
+        // another connection published as the agent (the CLI's or the MCP server's publish-only Bus). Dropped here,
+        // acked and never buffered, so recv, pending() and wait_arrival never see them.
+        if let Some(msg) = parse_message(&topic, &m.payload).filter(|msg| str_of(msg, "from") != Some(&self.addr)) {
             let mut c = self.lock();
             // Unacked QoS 1 messages are already capped by ReceiveMaximum, only QoS 0 floods need BUFFER_MAX.
             if m.qos > 0 || c.buf.len() < BUFFER_MAX {
@@ -465,6 +472,13 @@ impl Bus {
     pub fn connected(&self) -> bool {
         let c = self.shared.lock();
         c.up && c.synced && !c.closed
+    }
+
+    /// Down because another client took this connection's session over (DISCONNECT 142), until it reconnects: the
+    /// broker is fine. A CLI command or second process acting as the agent does that briefly; the relay logs nothing
+    /// for it, keeping "broker unreachable" for real outages.
+    pub fn taken_over(&self) -> bool {
+        self.shared.lock().taken
     }
 
     /// One ledgerd request over this connection, as this agent or, for the console, as_ (an owner it acts for).

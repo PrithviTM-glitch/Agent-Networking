@@ -12,7 +12,7 @@ mod request;
 mod store;
 
 use agent_bridge::config;
-use agent_bridge::mqtt::{Conn, Handler, Message, Options, filter};
+use agent_bridge::mqtt::{Conn, Handler, Message, Options, SESSION_TAKEN_OVER, filter};
 use agent_bridge::protocol::NEVER;
 use agent_bridge::service::{Mode, mode};
 use rumqttc::v5::mqttbytes::v5::{PublishProperties, RetainForwardRule};
@@ -27,7 +27,6 @@ use store::{History, Outgoing, log};
 const INFLIGHT: u16 = 32;
 const QUEUE_QOS0: usize = 1000;
 const REPLY_EXPIRY: u32 = 300;
-const SESSION_TAKEN_OVER: u8 = 142;
 const RECONNECT_MAX: Duration = Duration::from_secs(10);
 /// without a broker it imports anyway after this long
 const IMPORT_WAIT: Duration = Duration::from_secs(30);

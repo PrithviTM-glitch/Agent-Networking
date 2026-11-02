@@ -10,7 +10,7 @@ mod request;
 mod store;
 
 use agent_bridge::config;
-use agent_bridge::mqtt::{Ack, Conn, Handler, Message, Options, filter};
+use agent_bridge::mqtt::{Ack, Conn, Handler, Message, Options, SESSION_TAKEN_OVER, filter};
 use agent_bridge::protocol::NEVER;
 use agent_bridge::service::{Mode, mode};
 use request::is_addr;
@@ -26,7 +26,6 @@ use store::{Ledger, Outgoing, log};
 const INFLIGHT: u16 = 32;
 const QUEUE_QOS0: usize = 1000;
 const REPLY_EXPIRY: u32 = 300;
-const SESSION_TAKEN_OVER: u8 = 142;
 const RECONNECT_MAX: Duration = Duration::from_secs(10);
 
 /// One message for the main thread, or None when another ledgerd took the session over.

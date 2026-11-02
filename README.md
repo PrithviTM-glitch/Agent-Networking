@@ -160,7 +160,8 @@ ledger (`add`, `request`, `acquire`, ...).
 
 ## Upgrading
 
-Install the new release's wheel over the old one, the same way as in the Quick start:
+What each release changes, and anything to do when upgrading, is in [CHANGELOG.md](CHANGELOG.md), which is also the
+text of each GitHub release. Install the new release's wheel over the old one, the same way as in the Quick start:
 
 ```bash
 uv tool install --force ./agent_bridge-*-manylinux_2_28_$(uname -m).whl
@@ -175,6 +176,8 @@ git fetch --tags && git checkout v0.2.1 && docker compose up -d --build
 Running Claude Code sessions keep the old code until each part restarts:
 - **Hooks** run the new commands on their next start; nothing to do.
 - **Relays**: in each session, `agent-bridge relay stop` then `agent-bridge relay start`, or start a new session.
+  `relay stop` prints the relay's status after stopping it, so its `"live": false` is expected; `relay status` after
+  the start shows `"live": true`.
 - **MCP servers**: run `/mcp` in each session and reconnect `bridge`, or restart the session. A session that skips this
   keeps the previous version's server for as long as it runs.
 
@@ -575,7 +578,7 @@ scripts/gate.sh
 | `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, one channel notice per arrival across the relay taking the session and handing it back, adopting a CLI-registered agent, mentions waking only the mentioned agent |
 | `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho and none of the Python bus, CLI, relay, hooks, ledger or history modules |
 | `tests/test_conformance.py` | The `_native` contract listed above, with the bus behaviours summary |
-| `tests/test_harness.py` | The test harness itself: a killed run's temp directory is swept by the next run, and nothing else is |
+| `tests/test_harness.py` | The test harness and release tooling: a killed run's temp directory is swept by the next run, and nothing else is; `scripts/release-notes.sh` gives a tag exactly its CHANGELOG section and refuses a tag without one |
 
 CI (`.github/workflows/ci.yml`, GitHub Actions) runs ruff; the Rust formatter, clippy and tests, including the ones
 that need Docker; builds manylinux wheels for x86_64 and aarch64, with the native binaries built inside the manylinux
@@ -585,8 +588,9 @@ shims stay silent), imports, packaged files, and that no deleted module came bac
 installed wheel, builds the Rust ledgerd and historyd images and runs each service's `--help` in them without a
 network, and builds the v0.1.0 rollback images to run the parity tests that hand one database between each Rust
 service and its rollback (a skipped parity test fails that job).
-`.github/workflows/release.yml` turns a `v*` tag into a GitHub Release with the wheels, and can publish to PyPI once
-that is set up (see [Roadmap](#roadmap)).
+`.github/workflows/release.yml` turns a `v*` tag into a GitHub Release with the wheels and the sdist, its notes being
+the tag's section of `CHANGELOG.md` (`scripts/release-notes.sh`; a tag without a section fails before anything is
+built), and can publish to PyPI once that is set up (see [Roadmap](#roadmap)).
 
 ## Rust implementation
 
@@ -712,7 +716,8 @@ What exists is described above; this is what is planned and not built yet.
 
 Issues and pull requests are welcome. Keep changes small and in the style of the code around them: the standard
 library first, no speculative abstractions, and every input from another process treated as hostile. Add or extend
-an end-to-end test for any behaviour you change, and run `ruff check`, `ruff format`, `cargo fmt`, `cargo clippy` and
+an end-to-end test for any behaviour you change, add its entry under `## [Unreleased]` in
+[CHANGELOG.md](CHANGELOG.md) in the same change, and run `ruff check`, `ruff format`, `cargo fmt`, `cargo clippy` and
 the test suites before opening a pull request.
 
 ## License
