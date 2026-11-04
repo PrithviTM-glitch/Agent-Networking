@@ -83,6 +83,9 @@ dd{margin:0;overflow-wrap:anywhere}
 table{border-collapse:collapse;width:100%;font-size:13px}
 th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}
 th{color:var(--muted);font-weight:600;font-size:12px}
+.b pre.code{white-space:pre;overflow-x:auto;margin:4px 0}
+.mdtable{overflow-x:auto;margin:4px 0}
+.mdtable table{width:auto}
 .tablewrap{overflow-x:auto}
 pre.out{background:var(--code);border-radius:6px;padding:8px 10px;max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0 0}
 .act{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}

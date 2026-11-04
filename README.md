@@ -264,11 +264,12 @@ from the address bar. `MONITOR_PORT` changes the port. The console runs on the h
 Claude Code's session registry and transcripts, checks `/proc` and signals processes. `--headless` serves the API and
 `/metrics` without the page.
 
-It lists every Claude Code session on the machine, on the bus or not, joined with the bus agents by session id, with
-a friendly name (`branch · task`), liveness and recent activity. It shows rooms, DMs, topics and broadcasts live,
-posts as the reserved agent `admin`, and shows and intervenes in the ledger (release a lease, revoke a grant). For a
-live session it can send SIGINT, SIGTERM or SIGKILL; for a dead one it can open a terminal resuming it or resume it
-with a message. Every action is written to an audit log. Details are in
+It lists every Claude Code session on the machine, on the bus or not, joined with the bus agents by session id, with a
+friendly name (`branch · task`), liveness and recent activity. It shows rooms, DMs, topics and broadcasts live (a
+Markdown pipe table in a message, up to 50 columns and 500 rows, renders as a table, a ``` block as monospace, at most
+200 blocks per message), posts as the reserved agent `admin`, and shows and intervenes in the ledger (release a lease,
+revoke a grant). For a live session it can send SIGINT, SIGTERM or SIGKILL; for a dead one it can open a terminal
+resuming it or resume it with a message. Every action is written to an audit log. Details are in
 [docs/architecture.md](docs/architecture.md#admin-console).
 
 **Room settings.** A room's Settings button edits its moderation record as `admin`. That covers the mode (open, or
@@ -578,7 +579,7 @@ scripts/gate.sh
 | `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, one channel notice per arrival across the relay taking the session and handing it back, adopting a CLI-registered agent, mentions waking only the mentioned agent |
 | `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho and none of the Python bus, CLI, relay, hooks, ledger or history modules |
 | `tests/test_conformance.py` | The `_native` contract listed above, with the bus behaviours summary |
-| `tests/test_harness.py` | The test harness and release tooling: a killed run's temp directory is swept by the next run, and nothing else is; `scripts/release-notes.sh` gives a tag exactly its CHANGELOG section and refuses a tag without one |
+| `tests/test_harness.py` | The test harness and release tooling: a killed run's temp directory is swept by the next run, and nothing else is; `scripts/release-notes.sh` gives a tag exactly its CHANGELOG section and refuses a tag without one; `scripts/check-dist.sh` lets only one wheel per architecture and the sdist of the tag's version be published |
 
 CI (`.github/workflows/ci.yml`, GitHub Actions) runs ruff; the Rust formatter, clippy and tests, including the ones
 that need Docker; builds manylinux wheels for x86_64 and aarch64, with the native binaries built inside the manylinux
@@ -588,9 +589,11 @@ shims stay silent), imports, packaged files, and that no deleted module came bac
 installed wheel, builds the Rust ledgerd and historyd images and runs each service's `--help` in them without a
 network, and builds the v0.1.0 rollback images to run the parity tests that hand one database between each Rust
 service and its rollback (a skipped parity test fails that job).
-`.github/workflows/release.yml` turns a `v*` tag into a GitHub Release with the wheels and the sdist, its notes being
-the tag's section of `CHANGELOG.md` (`scripts/release-notes.sh`; a tag without a section fails before anything is
-built), and can publish to PyPI once that is set up (see [Roadmap](#roadmap)).
+`.github/workflows/release.yml` turns a `v*` tag into a GitHub Release with the wheels and the sdist, plus
+`THIRD_PARTY_LICENSES.md`, its notes being the tag's section of `CHANGELOG.md` (`scripts/release-notes.sh`; a tag
+without a section fails before anything is built). It can publish to PyPI once that is set up (see
+[Roadmap](#roadmap)); before the release and before the upload, `scripts/check-dist.sh` refuses anything in `dist`
+but one wheel per architecture and the sdist, of the tag's version.
 
 ## Rust implementation
 

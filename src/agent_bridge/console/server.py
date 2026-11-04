@@ -18,6 +18,7 @@ STATIC = {
     "/": ("index.html", "text/html"),
     "/app.js": ("app.js", "text/javascript"),
     "/app.css": ("app.css", "text/css"),
+    "/markup.js": ("markup.js", "text/javascript"),
 }
 CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; "

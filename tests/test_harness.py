@@ -1,5 +1,5 @@
-"""The test harness and release tooling: what conftest promises about leftovers from killed runs, and the release notes
-the release workflow takes from CHANGELOG.md."""
+"""The test harness and release tooling: what conftest promises about leftovers from killed runs, the release notes
+the release workflow takes from CHANGELOG.md, and what it publishes."""
 
 import os
 import subprocess
@@ -61,3 +61,35 @@ def test_release_notes_are_the_tags_changelog_section(tmp_path):
     for missing in ("1.3.0", "1.2", "Unreleased"):  # absent, a prefix of a real version, and an empty section
         refused = release_notes(missing, changelog)
         assert refused.returncode == 1 and "has no section" in refused.stderr, (missing, refused)
+
+
+def check_dist(path, version=""):
+    script = str(ROOT / "scripts" / "check-dist.sh")
+    return subprocess.run([script, str(path), *([version] if version else [])], capture_output=True, text=True)
+
+
+def test_only_the_distributions_are_published(tmp_path):
+    """dist must hold one wheel per architecture and one sdist, of the tag's version, and nothing else, so neither the
+    GitHub release nor the PyPI upload picks up a stray file (release notes, licenses)."""
+    good = [
+        "agent_bridge-1.2.0-cp312-abi3-manylinux_2_28_x86_64.whl",
+        "agent_bridge-1.2.0-cp312-abi3-manylinux_2_28_aarch64.whl",
+        "agent_bridge-1.2.0.tar.gz",
+    ]
+    for name in good:
+        (tmp_path / name).touch()
+    for version in ("", "1.2.0", "v1.2.0"):
+        assert check_dist(tmp_path, version).returncode == 0, version
+    assert "not a wheel or sdist of agent-bridge 1.1.0" in check_dist(tmp_path, "1.1.0").stderr
+    for stray, why in (
+        ("THIRD_PARTY_LICENSES.md", "not a wheel or sdist"),
+        (".release-notes.md", "not a wheel or sdist"),
+        ("agent_bridge-1.2.0-cp312-abi3-manylinux_2_34_x86_64.whl", "2 x86_64 and 1 aarch64 wheels"),
+        ("agent_bridge-1.1.0.tar.gz", "2 sdists"),
+    ):
+        (tmp_path / stray).touch()
+        refused = check_dist(tmp_path)
+        assert refused.returncode == 1 and why in refused.stderr, (stray, refused.stderr)
+        (tmp_path / stray).unlink()
+    (tmp_path / good[1]).unlink()
+    assert "1 x86_64 and 0 aarch64 wheels" in check_dist(tmp_path).stderr

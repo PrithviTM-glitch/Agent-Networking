@@ -1457,6 +1457,109 @@ def test_ledger_no_reply_wording(monkeypatch):
         assert ("it may still have been applied, check the ledger view" in str(e.value)) == applied, (op, e.value)
 
 
+MARKUP_JS = """
+const M = require(process.argv[1]);
+// A stub document: elements record their tag, class, children, text and style; setting innerHTML throws.
+const node = tag => {
+  const n = {tag, className: "", kids: [], style: {}, _text: null};
+  Object.defineProperty(n, "textContent", {set(v) { n._text = String(v); }, get() { return n._text; }});
+  Object.defineProperty(n, "innerHTML", {set() { throw new Error("innerHTML used"); }});
+  n.append = (...k) => n.kids.push(...k);
+  return n;
+};
+const doc = {createElement: node, createTextNode: t => ({tag: "#text", text: t})};
+const tree = n => n.tag === "#text" ? ["#text", n.text]
+  : [n.tag, n.className, n._text, n.style.textAlign || "", n.kids.map(tree)];
+const out = {};
+for (const [name, text] of Object.entries(JSON.parse(require("fs").readFileSync(0, "utf8")))) {
+  const root = node("div"), t0 = process.hrtime.bigint();
+  M.render(doc, root, text, (p, t) => p.append(doc.createTextNode(t)));
+  out[name] = {ms: Number(process.hrtime.bigint() - t0) / 1e6, tree: root.kids.map(tree)};
+}
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def markup(**cases):
+    """markup.js's rendering of each case under node: {ms, tree}, the tree as [tag, class, text, align, children]."""
+    js = os.path.join(os.path.dirname(config.__file__), "console", "static", "markup.js")
+    p = subprocess.run(
+        ["node", "-e", MARKUP_JS, js], input=json.dumps(cases), capture_output=True, text=True, timeout=30
+    )
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+def trees(**cases):
+    return {name: r["tree"] for name, r in markup(**cases).items()}
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="needs node to run the page's markup.js")
+def test_message_markup():
+    """Markdown pipe tables render as <table> and ``` fences as <pre>, built with textContent only: message text
+    never becomes markup, and anything malformed stays plain text."""
+    got = trees(
+        table="before\n| name | state |\n|---|:-:|\n| <script>alert(1)</script> | a\\|b |\n| one |\nafter",
+        nosep="| a | b |\n| c | d |",
+        badsep="| a | b |\n|---|\n| c | d |",
+        fence="intro\n```\n| x | y |\n<b>bold</b>\n```\nend",
+        unclosed="```\nnot code\n| a | b |",
+    )
+    [before, wrap, after] = got["table"]
+    assert before == ["#text", "before"] and after == ["#text", "after"], got["table"]
+    assert wrap[:2] == ["div", "mdtable"]
+    [table] = wrap[4]
+    [thead, tbody] = table[4]
+    assert [(c[0], c[2], c[3]) for c in thead[4][0][4]] == [("th", "name", ""), ("th", "state", "center")]
+    rows = [[(c[0], c[2]) for c in tr[4]] for tr in tbody[4]]
+    assert rows == [[("td", "<script>alert(1)</script>"), ("td", "a|b")], [("td", "one")]], "short rows unpadded"
+    assert got["nosep"] == [["#text", "| a | b |\n| c | d |"]], "no separator: plain text"
+    assert got["badsep"] == [["#text", "| a | b |\n|---|\n| c | d |"]], "a separator of the wrong width: plain text"
+    assert got["fence"] == [
+        ["#text", "intro"],
+        ["pre", "out code", "| x | y |\n<b>bold</b>", "", []],
+        ["#text", "end"],
+    ], got["fence"]
+    assert got["unclosed"] == [["#text", "```\nnot code\n| a | b |"]], "an unclosed fence stays plain text"
+    # Bounded work: a table over 50 columns or 500 rows stays plain text, and unclosed fences are scanned once.
+    row = lambda n: "|" + " x |" * n  # noqa: E731
+    sep = lambda n: "|" + "---|" * n  # noqa: E731
+    big = markup(
+        cols50="\n".join([row(50), sep(50), row(50)]),
+        cols51="\n".join([row(51), sep(51), row(51)]),
+        rows500="\n".join([row(1), sep(1), *[row(1)] * 500]),
+        rows501="\n".join([row(1), sep(1), *[row(1)] * 501]),
+        # bridge-core's attack: a 5000-column header, its separator, then 22000 one-pipe rows, in one 64 KiB body.
+        amplify="\n".join(["|" * 5001, "|" + "-|" * 5000, *["|"] * 22000]),
+        fences="```a\n" * 13000,  # openers that a lone ``` never closes, about 64 KiB
+        closed="```\nx\n```\n" * 5000,  # many closed fences: each closer search starts at its opener
+        tiny="```\n```\n" * 8000,  # 8000 empty fences in about 64 KiB: at most 200 blocks, then one text run
+        # bridge-core's padding case: 54 tables (a 50-column header, its separator, 500 one-pipe rows), each apart.
+        padded="\nx\n".join(["\n".join(["|" + "a|" * 50, "|" + "-|" * 50, *["|"] * 500])] * 54),
+    )
+    assert big["cols50"]["tree"][0][:2] == ["div", "mdtable"] and big["rows500"]["tree"][0][:2] == ["div", "mdtable"]
+    for name in ("cols51", "rows501", "amplify", "fences"):
+        assert [n[0] for n in big[name]["tree"]] == ["#text"], f"{name} stays plain text"
+        assert big[name]["ms"] < 200, (name, big[name]["ms"])
+
+    def count(n):
+        return (n[0] in ("th", "td")) + sum(count(k) for k in (n[4] if n[0] != "#text" else []))
+
+    tables = [n for n in big["padded"]["tree"] if n[:2] == ["div", "mdtable"]]
+    assert len(tables) == 54, f"each of the 54 tables renders ({len(tables)})"
+    cells_made = sum(count(n) for n in big["padded"]["tree"])
+    assert cells_made <= 32 * 1024 and big["padded"]["ms"] < 200, (cells_made, big["padded"]["ms"])
+    for name in ("closed", "tiny"):
+        kinds = [n[0] for n in big[name]["tree"]]
+        assert big[name]["ms"] < 200 and kinds == ["pre"] * 200 + ["#text"], (name, big[name]["ms"], len(kinds))
+    assert len("\n".join(["|" * 5001, "|" + "-|" * 5000, *["|"] * 22000]).encode()) <= 65536
+    static = os.path.join(os.path.dirname(config.__file__), "console", "static")
+    for name in ("markup.js", "app.js"):
+        with open(os.path.join(static, name)) as f:
+            used = re.findall(r"\.innerHTML\b|\.outerHTML\b|insertAdjacentHTML|document\.write", f.read())
+            assert not used, f"{name} must build markup with textContent only, found {used}"
+
+
 def test_native_only_imports():
     """The console and the MCP server run on the native core: importing them loads no paho and none of the modules the
     cutover deletes (the Python bus, CLI, relay, hooks, ledger and history), so those go without touching either. What

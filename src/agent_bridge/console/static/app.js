@@ -188,19 +188,23 @@ function mentioned(m, word) {
   return ms.includes(word) || ms.some(a => (agentOf(a) || {}).name === word);
 }
 function bodyNode(m) {
+  // Fenced blocks and pipe tables (markup.js) render as <pre> and <table>; the text between them keeps its mentions.
   const b = el("div", "b");
-  if (!m.topic.startsWith("room/") || !m.body.includes("@")) { b.textContent = m.body; return b; }
+  Markup.render(document, b, m.body, (parent, text) => mentionText(parent, m, text));
+  return b;
+}
+function mentionText(b, m, text) {
+  if (!m.topic.startsWith("room/") || !text.includes("@")) { b.append(document.createTextNode(text)); return; }
   let last = 0;
-  for (const x of m.body.matchAll(/(^|\s)@([A-Za-z0-9_-]+)/g)) {
+  for (const x of text.matchAll(/(^|\s)@([A-Za-z0-9_-]+)/g)) {
     const at = x.index + x[1].length, word = x[2];
     if (!mentioned(m, word)) continue;
-    b.append(document.createTextNode(m.body.slice(last, at)));
+    b.append(document.createTextNode(text.slice(last, at)));
     const me = word === ADMIN || ((m.mentions || []).includes(ADMIN) && agentOf(ADMIN)?.name === word);
     b.append(el("span", "mention" + (me ? " me" : ""), "@" + word));
     last = at + word.length + 1;
   }
-  b.append(document.createTextNode(m.body.slice(last)));
-  return b;
+  b.append(document.createTextNode(text.slice(last)));
 }
 function renderChannel(id, fresh) {
   const body = $("body"), stick = fresh || body.scrollTop + body.clientHeight >= body.scrollHeight - 40;

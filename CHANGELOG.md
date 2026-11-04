@@ -9,6 +9,19 @@ workflow publishes the section as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-04
+
+### Added
+- The console renders Markdown tables and fenced code blocks in messages: a pipe table (a header row, then a
+  `|---|` separator) becomes a real table, for tables up to 50 columns and 500 rows, and a ``` block becomes
+  monospace, in rooms, DMs and broadcasts, at most 200 blocks per message. Both are built from text only, so a
+  message cannot inject markup, and anything malformed or over the caps stays plain text.
+
+### Fixed
+- Releases publish only the wheels and the sdist, plus `THIRD_PARTY_LICENSES.md` on the GitHub release by name.
+  Every artifact of the run used to land in the upload directory (the licenses since 0.1.0, the release notes in
+  0.2.2), which PyPI would have refused; `scripts/check-dist.sh` now guards the GitHub release and the PyPI upload.
+
 ## [0.2.2] - 2026-11-02
 
 ### Added
@@ -99,7 +112,8 @@ First release.
 - A Rust core with Python bindings, and Rust ports of the CLI, relay, ledgerd and historyd, kept in parity with the
   Python reference by conformance tests.
 
-[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.1.0...v0.2.0

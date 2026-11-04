@@ -25,23 +25,36 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+      # Only the wheels and the sdist go in dist: it is what gets published, and PyPI refuses anything else.
       - uses: actions/download-artifact@v8
         with:
+          pattern: wheel-*
           path: dist
           merge-multiple: true
       - uses: actions/download-artifact@v8
         with:
+          name: sdist
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
           name: release-notes
           path: notes
+      - uses: actions/download-artifact@v8
+        with:
+          name: licenses
+          path: licenses
       - name: The tag must match the package version
         run: |
           sdist=(dist/agent_bridge-*.tar.gz)
           version=${sdist[0]#dist/agent_bridge-}
           version=${version%.tar.gz}
           test "$GITHUB_REF_NAME" = "v$version" || { echo "tag $GITHUB_REF_NAME, package $version"; exit 1; }
+      - run: scripts/check-dist.sh dist "$GITHUB_REF_NAME"
+      # The third-party licenses are attached on purpose, by name, next to the distributions.
       - run: >-
-          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME"
-          --notes-file notes/release-notes.md --verify-tag
+          gh release create "$GITHUB_REF_NAME" dist/* licenses/THIRD_PARTY_LICENSES.md --repo "$GITHUB_REPOSITORY"
+          --title "$GITHUB_REF_NAME" --notes-file notes/release-notes.md --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
   pypi:
@@ -53,8 +66,16 @@ jobs:
     permissions:
       id-token: write
     steps:
+      - uses: actions/checkout@v7
+      # Only the wheels and the sdist go in dist: it is what gets published, and PyPI refuses anything else.
       - uses: actions/download-artifact@v8
         with:
+          pattern: wheel-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: dist
+      - run: scripts/check-dist.sh dist "$GITHUB_REF_NAME"
       - uses: pypa/gh-action-pypi-publish@v1.14.3

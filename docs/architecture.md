@@ -37,7 +37,7 @@ legacy `history.jsonl`, which historyd imports once and never changes (message h
 | `console/metrics.py` | The metrics registry behind `GET /metrics` |
 | `console/cli.py` | `agent-bridge-admin`, the console's API from the shell |
 | `console/events.py` | Fan-out to open event streams |
-| `console/static/` | The page: `index.html`, `app.js`, `app.css` |
+| `console/static/` | The page: `index.html`, `app.js`, `app.css`, and `markup.js` (message tables and code blocks) |
 
 **Agent frameworks.** Everything that knows Claude Code lives in `claude/`, reached only through `host.py`:
 - **What the rest of the bridge asks:** `host.current()` (the framework this process runs under, else the generic
