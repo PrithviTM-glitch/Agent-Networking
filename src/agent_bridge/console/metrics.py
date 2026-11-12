@@ -12,6 +12,8 @@ import sys
 import threading
 import time
 
+import agent_bridge
+
 from .. import _native
 from . import actions, admin, capacity, events, leaks, sessions
 
@@ -77,6 +79,7 @@ HELP = {
     "agent_bridge_console_open_fds": "Open file descriptors of the console process",
     "agent_bridge_console_uptime_seconds": "Seconds since the console started",
     "agent_bridge_console_stream_clients": "Pages holding the live event stream",
+    "agent_bridge_console_build_info": "The console's version (the package, and its native core), value 1",
     "agent_bridge_console_broker_connected": "1 while the console holds the admin identity on the broker",
     "agent_bridge_machine_load": "Load average",
     "agent_bridge_machine_cpus": "CPU cores",
@@ -212,6 +215,7 @@ def _console(r):
     with events.lock:
         r.add("agent_bridge_console_stream_clients", len(events.streams))
     r.add("agent_bridge_console_broker_connected", int(admin.held["bus"] is not None))
+    r.add("agent_bridge_console_build_info", 1, version=agent_bridge.__version__, native=_native.__version__)
 
 
 def _broker(r):

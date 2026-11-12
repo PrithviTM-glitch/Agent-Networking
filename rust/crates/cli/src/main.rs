@@ -3,6 +3,7 @@
 
 mod args;
 mod commands;
+mod doctor;
 mod hooks;
 mod ledger_raw;
 mod relay;
@@ -35,13 +36,19 @@ fn main() {
         std::process::exit(1);
     }));
     agent_bridge::ledger::cancel_on_signals();
+    let parsed = args::Cli::try_parse();
+    // help and --version read no configuration, so they work whatever the environment holds
+    if let Err(e) = &parsed
+        && matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion)
+    {
+        e.exit()
+    }
     if let Err(e) = agent_bridge::config::get() {
         eprintln!("{e}");
         std::process::exit(1);
     }
-    let cli = match args::Cli::try_parse() {
+    let cli = match parsed {
         Ok(cli) => cli,
-        Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => e.exit(),
         Err(e) if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
             eprintln!("agent-bridge: the following arguments are required: COMMAND");
             std::process::exit(1);

@@ -1,10 +1,12 @@
-"""The ledgerd rollback promise: the Rust ledgerd and the frozen Python one in agent-bridge-ledgerd:2 (built from
-v0.1.0) hand one ledger.db back and forth (schema 1) with nothing lost or duplicated: ledgers, resources, requests, a
-held write lease and its fencing token, a queued waiter, and the replay of a redelivered request.
+"""The ledgerd rollback promise: this ledgerd and its rollbacks, the frozen Python one in agent-bridge-ledgerd:2
+(built from v0.1.0) and the Rust one in agent-bridge-ledgerd:0.2.3, hand one ledger.db back and forth (schema 1) with
+nothing lost or duplicated: ledgers, resources, requests, a held write lease and its fencing token, a queued waiter,
+and the replay of a redelivered request. A database with 0.3.0's lease history opens and serves in both rollbacks,
+which ignore that table.
 
-The Python side runs in Docker (AGENT_BRIDGE_ROLLBACK_LEDGERD overrides the image); skipped when the image is not built.
-One writer at a time: each ledgerd is stopped, and seen to exit, before the other opens the database. This test lives
-exactly as long as the README offers that image as the rollback.
+The rollbacks run in Docker (AGENT_BRIDGE_ROLLBACK_LEDGERD and AGENT_BRIDGE_ROLLBACK_LEDGERD_RUST override the images);
+each test is skipped when its image is not built. One writer at a time: each ledgerd is stopped, and seen to exit,
+before the other opens the database. These tests live exactly as long as the README offers those images as rollbacks.
 """
 
 import json
@@ -26,15 +28,22 @@ from agent_bridge import _native, config
 from agent_bridge.errors import LedgerError
 
 IMAGE = os.environ.get("AGENT_BRIDGE_ROLLBACK_LEDGERD", "agent-bridge-ledgerd:2")
+RUST_IMAGE = os.environ.get("AGENT_BRIDGE_ROLLBACK_LEDGERD_RUST", "agent-bridge-ledgerd:0.2.3")
 
 
-def built():
+def built(image):
     if not shutil.which("docker"):
         return False
-    return subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True).returncode == 0
+    return subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode == 0
 
 
-pytestmark = pytest.mark.skipif(not built(), reason=f"the rollback image {IMAGE} is not built")
+python_rollback = pytest.mark.skipif(not built(IMAGE), reason=f"the rollback image {IMAGE} is not built")
+rust_rollback = pytest.mark.skipif(not built(RUST_IMAGE), reason=f"the rollback image {RUST_IMAGE} is not built")
+# The v0.1.0 image has a PATH; the Rust one is a static binary on scratch.
+ROLLBACKS = [
+    pytest.param(IMAGE, "agent-bridge-ledgerd", marks=python_rollback, id="python-0.1.0"),
+    pytest.param(RUST_IMAGE, "/agent-bridge-ledgerd", marks=rust_rollback, id="rust-0.2.3"),
+]
 
 
 def answers():
@@ -56,17 +65,16 @@ class Rust:
 
 
 class Rollback:
-    """The Python ledgerd in its image, on the host network and as this user, so the files it creates in data stay
-    writable for the host-run Rust ledgerd; --init forwards docker stop's SIGTERM to it, since it runs as PID 1."""
+    """A rollback ledgerd in its image, on the host network and as this user, so the files it creates in data stay
+    writable for the host-run ledgerd; --init forwards docker stop's SIGTERM to it, since it runs as PID 1."""
 
-    def __init__(self, data):
+    def __init__(self, data, image=IMAGE, command="agent-bridge-ledgerd"):
         self.name = f"agent-bridge-ledger-parity-{os.getpid()}"
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
         subprocess.run(
             ["docker", "run", "-d", "--rm", "--init", "--name", self.name, "--network", "host",
              "--user", f"{os.getuid()}:{os.getgid()}", "-v", f"{data}:/data", "-e", "LEDGER_DB=/data/ledger.db",
-             "-e", f"AGENT_BRIDGE_HOST={config.HOST}", "-e", f"AGENT_BRIDGE_PORT={config.PORT}", IMAGE,
-             "agent-bridge-ledgerd"],
+             "-e", f"AGENT_BRIDGE_HOST={config.HOST}", "-e", f"AGENT_BRIDGE_PORT={config.PORT}", image, command],
             check=True,
             capture_output=True,
         )  # fmt: skip
@@ -112,6 +120,7 @@ def state():
     return d
 
 
+@python_rollback
 def test_rust_and_python_share_one_database(state_dir, tmp_path):
     data = str(tmp_path)  # mounted at /data in the rollback container; the Rust ledgerd opens the same file
     db, log = os.path.join(data, "ledger.db"), os.path.join(state_dir, "ledgerd.log")
@@ -194,6 +203,7 @@ def test_rust_and_python_share_one_database(state_dir, tmp_path):
         raw.loop_stop()
 
 
+@python_rollback
 def test_an_interrupted_acquire_against_the_rollback(tmp_path):
     """cancel is newer than v0.1.0: the Python ledgerd refuses it as an unknown op, and an interrupted command-line
     acquire still ends quietly by its signal, as it does against the Rust ledgerd."""
@@ -222,3 +232,50 @@ def test_an_interrupted_acquire_against_the_rollback(tmp_path):
         )
     finally:
         rollback.remove()
+
+
+@pytest.mark.parametrize(("image", "command"), ROLLBACKS)
+def test_the_lease_history_survives_a_rollback(state_dir, tmp_path, image, command):
+    """lease_events is additive: a rollback opens and serves a database that has it, without recording into it, and
+    this ledgerd finds its history intact afterwards. The rollback has no leases op, and the client says so."""
+    data = str(tmp_path)
+    db, log = os.path.join(data, "ledger.db"), os.path.join(state_dir, "ledgerd.log")
+    o, h = "parh-o1", "parh-h1"
+    rollback = None
+    try:
+        ledgerd = Rust(db, log)
+        for x in (o, h):
+            call("init", x)
+        call("add", o, name="lk", visibility="public", max_level="write")
+        call("request", h, resource=f"{o}/lk", level="write")
+        first = call("acquire", h, resource=f"{o}/lk", level="write", ttl=60)["lease"]
+        call("release", h, lease_id=first["lease_id"])
+        held = call("acquire", h, resource=f"{o}/lk", level="write", ttl=120)["lease"]
+        assert [x["lease_id"] for x in call("leases", h)["leases"]] == [held["lease_id"]]
+        events = call("lease_history", o, resource=f"{o}/lk")["events"]
+        assert [e["event"] for e in events] == ["acquire", "release", "acquire"]
+        before = state()
+        ledgerd.stop()
+
+        rollback = Rollback(data, image, command)
+        assert state() == before, "the rollback reads what this ledgerd wrote"
+        with pytest.raises(LedgerError, match="ledgerd is older than 0.3.0 and has no leases op"):
+            call("leases", h)
+        call("release", h, lease_id=held["lease_id"])
+        again = call("acquire", h, resource=f"{o}/lk", level="write", ttl=60)["lease"]
+        assert again["token"] > held["token"]
+        call("release", h, lease_id=again["lease_id"])
+        after = state()
+        rollback.stop()
+
+        ledgerd = Rust(db, log)
+        assert state() == after
+        assert call("lease_history", o, resource=f"{o}/lk")["events"] == events, "kept, and nothing recorded meanwhile"
+        call("release", h, lease_id=call("acquire", h, resource=f"{o}/lk", level="write", ttl=5)["lease"]["lease_id"])
+        assert len(call("lease_history", o, resource=f"{o}/lk")["events"]) == 5
+        ledgerd.stop()
+        with sqlite3.connect(db) as conn:
+            assert conn.execute("SELECT value FROM meta WHERE key='schema'").fetchall() == [(1,)], "still schema 1"
+    finally:
+        if rollback:
+            rollback.remove()

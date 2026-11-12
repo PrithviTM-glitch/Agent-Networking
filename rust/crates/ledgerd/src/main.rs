@@ -12,7 +12,7 @@ mod store;
 use agent_bridge::config;
 use agent_bridge::mqtt::{Ack, Conn, Handler, Message, Options, SESSION_TAKEN_OVER, filter};
 use agent_bridge::protocol::NEVER;
-use agent_bridge::service::{Mode, mode};
+use agent_bridge::service::{Mode, mode, version_line};
 use request::is_addr;
 use rumqttc::v5::mqttbytes::v5::PublishProperties;
 use std::path::PathBuf;
@@ -75,6 +75,10 @@ fn main() {
         }
         Mode::Help => {
             print!("{}", args::USAGE);
+            return;
+        }
+        Mode::Version => {
+            println!("{}", version_line("agent-bridge-ledgerd"));
             return;
         }
         Mode::Bad(text) => {

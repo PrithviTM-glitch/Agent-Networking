@@ -3,7 +3,7 @@
 use crate::args::{Cmd, Details, Hook, Moderation, OnOff, RoomCmd};
 use crate::relay;
 use agent_bridge::bus::Bus;
-use agent_bridge::json::{Map, dumps_map, float};
+use agent_bridge::json::{Map, dumps_readable, float};
 use agent_bridge::validation::{check_ident, check_wait, not_admin, os_error};
 use agent_bridge::{Error, Result, claude, config, history, ledger, presence, rooms};
 use serde_json::Value;
@@ -20,10 +20,52 @@ pub fn out(line: &str) {
     }
 }
 
+/// One JSON object per line, non-ASCII readable rather than \u-escaped.
 pub fn show_all(items: &[Map]) {
     for item in items {
-        out(&dumps_map(item));
+        out(&dumps_readable(&Value::Object(item.clone())));
     }
+}
+
+/// Messages as JSON lines, or with text one readable line each.
+fn show_messages(msgs: &[Map], text: bool) {
+    match text {
+        true => msgs.iter().for_each(|m| out(&agent_bridge::text::line(m))),
+        false => show_all(msgs),
+    }
+}
+
+/// say's and dm's message: TEXT, stdin for "-", or --file PATH, read as UTF-8 up to just past the 64 KiB limit, so
+/// the usual check refuses an oversized one, without the one newline that ends the input.
+fn message(text: Option<String>, file: Option<std::path::PathBuf>) -> Result<String> {
+    use std::io::Read;
+    // the limit plus room for a final "\r\n", so a message of exactly the limit read from a CRLF file still fits
+    let limit = (agent_bridge::validation::BODY_MAX + 2) as u64;
+    let (bytes, what) = match (text, file) {
+        (Some(t), _) if t != "-" => return Ok(t),
+        (Some(_), _) => {
+            let mut buf = Vec::new();
+            std::io::stdin().take(limit).read_to_end(&mut buf).map_err(|e| os_error(&e, None))?;
+            (buf, "stdin".to_owned())
+        }
+        (None, Some(path)) => {
+            let mut buf = Vec::new();
+            File::open(&path)
+                .and_then(|f| f.take(limit).read_to_end(&mut buf))
+                .map_err(|e| os_error(&e, Some(&path)))?;
+            (buf, path.display().to_string())
+        }
+        (None, None) => return Err(Error("give TEXT, - for stdin, or --file PATH".into())),
+    };
+    let mut text = String::from_utf8(bytes).map_err(|_| Error(format!("{what} is not UTF-8")))?;
+    // the newline that ends the input (echo, an editor's last line) is not part of the message; only one goes
+    if text.ends_with('\n') {
+        text.pop();
+        if text.ends_with('\r') {
+            text.pop();
+        }
+    }
+    Ok(text)
 }
 
 fn crc32(data: &[u8]) -> u32 {
@@ -61,7 +103,7 @@ fn attached<T>(addr: &str, take_turn: bool, f: impl FnOnce(&Bus) -> Result<T>) -
     f(&Bus::attach(addr)?)
 }
 
-/// say, dm and pub while this session's relay holds addr: a publish-only connection of their own, so the relay keeps
+/// say, dm, pub and describe while this session's relay holds addr: a publish-only connection of their own, so the relay keeps
 /// its session. Otherwise the owner connection, under whose no-local the agent does not get its own posts back.
 fn posted<T>(addr: &str, f: impl FnOnce(&Bus) -> Result<T>) -> Result<T> {
     let session = std::env::var(claude::SESSION_ENV).unwrap_or_default();
@@ -95,12 +137,12 @@ fn leave(addr: &str) -> Result<()> {
     Ok(())
 }
 
-fn recv(addr: &str, wait: f64) -> Result<()> {
+fn recv(addr: &str, wait: f64, text: bool) -> Result<()> {
     attached(addr, wait == 0.0, |b| {
         // Queued messages come right after CONNACK, ahead of the Bus's connect barrier, so recv(0) already sees them.
         let mut msgs = b.recv(check_wait(wait)?, None, None)?;
         while !msgs.is_empty() {
-            show_all(&msgs);
+            show_messages(&msgs, text);
             msgs = b.recv(QUIET, None, None)?;
         }
         Ok(())
@@ -111,14 +153,16 @@ fn moderation(verb: &str, m: &Moderation) -> Result<()> {
     shown(&m.addr, |b| b.moderate_member(verb, &m.room, &m.target))
 }
 
+/// A ledger error as the CLI prints it: one line, "ledger: ...".
+fn plain(e: ledger::LedgerError) -> Error {
+    Error(format!("ledger: {}", e.to_string().split_whitespace().collect::<Vec<_>>().join(" ")))
+}
+
 /// A ledger command: init MY_ADDR's ledger, send op with the given fields, print the reply without "ok".
 fn ledger_op(addr: &str, op: &str, fields: &[(&str, Option<Value>)]) -> Result<()> {
     not_admin(Some(addr), "address")?;
     presence::need(addr)?;
     let args: Map = fields.iter().filter_map(|(k, v)| Some(((*k).to_owned(), v.clone()?))).collect();
-    let plain = |e: ledger::LedgerError| {
-        Error(format!("ledger: {}", e.to_string().split_whitespace().collect::<Vec<_>>().join(" ")))
-    };
     ledger::call("init", addr, Map::new(), None).map_err(plain)?;
     let mut reply = ledger::call(op, addr, args, None).map_err(plain)?;
     reply.shift_remove("ok");
@@ -152,7 +196,8 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::Rooms => rooms::listing().map(|r| show_all(&r)),
         Cmd::Join { addr, room } => attached(&addr, true, |b| b.join(&room)),
         Cmd::Part { addr, room } => attached(&addr, true, |b| b.part(&room)),
-        Cmd::Say { addr, room, text } => {
+        Cmd::Say { addr, room, text, file } => {
+            let text = message(text, file)?;
             let said = posted(&addr, |b| b.say(&room, &text))?;
             if !said.unresolved.is_empty() {
                 let words: Vec<String> = said.unresolved.iter().map(|w| format!("@{w}")).collect();
@@ -173,16 +218,31 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::Ban(m) => moderation("ban", &m),
         Cmd::Unban(m) => moderation("unban", &m),
         Cmd::Kick(m) => moderation("kick", &m),
-        Cmd::History { room, last } => history::client::room(&room, last, None).map(|h| show_all(&h)),
-        Cmd::Dm { addr, to, text } => posted(&addr, |b| b.dm(&to, &text)),
-        Cmd::Dms { addr, peer, last } => history::client::dms(&addr, peer.as_deref(), last).map(|h| show_all(&h)),
+        Cmd::History { room, last, before, text } => {
+            history::client::room_paged(&room, last, before).map(|h| show_messages(&h, text))
+        }
+        Cmd::Dm { addr, to, text, file } => {
+            let text = message(text, file)?;
+            posted(&addr, |b| b.dm(&to, &text))
+        }
+        Cmd::Dms { addr, peer, last, before, text } => {
+            history::client::dms_paged(&addr, peer.as_deref(), last, before).map(|h| show_messages(&h, text))
+        }
         Cmd::Sub { addr, topic } => attached(&addr, true, |b| b.sub(&topic)),
         Cmd::Unsub { addr, topic } => attached(&addr, true, |b| b.unsub(&topic)),
         Cmd::Pub { addr, topic, text } => posted(&addr, |b| b.publish(&topic, &text)),
         // A waiting recv can be long, so it does not take a turn: other commands take its session over and it
         // reconnects.
-        Cmd::Recv { addr, wait } => recv(&addr, wait),
+        Cmd::Recv { addr, wait, text } => recv(&addr, wait, text),
+        Cmd::Watch { room, last, text } => agent_bridge::watch::run(&room, last, text),
+        Cmd::Describe { addr, name, caps, about } => {
+            let caps: Option<Vec<String>> =
+                caps.map(|c| c.split(',').filter(|c| !c.is_empty()).map(str::to_owned).collect());
+            // presence writes go over a publish-only connection too, so a live relay keeps its session
+            posted(&addr, |b| b.describe(name.as_deref(), caps.as_deref(), about.as_deref()))
+        }
         Cmd::Relay { action, run, session } => relay::command(action, &run, session),
+        Cmd::Doctor { json } => crate::doctor::run(json),
         Cmd::Hook { which: Hook::Broadcast } => {
             crate::hooks::broadcast();
             Ok(())
@@ -201,13 +261,28 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::Remove { addr, name } => ledger_op(&addr, "remove", &[("name", Some(name.into()))]),
         Cmd::Ledger { addr, owner } => ledger_op(&addr, "ledger", &[("owner", text(&owner))]),
         Cmd::Public { addr } => ledger_op(&addr, "public", &[]),
-        Cmd::Request { addr, resource, level } => {
+        Cmd::Request { addr, resource, level, wait: None } => {
             ledger_op(&addr, "request", &[("resource", Some(resource.into())), ("level", Some(level.name().into()))])
+        }
+        Cmd::Request { addr, resource, level, wait: Some(wait) } => {
+            not_admin(Some(&addr), "address")?;
+            presence::need(&addr)?;
+            let reply = ledger::request_wait(&addr, &resource, &level.name(), wait).map_err(plain)?;
+            show_all(&[reply]);
+            Ok(())
         }
         Cmd::Grant { addr, request_id } => ledger_op(&addr, "grant", &[("request_id", Some(request_id.into()))]),
         Cmd::Deny { addr, request_id } => ledger_op(&addr, "deny", &[("request_id", Some(request_id.into()))]),
         Cmd::Grants { addr } => ledger_op(&addr, "grants", &[]),
-        Cmd::Acquire { addr, resource, level, ttl, wait } => ledger_op(
+        Cmd::Acquire { addr, resource, level, ttl, wait, exec: Some(cmd) } => {
+            // CMD never ran, so the status says "retry" (75), not a status CMD itself could have
+            if let Err(e) = not_admin(Some(&addr), "address").and_then(|_| presence::need(&addr).map(drop)) {
+                eprintln!("{e}");
+                std::process::exit(ledger::EXEC_NO_LEASE);
+            }
+            std::process::exit(ledger::exec(&addr, &resource, &level.name(), ttl, wait, &cmd))
+        }
+        Cmd::Acquire { addr, resource, level, ttl, wait, exec: None } => ledger_op(
             &addr,
             "acquire",
             &[
@@ -221,6 +296,12 @@ pub fn run(cmd: Cmd) -> Result<()> {
             ledger_op(&addr, "renew", &[("lease_id", Some(lease_id.into())), ("ttl", ttl.map(number))])
         }
         Cmd::Release { addr, lease_id } => ledger_op(&addr, "release", &[("lease_id", Some(lease_id.into()))]),
+        Cmd::Leases { addr } => ledger_op(&addr, "leases", &[]),
+        Cmd::LeaseHistory { addr, resource, last } => {
+            // a bare NAME is one of your own, as add and remove take it
+            let resource = if resource.contains('/') { resource } else { format!("{addr}/{resource}") };
+            ledger_op(&addr, "lease_history", &[("resource", Some(resource.into())), ("last", last.map(Value::from))])
+        }
     }
 }
 

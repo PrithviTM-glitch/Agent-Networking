@@ -9,6 +9,80 @@ workflow publishes the section as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-12
+
+### Added
+- `--version` (and `-V`) on every command, native and Python alike: it prints `<command> <version>` and exits 0
+  without connecting or reading any settings. Python code reads the same version as `agent_bridge.__version__`.
+- `agent-bridge doctor [--json]` checks this machine's bridge, read-only: the broker, ledgerd and historyd (and their
+  versions), the state and config directories (ownership and modes), `cli.lock`, version skew between the CLI, the
+  services and the installed wheel, relays still running a replaced binary or outliving their session, and whether each
+  agent-bridge hook in `~/.claude/settings.json` runs an existing program. Each check is OK, WARN or FAIL with what to
+  do, and any FAIL exits 1.
+- `agent-bridge relay restart` stops this session's relay and starts it again on the installed binary, for after an
+  upgrade.
+- `relay status` (and `stop`) also show the relay's `pid`, `started`, `uptime_s`, `binary` and `version`; the binary
+  ends in ` (deleted)` when an upgrade replaced it. The relay lock file gains the version as its third line.
+- `agent-bridge watch ROOM [--last N] [--text]` follows a room from the terminal: its last messages from history,
+  then each new one live, until Ctrl-C. It needs no agent or membership, and it never takes over a session.
+- `--text` on `recv`, `history`, `dms` and `watch` prints one readable line per message (`14:02:31 #ops alice-1a2b3c:
+  hello`) instead of JSON. A body's carriage returns and bidi or zero-width marks are shown escaped.
+- History paging: `history ROOM --before SEQ` and `dms MY_ADDR --before SEQ` page back past the newest 1000. Each entry
+  shown by these commands carries its `seq`. historyd returns `seq` only when a request asks for it, so 0.2.x clients
+  get the same replies as before.
+- `say` and `dm` read the text from stdin when it is `-`, or from a file with `--file PATH`; the one newline that ends
+  the input is dropped, so `echo` and heredocs send what you typed.
+- `describe` sets a one-line `about` (up to 200 bytes; `""` removes it) next to the name and caps. Like the MCP
+  server's `mcp`, it is an optional presence field: a 0.2.x client that rewrites the record drops both until they are
+  set again.
+- `agent-bridge acquire ... --exec CMD [ARGS...]` runs a command under a lease: the fencing token and lease are in its
+  environment (`AGENT_BRIDGE_FENCE_TOKEN`, `AGENT_BRIDGE_LEASE_ID`, `_RESOURCE`, `_LEVEL`), the lease is renewed while
+  it runs and released when it exits, signals sent to agent-bridge reach it, and the exit status is the command's,
+  or 75 when it never got the lease or lost it while running (it is then stopped).
+- `agent-bridge leases` lists the leases you hold.
+- `agent-bridge request ... --wait [S]` waits for the owner's answer.
+- Lease history: ledgerd keeps the last 200 lease events of each resource (acquire, renew, release, break, revoke,
+  expire, drop, with who did it), for its owner (`agent-bridge lease-history`, the `lease_history` op). The database
+  stays schema 1, so both rollback ledgerds still open it.
+- A lease that expires without renewal gets its holder a DM from ledgerd.
+- ledgerd answers a `ping` op with its version, for `agent-bridge doctor`; a client asking an older ledgerd for one of
+  the new ops gets "ledgerd is older than 0.3.0".
+- historyd: `room`, `dms`, `topic` and `broadcasts` take `before_seq` (and `seq: true`) to page in storage order, and
+  `{"op": "ping", "version": true}` answers with its version. Without them its replies are unchanged.
+- MCP tools `leases` (the leases you hold) and `lease_history` (a resource's lease events, owner only; a bare name is
+  one of yours, as in the CLI), and `request` takes `wait` to block up to an hour for the owner's answer. A request
+  whose resource is removed while it waits ends at once with status `gone`.
+- MCP tool `describe` (name, caps and `about` in place), and MCP `history` and `dms` entries carry their `seq`, with
+  `before` to page back. The MCP server's presence record carries its version as `mcp`, which the console shows per
+  session (unknown for a server from before 0.3.0).
+- The console's views update themselves: the ledger, capacity, leftovers and agent views refresh on their own while
+  shown and the tab is visible, show when they last updated, and back off (up to a minute) with the reason when a
+  load fails. The Refresh buttons are gone.
+- The console shows its own version in the page header, in `agent-bridge-admin status` and in `/metrics` as
+  `agent_bridge_console_build_info{version, native}`.
+
+### Changed
+- `history` and `dms`, in the CLI and the MCP server, ask historyd for each entry's `seq`, so they need historyd 0.3.0:
+  upgrade the services before the commands (README, Upgrading).
+- CLI JSON output writes text as UTF-8 instead of `\uXXXX` escapes, so non-ASCII text is readable. Control
+  characters and bidi or zero-width marks stay escaped, and the wire format is unchanged.
+
+### Fixed
+- A Bus whose session was taken over (by a CLI command acting as the agent, for example) could keep an agent that had
+  left in its presence cache until its next reconnect, so mentions and DMs still resolved to it. On reconnect it now
+  ignores the presence and room records that the broker had queued for the old connection, and rebuilds both caches
+  from the fresh replay.
+- `agent-bridge --help` and `--version` work whatever the environment holds; a bad `AGENT_BRIDGE_PORT` no longer
+  stops them.
+- The MCP server posts as the session's own agent (the one its relay delivers for) instead of a second derived
+  address that could not receive replies. A running server picks this up when restarted.
+- Console message tables no longer split short tokens mid-word in a narrow column (`!1432` showed as `!14` over
+  `32`): table cells wrap only between words, and cells of up to 12 characters never wrap.
+
+### Documentation
+- The README gains an Everyday commands section and `doctor` in the Quick start, and Upgrading now updates the
+  services before the commands and rolls both back together.
+
 ## [0.2.3] - 2026-11-04
 
 ### Added
@@ -112,7 +186,8 @@ First release.
 - A Rust core with Python bindings, and Rust ports of the CLI, relay, ledgerd and historyd, kept in parity with the
   Python reference by conformance tests.
 
-[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.0...v0.2.1

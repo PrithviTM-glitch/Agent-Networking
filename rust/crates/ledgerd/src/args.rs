@@ -1,14 +1,15 @@
-//! --help and --health; agent_bridge::service parses the arguments.
+//! --help, --version and --health; agent_bridge::service parses the arguments.
 
 use agent_bridge::json::Map;
 use agent_bridge::ledger;
 
-pub const USAGE: &str = "usage: agent-bridge-ledgerd [-h] [--health]
+pub const USAGE: &str = "usage: agent-bridge-ledgerd [-h] [--health] [-V]
 
 Serves the agent-bridge resource ledger over MQTT 5 request/response on ledger/req.
 
   (no arguments)  run the service (AGENT_BRIDGE_HOST, AGENT_BRIDGE_PORT, LEDGER_DB)
   --health        ask the running ledgerd for a dump as health-0; exit 0 on an ok reply within 5 s, else 1
+  -V, --version   print the version and exit
   -h, --help      show this help
 ";
 

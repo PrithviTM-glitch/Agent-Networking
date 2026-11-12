@@ -36,9 +36,26 @@ enum Fallback {
 
 type Field = (&'static str, Check, Fallback);
 
-pub const OPS: [&str; 16] = [
-    "init", "add", "update", "remove", "ledger", "public", "request", "grant", "deny", "grants", "acquire", "renew",
-    "release", "cancel", "drop", "dump",
+pub const OPS: [&str; 19] = [
+    "init",
+    "add",
+    "update",
+    "remove",
+    "ledger",
+    "public",
+    "request",
+    "grant",
+    "deny",
+    "grants",
+    "acquire",
+    "renew",
+    "release",
+    "cancel",
+    "leases",
+    "lease_history",
+    "drop",
+    "dump",
+    "ping",
 ];
 
 fn fields(op: &str) -> &'static [Field] {
@@ -70,6 +87,7 @@ fn fields(op: &str) -> &'static [Field] {
         "renew" => &[("lease_id", C::RowId, D::Required), ("ttl", C::Number(1.0, MAX_TTL), D::Number(60.0))],
         "release" => &[("lease_id", C::RowId, D::Required)],
         "cancel" => &[("correlation", C::Hex, D::Required)],
+        "lease_history" => &[("resource", C::Resource, D::Required), ("last", C::Number(1.0, 500.0), D::Number(50.0))],
         _ => &[],
     }
 }

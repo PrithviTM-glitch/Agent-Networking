@@ -2,8 +2,8 @@
 golden/ledgerd.jsonl. The file was generated from the Python ledgerd before it was removed (v0.1.0 is the last release
 that has it) and is now the reference: a deliberate change to a reply is a reviewed edit of that file. Since v0.1.0:
 release and renew of another agent's lease say whose it is, the op list names cancel, and the description error names
-the control characters it allows (0.2.1). It runs against whichever ledgerd AGENT_BRIDGE_LEDGERD names, the bundled
-Rust one by default.
+the control characters it allows (0.2.1); the op list names leases, lease_history and ping (0.3.0). It runs against
+whichever ledgerd AGENT_BRIDGE_LEDGERD names, the bundled Rust one by default.
 
 Normalised the same way on both sides: request and lease ids become R1, L1, ... in order of first appearance, every
 timestamp becomes "<t>", fencing tokens count from the first one seen, and dump's "ledgerd" field is dropped. Error

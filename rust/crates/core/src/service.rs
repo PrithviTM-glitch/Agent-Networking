@@ -1,5 +1,5 @@
 //! The services' command line (ledgerd, historyd), as Python's argparse with allow_abbrev=False parses
-//! [-h] [--health]: the same outcome, and on a bad argument the same stderr and exit status 2. Only no arguments (or
+//! [-h] [--health] [-V] (-V/--version an action="version" argument): the same outcome, and on a bad argument the same stderr and exit status 2. Only no arguments (or
 //! --health alone, repeated) ever reaches the service, so a stray flag cannot start a second one that takes the live
 //! one's session over.
 
@@ -10,12 +10,19 @@ pub enum Mode {
     Serve,
     Health,
     Help,
+    /// print version_line(prog) and exit 0
+    Version,
     /// what to print on stderr before exiting with status 2
     Bad(String),
 }
 
 pub fn usage(prog: &str) -> String {
-    format!("usage: {prog} [-h] [--health]")
+    format!("usage: {prog} [-h] [--health] [-V]")
+}
+
+/// What -V/--version prints, as argparse's "%(prog)s VERSION" and clap's default for agent-bridge.
+pub fn version_line(prog: &str) -> String {
+    format!("{prog} {}", env!("CARGO_PKG_VERSION"))
 }
 
 pub fn mode(prog: &str, args: &[String]) -> Mode {
@@ -31,13 +38,18 @@ pub fn mode(prog: &str, args: &[String]) -> Mode {
                 break;
             }
             "-h" | "--help" => return Mode::Help,
+            "-V" | "--version" => return Mode::Version,
             "--health" => health = true,
             a if a.starts_with("--help=") => return ignored("-h/--help", &a["--help=".len()..]),
             a if a.starts_with("--health=") => return ignored("--health", &a["--health=".len()..]),
             a if a.starts_with("-h=") => return ignored("-h/--help", &a["-h=".len()..]),
+            a if a.starts_with("--version=") => return ignored("-V/--version", &a["--version=".len()..]),
+            a if a.starts_with("-V=") => return ignored("-V/--version", &a["-V=".len()..]),
             // a cluster of short flags: -h takes no argument, so the rest is more flags (or a dash, refused)
             a if a.starts_with("-h-") => return ignored("-h/--help", &a["-h".len()..]),
             a if a.starts_with("-h") => return Mode::Help,
+            a if a.starts_with("-V-") => return ignored("-V/--version", &a["-V".len()..]),
+            a if a.starts_with("-V") => return Mode::Version,
             a => extras.push(a),
         }
     }
@@ -60,7 +72,7 @@ mod tests {
     fn error(args: &[&str]) -> String {
         match of(args) {
             Mode::Bad(text) => {
-                assert!(text.starts_with("usage: agent-bridge-historyd [-h] [--health]\n"), "{text}");
+                assert!(text.starts_with("usage: agent-bridge-historyd [-h] [--health] [-V]\n"), "{text}");
                 text.lines().last().unwrap_or_default().to_owned()
             }
             other => format!("{other:?}"),
@@ -72,9 +84,33 @@ mod tests {
         assert_eq!(of(&[]), Mode::Serve);
         assert_eq!(of(&["--health"]), Mode::Health);
         assert_eq!(of(&["--health", "--health"]), Mode::Health);
-        for help in
-            [&["-h"][..], &["--help"], &["--bogus", "-h"], &["-h", "--bogus"], &["-hx"], &["x", "--health", "-hh"]]
-        {
+        // argparse's version action, like help, exits as soon as it is reached, whatever follows
+        for version in [
+            &["-V"][..],
+            &["--version"],
+            &["-V", "-h"],
+            &["--bogus", "-V"],
+            &["-V", "--bogus"],
+            &["-Vh"],
+            &["-Vx"],
+            &["-VV"],
+            &["x", "-V"],
+            &["-V", "--"],
+            &["--health", "-V"],
+            &["-V", "--health=1"],
+        ] {
+            assert_eq!(of(version), Mode::Version, "{version:?}");
+        }
+        for help in [
+            &["-h"][..],
+            &["--help"],
+            &["--bogus", "-h"],
+            &["-h", "--bogus"],
+            &["-hx"],
+            &["x", "--health", "-hh"],
+            &["-h", "-V"],
+            &["-hV"],
+        ] {
             assert_eq!(of(help), Mode::Help, "{help:?}");
         }
         let e = "agent-bridge-historyd: error:";
@@ -98,6 +134,13 @@ mod tests {
             (&["-h-x"], "argument -h/--help: ignored explicit argument '-x'"),
             (&["--help="], "argument -h/--help: ignored explicit argument ''"),
             (&["--health="], "argument --health: ignored explicit argument ''"),
+            (&["-V=1"], "argument -V/--version: ignored explicit argument '1'"),
+            (&["--version=1"], "argument -V/--version: ignored explicit argument '1'"),
+            (&["--version="], "argument -V/--version: ignored explicit argument ''"),
+            (&["-V-x"], "argument -V/--version: ignored explicit argument '-x'"),
+            (&["--vers"], "unrecognized arguments: --vers"),
+            (&["--", "-V"], "unrecognized arguments: -- -V"),
+            (&["--health=1", "-V"], "argument --health: ignored explicit argument '1'"),
         ] {
             assert_eq!(error(args), format!("{e} {last}"), "{args:?}");
         }

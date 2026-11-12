@@ -4,6 +4,7 @@
 //! behaviour. Needs Docker, so it is ignored by default: cargo test --workspace -- --ignored (which also builds the
 //! services next to agent-bridge; AGENT_BRIDGE_LEDGERD and AGENT_BRIDGE_HISTORYD name others).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -190,6 +191,10 @@ fn the_cli_matches_the_golden_transcript() {
     let want = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/cli.txt"))
         .expect("tests/golden/cli.txt");
     let got = start().transcript();
+    // to review a deliberate change: AGENT_BRIDGE_GOLDEN_OUT=/tmp/cli.txt, then diff it against the golden
+    if let Some(path) = std::env::var_os("AGENT_BRIDGE_GOLDEN_OUT") {
+        std::fs::write(path, &got).expect("the transcript is written");
+    }
     for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
         assert_eq!(g, w, "line {}", i + 1);
     }
@@ -209,12 +214,18 @@ impl Drop for Killed {
 /// A shell named claude, the relay's ancestor, running `relay start` for session; it lives while its stdin is open.
 /// Returns it and the relay's pid once the relay is live.
 fn relayed(w: &World, session: &str) -> (Killed, i32) {
+    relayed_by(w, session, Path::new(RUST))
+}
+
+/// relayed, with exe as the agent-bridge that starts the relay. The fake claude then runs each line written to its
+/// stdin as a shell command, so a command can run inside the session (as its child).
+fn relayed_by(w: &World, session: &str, exe: &Path) -> (Killed, i32) {
     let claude = w.dir.join("claude");
     if !claude.exists() {
         std::fs::copy("/bin/sh", &claude).expect("a fake claude");
     }
     let mut fake = w.cmd(&claude);
-    fake.args(["-c", &format!("{RUST} relay start; read _")])
+    fake.args(["-c", &format!("{} relay start; while read -r c; do eval \"$c\"; done", exe.display())])
         .env("CLAUDE_CODE_SESSION_ID", session)
         .env("CLAUDE_CODE_MESSAGING_SOCKET", w.dir.join("inbox.sock"))
         .stdin(Stdio::piped());
@@ -260,7 +271,7 @@ fn a_relay_ends_with_its_claude_while_the_broker_is_down() {
     assert!(log.contains("broker unreachable, waiting for it"), "{log}");
 }
 
-/// While a session's relay is live, say, dm and pub from that session post over a connection of their own and never
+/// While a session's relay is live, say, dm, pub and describe from that session go over a connection of their own and never
 /// take the relay's session over; join still does (it changes the session's subscriptions), and the relay takes it
 /// back without logging an outage. The broker's log counts the takeovers.
 #[test]
@@ -296,8 +307,11 @@ fn posting_from_the_shell_leaves_the_relay_its_session() {
     in_session(&["say", &addr, "room1", "hello from the shell"]);
     in_session(&["dm", &addr, &peer, "a dm from the shell"]);
     in_session(&["pub", &addr, "topic/a", "a raw post"]);
+    in_session(&["describe", &addr, "--about", "posts from the shell"]);
     std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(takeovers(), before, "a post took the relay's session over");
+    assert_eq!(takeovers(), before, "a post or describe took the relay's session over");
+    let agents = String::from_utf8_lossy(&w.run(&["agents"]).stdout).into_owned();
+    assert!(agents.contains("\"about\": \"posts from the shell\""), "{agents}");
     let said = String::from_utf8_lossy(&w.run(&["history", "room1"]).stdout).into_owned();
     assert!(said.contains("hello from the shell"), "{said}");
     let got = String::from_utf8_lossy(&w.run(&["recv", &peer]).stdout).into_owned();
@@ -305,6 +319,78 @@ fn posting_from_the_shell_leaves_the_relay_its_session() {
     let log = relay_log(&w);
     assert!(!log.contains("broker unreachable"), "a takeover was logged as an outage\n{log}");
     assert!(log.lines().all(|l| l.contains(&format!(" {addr}: ")) || l.contains(" session ")), "{log}");
+}
+
+fn json_lines(out: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(out).lines().map(|l| serde_json::from_str(l).expect("a JSON line")).collect()
+}
+
+/// relay status names the relay's pid, binary and version; doctor flags a relay on a replaced binary and a hook whose
+/// program is gone, and relay restart, run inside the session, moves the relay to the current binary.
+#[test]
+#[ignore = "needs Docker"]
+fn doctor_and_relay_restart_see_what_a_relay_runs() {
+    let w = start();
+    let session = "5b2e8f0c-7d4a-4e61-b3c9-0a1d2e3f4a5b";
+    // an "old install": a copy of the binary, which the upgrade then deletes
+    let old = w.dir.join("old").join("agent-bridge");
+    std::fs::create_dir_all(old.parent().expect("a dir")).expect("a dir");
+    std::fs::copy(RUST, &old).expect("a copy");
+    let (mut fake, first) = relayed_by(&w, session, &old);
+    let status = json_lines(&w.run(&["relay", "status", "--session", session]).stdout).remove(0);
+    assert_eq!(status["pid"], first);
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(status["binary"], old.display().to_string());
+    assert!(status["uptime_s"].as_i64().is_some_and(|u| u >= 0) && status["started"].as_f64().is_some_and(|t| t > 0.0));
+    std::fs::remove_file(&old).expect("the old binary goes");
+
+    let home = w.dir.join("home");
+    std::fs::create_dir_all(home.join(".claude")).expect("a home");
+    let hooks = |commands: &[&str]| {
+        let groups: Vec<_> =
+            commands.iter().map(|c| serde_json::json!({"hooks": [{"type": "command", "command": c}]})).collect();
+        let settings = serde_json::json!({"hooks": {"SessionStart": groups}});
+        std::fs::write(home.join(".claude/settings.json"), settings.to_string()).expect("settings");
+    };
+    let doctor = || {
+        let out = w.cmd(Path::new(RUST)).args(["doctor", "--json"]).env("HOME", &home).output().expect("doctor runs");
+        let checks: std::collections::HashMap<String, serde_json::Value> = json_lines(&out.stdout)
+            .into_iter()
+            .map(|c| (c["check"].as_str().unwrap_or_default().to_owned(), c))
+            .collect();
+        (out.status.code(), checks)
+    };
+    hooks(&[&format!("{RUST} hook relay-start"), "/nowhere/agent-bridge hook broadcast"]);
+    let (code, checks) = doctor();
+    assert_eq!(code, Some(1), "a missing hook program fails");
+    assert_eq!(checks["hooks"]["status"], "fail");
+    assert_eq!(checks["hooks"]["detail"], "missing: /nowhere/agent-bridge");
+    for name in ["broker", "ledgerd", "historyd", "state_dir", "cli_lock"] {
+        assert_eq!(checks[name]["status"], "ok", "{name}: {}", checks[name]);
+    }
+    let v = env!("CARGO_PKG_VERSION");
+    assert_eq!((&checks["ledgerd"]["version"], &checks["historyd"]["version"]), (&v.into(), &v.into()));
+    assert_eq!(checks["relays"]["status"], "warn");
+    assert_eq!(checks["relays"]["stale"][0]["session"], session);
+    assert_eq!(checks["relays"]["stale"][0]["why"], "its binary was replaced");
+
+    let stdin = fake.0.stdin.as_mut().expect("the fake claude's stdin");
+    let restarted = w.dir.join("restart.out");
+    writeln!(stdin, "{RUST} relay restart > {} 2>&1", restarted.display()).expect("a command");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !std::fs::read_to_string(&restarted).is_ok_and(|t| t.ends_with('\n')) {
+        assert!(Instant::now() < deadline, "relay restart never answered");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let row = json_lines(&std::fs::read(&restarted).expect("its output")).remove(0);
+    assert_eq!(row["live"], true, "{row}");
+    assert_ne!(row["pid"], first);
+    assert_eq!(row["binary"], std::fs::canonicalize(RUST).expect("the binary").display().to_string());
+    hooks(&[&format!("{RUST} hook relay-start")]);
+    let (code, checks) = doctor();
+    assert_eq!(code, Some(0), "{checks:?}");
+    assert_eq!(checks["relays"]["status"], "ok", "{}", checks["relays"]);
+    assert_eq!(checks["relays"]["detail"], "1 current");
 }
 
 #[test]

@@ -170,6 +170,45 @@ function setTitle(t1, t2, actions) {
   $("t1").textContent = t1;
   $("t2").textContent = t2 || "";
   $("tactions").replaceChildren(...(actions || []));
+  liveShow();
+}
+
+// Live views: each loader below refreshes on its own period while its view is shown and the tab is visible, so no
+// view needs a Refresh button. A failed load backs off (liveDelay) and says why under the title; a success resets it.
+const LIVE = [
+  {every: 5000, on: v => v.type === "ledger", load: () => loadLedger()},
+  {every: 3000, on: v => v.type === "capacity" || (v.type === "agent" && S.tab === "overview"), load: () => loadCapacity()},
+  {every: 10000, on: v => v.type === "leaks", load: () => loadLeaks()},
+  {every: 5000, on: v => v.type === "agent", load: () => loadProfile()},
+  {every: 60000, on: v => v.type === "capacity" || (v.type === "agent" && S.tab === "overview") || (v.type === "chan" && v.id.startsWith("room:")),
+   load: () => loadUsage()},
+];
+function liveDelay(every, fails) { return fails ? Math.min(every * 2 ** fails, 60000) : every; }
+function liveTick() {
+  if (document.hidden) return;
+  const now = Date.now();
+  for (const l of LIVE) {
+    if (l.busy || now < (l.next || 0) || !l.on(S.view)) continue;
+    l.busy = true;
+    Promise.resolve(l.load()).catch(e => e.message).then(err => {
+      l.busy = false;
+      l.fails = err ? (l.fails || 0) + 1 : 0;
+      l.err = err || null;
+      l.at = Date.now();
+      l.next = l.at + liveDelay(l.every, l.fails);
+      liveShow();
+    });
+  }
+}
+function liveNow() { for (const l of LIVE) l.next = 0; liveTick(); }
+function liveShow() {
+  // The first live loader of the view speaks for it: when it last succeeded, or why it is waiting.
+  const l = LIVE.find(x => x.on(S.view)), box = $("live");
+  if (!box) return;
+  if (!l || !l.at) { box.textContent = ""; return; }
+  box.textContent = l.err ? "retrying in " + Math.round((l.next - Date.now()) / 1000) + " s: " + l.err
+    : "live, updated " + clock(l.at / 1000);
+  box.classList.toggle("bad", !!l.err);
 }
 function msgNode(m, tag) {
   const d = el("div", "msg" + (m.from === ADMIN ? " admin" : "")), h = el("div", "h");
@@ -321,8 +360,10 @@ async function loadProfile() {
   try {
     const p = await api("/api/agent?" + new URLSearchParams(ident(a)));
     if (here()) { S.profile = p; if (S.tab !== "overview") renderPane(); }
+    return null;
   } catch (e) {
     if (here()) { S.profile = {error: e.message}; renderPane(); }
+    return e.message;
   }
 }
 function field(dl, k, v, mono) {
@@ -366,6 +407,13 @@ function renderAgent() {
   else renderActivity(body, p.activity);
   body.scrollTop = top;
 }
+function mcpLine(a) {
+  // The version an MCP server writes into its presence (0.3.0 on), against the console's own: a session keeps its
+  // old server until it reconnects, so a mismatch is worth seeing.
+  if (!a.mcp) return a.session ? "unknown (before 0.3.0, or no MCP server)" : null;
+  const mine = S.version && S.version.package;
+  return "v" + a.mcp + (mine && a.mcp !== mine ? " · the console is v" + mine + ": reconnect it (/mcp) or restart the session" : "");
+}
 function renderOverview(body, a) {
   const card = el("div", "card"), dl = el("dl");
   field(dl, "Name", a.friendly);
@@ -389,6 +437,7 @@ function renderOverview(body, a) {
     field(dl, "Last seen", clock(a.seen) + " (" + ago(a.seen) + ")");
     field(dl, "Presence", a.keep ? "kept (never expires)" : "expires " + ago(a.expires));
     field(dl, "Caps", a.caps.join(", "));
+    field(dl, "MCP server", mcpLine(a));
     field(dl, "Rooms", a.rooms.join(", "));
     field(dl, "Topics", a.topics.join(", "), true);
   }
@@ -481,14 +530,16 @@ function leaseRow(l) {
 }
 function waiterRow(w) { return [w.resource, w.holder, w.level, ago(w.deadline)]; }
 async function loadLedger() {
-  try { S.ledger = await api("/api/ledger"); } catch (e) { S.ledger = {error: e.message}; }
+  let err = null;
+  try { S.ledger = await api("/api/ledger"); } catch (e) { S.ledger = {error: err = e.message}; }
   if (S.view.type === "ledger") renderPane();
+  return err;
 }
 function refreshLedgerViews() { if (S.view.type === "ledger") loadLedger(); if (S.view.type === "agent") loadProfile(); }
 function renderLedger() {
   const body = $("body"), top = body.scrollTop, d = S.ledger;
   $("compose").hidden = true;
-  setTitle("Ledger", d && d.ts ? "as of " + clock(d.ts) : "", [button("Refresh", loadLedger)]);
+  setTitle("Ledger", d && d.ts ? "as of " + clock(d.ts) : "");
   body.replaceChildren();
   if (!d) { body.append(el("div", "empty", "Loading…")); return; }
   if (d.error) { body.append(el("div", "empty", d.error)); return; }
@@ -599,12 +650,14 @@ function bytes(n) {
 function num(v) { return el("span", "nowrap", v); }
 function pct(v) { return v == null ? "…" : v.toFixed(1) + "%"; }
 async function loadCapacity() {
-  try { S.capacity = await api("/api/capacity"); } catch (e) { S.capacity = {error: e.message}; }
+  let err = null;
+  try { S.capacity = await api("/api/capacity"); } catch (e) { S.capacity = {error: err = e.message}; }
   if (S.view.type === "capacity") renderCapacity();
   else if (S.view.type === "agent" && S.tab === "overview" && $("resources")) {
     const a = byKey(S.view.key);
     if (a) $("resources").replaceWith(resourcesCard(a));
   }
+  return err;
 }
 function sessionLink(key) {
   const a = byKey(key);
@@ -623,7 +676,7 @@ function procRows(rows, withSession) {
 function renderCapacity() {
   const c = S.capacity, body = $("body"), top = body.scrollTop;
   $("compose").hidden = true;
-  setTitle("Capacity", "CPU is the share of one core since the last sample; memory is resident size, shared pages counted per process", [button("Refresh", loadCapacity)]);
+  setTitle("Capacity", "CPU is the share of one core since the last sample; memory is resident size, shared pages counted per process", );
   body.replaceChildren();
   if (!c) { body.append(el("div", "empty", "Loading…")); return; }
   if (c.error) { body.append(el("div", "empty", c.error)); return; }
@@ -655,7 +708,8 @@ function resourcesCard(a) {
 // Claude usage from Prometheus (optional)
 
 async function loadUsage() {
-  try { S.usage = await api("/api/usage"); } catch (e) { S.usage = {enabled: true, error: e.message, sessions: {}}; }
+  let err = null;
+  try { S.usage = await api("/api/usage"); } catch (e) { S.usage = {enabled: true, error: err = e.message, sessions: {}}; }
   const v = S.view.type;
   if (v === "capacity") renderCapacity();
   else if (v === "chan" && S.view.id.startsWith("room:")) renderChannel(S.view.id);
@@ -663,6 +717,7 @@ async function loadUsage() {
     const a = byKey(S.view.key);
     if (a) $("usage").replaceWith(usageCard(a));
   }
+  return err;
 }
 function money(v) { return v == null ? "—" : "$" + v.toLocaleString([], {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
 function count(v) {
@@ -713,8 +768,10 @@ function roomUsage(room) {
 // leftovers: test containers and orphaned processes
 
 async function loadLeaks() {
-  try { S.leaks = await api("/api/leaks"); } catch (e) { S.leaks = {error: e.message}; }
+  let err = null;
+  try { S.leaks = await api("/api/leaks"); } catch (e) { S.leaks = {error: err = e.message}; }
   if (S.view.type === "leaks") renderLeaks();
+  return err;
 }
 async function leakAct(path, body, ask) {
   if (confirm(ask) && await act(path, body, "cleanup")) loadLeaks();
@@ -722,7 +779,7 @@ async function leakAct(path, body, ask) {
 function renderLeaks() {
   const d = S.leaks, body = $("body");
   $("compose").hidden = true;
-  setTitle("Leftovers", "Test containers and agent-bridge processes that outlived what started them", [button("Refresh", loadLeaks)]);
+  setTitle("Leftovers", "Test containers and agent-bridge processes that outlived what started them", );
   body.replaceChildren();
   if (!d) { body.append(el("div", "empty", "Loading…")); return; }
   if (d.error) { body.append(el("div", "empty", d.error)); return; }
@@ -819,7 +876,7 @@ function targetLink(t) {
 }
 function renderAudit() {
   $("compose").hidden = true;
-  setTitle("Audit log", "Every admin action, newest first (admin-audit.jsonl in the state directory)", [button("Refresh", loadAudit)]);
+  setTitle("Audit log", "Every admin action, newest first (admin-audit.jsonl in the state directory)", );
   const body = $("body"), f = S.auditQ, r = S.auditRes;
   const focused = document.activeElement && document.activeElement.id === "audit-target";
   body.replaceChildren();
@@ -915,6 +972,8 @@ async function loadState() {
   const st = await api("/api/state");
   S.agents = st.agents; S.msgs = st.messages; S.audit = st.audit; S.rooms = st.rooms || {};
   setDrops(st.broker && st.broker.dropped);
+  S.version = st.version || null;
+  if (st.version) { $("ver").textContent = "v" + st.version.package; $("ver").title = "native core " + st.version.native; }
   S.jobs = Object.fromEntries(st.jobs.map(j => [j.id, j]));
   render(true);
 }
@@ -988,17 +1047,9 @@ function boot() {
   };
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && S.view.type === "chan") { delete S.unread[S.view.id]; delete S.atme[S.view.id]; renderNav(); }
+    if (!document.hidden) liveNow();
   });
-  setInterval(() => {
-    if (S.view.type === "agent") { loadProfile(); if (S.tab === "overview") loadCapacity(); }
-    else if (S.view.type === "ledger") loadLedger();
-  }, 5000);
-  setInterval(() => { if (S.view.type === "capacity") loadCapacity(); }, 3000);
-  setInterval(() => {
-    const v = S.view;
-    if (v.type === "capacity" || (v.type === "agent" && S.tab === "overview") || (v.type === "chan" && v.id.startsWith("room:"))) loadUsage();
-  }, 60000);
-  setInterval(() => { if (S.view.type === "leaks") loadLeaks(); }, 10000);
+  setInterval(liveTick, 1000);
   setInterval(() => { if (S.view.type === "chan") renderNav(); }, 30000);
   if (!S.token) { showLogin(); return; }
   stream();

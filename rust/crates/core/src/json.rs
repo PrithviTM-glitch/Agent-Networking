@@ -7,7 +7,18 @@ use std::io::{self, Write};
 
 pub type Map = JsonMap<String, Value>;
 
-struct Python;
+/// ascii: every non-ASCII character escaped, as Python's default (the wire). Otherwise only the characters that could
+/// reorder or hide text on a terminal are escaped (bidi and format controls, line and paragraph separators): the CLI's
+/// readable output, the same JSON.
+struct Python {
+    ascii: bool,
+}
+
+/// Characters a terminal would act on rather than show: zero-width and bidi marks, embeddings and isolates, the word
+/// joiner and BOM, and the Unicode line and paragraph separators.
+pub fn is_format_control(c: char) -> bool {
+    matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+}
 
 impl Formatter for Python {
     fn begin_array_value<W: ?Sized + Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
@@ -26,6 +37,8 @@ impl Formatter for Python {
         for c in fragment.chars() {
             if c.is_ascii() && c != '\x7f' {
                 w.write_all(&[c as u8])?;
+            } else if !self.ascii && c != '\x7f' && !is_format_control(c) {
+                w.write_all(c.encode_utf8(&mut [0; 4]).as_bytes())?;
             } else {
                 for unit in c.encode_utf16(&mut [0; 2]) {
                     write!(w, "\\u{unit:04x}")?;
@@ -64,10 +77,20 @@ pub fn float_repr(value: f64) -> String {
 }
 
 pub fn dumps(value: &Value) -> String {
+    serialize(value, true)
+}
+
+/// dumps for people reading the CLI's output: non-ASCII text as UTF-8, not \uXXXX, so the same JSON reads as written.
+/// Terminal-affecting format controls stay escaped (is_format_control). Never for the wire or digests.
+pub fn dumps_readable(value: &Value) -> String {
+    serialize(value, false)
+}
+
+fn serialize(value: &Value, ascii: bool) -> String {
     let mut out = Vec::with_capacity(128);
-    let mut ser = serde_json::Serializer::with_formatter(&mut out, Python);
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, Python { ascii });
     serde::Serialize::serialize(value, &mut ser).expect("serializing a Value to memory cannot fail");
-    String::from_utf8(out).expect("the formatter writes ASCII only")
+    String::from_utf8(out).expect("the formatter writes UTF-8")
 }
 
 pub fn dumps_map(map: &Map) -> String {
@@ -153,6 +176,18 @@ pub fn now() -> f64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn readable_is_the_same_json_with_text_as_written() {
+        let v = json!({"body": "é ✓ 😀 \"q\" \n\u{1f}\u{7f} bidi\u{202e}x zw\u{200b}y", "n": 1.5});
+        let out = dumps_readable(&v);
+        assert_eq!(
+            out, r#"{"body": "é ✓ 😀 \"q\" \n\u001f\u007f bidi\u202ex zw\u200by", "n": 1.5}"#,
+            "UTF-8 as written; controls, DEL and format characters still escaped"
+        );
+        assert_eq!(loads(out.as_bytes()), Some(v.clone()), "the same value");
+        assert!(dumps(&v).is_ascii() && loads(dumps(&v).as_bytes()) == Some(v));
+    }
 
     #[test]
     fn like_python() {

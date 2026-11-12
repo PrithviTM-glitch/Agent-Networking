@@ -1,11 +1,11 @@
 """The test harness and release tooling: what conftest promises about leftovers from killed runs, the release notes
-the release workflow takes from CHANGELOG.md, and what it publishes."""
+the release workflow takes from CHANGELOG.md, what it publishes, and the version every command reports."""
 
 import os
 import subprocess
 import sys
 
-from conftest import ROOT, TMP_PREFIX, _sweep_stale_dirs
+from conftest import BIN, ROOT, TMP_PREFIX, _sweep_stale_dirs
 
 
 def test_a_killed_runs_directory_is_swept():
@@ -93,3 +93,28 @@ def test_only_the_distributions_are_published(tmp_path):
         (tmp_path / stray).unlink()
     (tmp_path / good[1]).unlink()
     assert "1 x86_64 and 0 aarch64 wheels" in check_dist(tmp_path).stderr
+
+
+COMMANDS = (
+    "agent-bridge",
+    "agent-bridge-ledgerd",
+    "agent-bridge-historyd",
+    "agent-bridge-mcp",
+    "agent-bridge-console",
+    "agent-bridge-admin",
+)
+
+
+def test_every_command_reports_the_package_version():
+    """Each command under test, the native binaries and the Python entry points alike, prints "<command> <version>"
+    for -V and --version and exits 0 without connecting to anything, the version being the installed package's."""
+    import agent_bridge
+
+    for command in COMMANDS:
+        for flag in ("--version", "-V"):
+            got = subprocess.run([str(BIN / command), flag], capture_output=True, text=True, timeout=10, env={})
+            assert (got.returncode, got.stdout, got.stderr) == (0, f"{command} {agent_bridge.__version__}\n", ""), (
+                command,
+                flag,
+                got,
+            )

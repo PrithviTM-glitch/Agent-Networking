@@ -9,8 +9,8 @@ use crate::mqtt::{Ack, Conn, Handler, Message, filter};
 use crate::protocol::{BROADCAST, parse_message, parse_presence};
 use crate::request::Replies;
 use crate::validation::{
-    ADMIN, Error, ID_MAX, NAME_MAX, Result, TOPICS_MAX, check_body, check_caps, check_ident, check_ident_cap,
-    check_message, check_topic, check_wait, fail, is_ident, not_admin,
+    ADMIN, Error, ID_MAX, NAME_MAX, Result, TOPICS_MAX, check_about, check_body, check_caps, check_ident,
+    check_ident_cap, check_message, check_topic, check_wait, fail, is_ident, is_version, not_admin,
 };
 use crate::{config, history, identity, ledger, presence, rooms};
 use serde_json::Value;
@@ -81,6 +81,11 @@ struct Cache {
     /// set once both caches hold every retained record of this connection
     synced: bool,
     barrier: Option<u16>,
+    /// The rooms/+ and agents/+ SUBSCRIBE of this connection, and whether its SUBACK has come: the caches take
+    /// records only after it. Before it, a resumed session can still deliver a copy the broker queued for the old
+    /// connection (one cut off mid-replay by a takeover), whose clear a QoS 0 subscription never got while offline.
+    cache_sub: Option<u16>,
+    cache_live: bool,
 }
 
 impl Shared {
@@ -97,6 +102,7 @@ impl Handler for Shared {
             c.rooms.clear();
             c.agents.clear();
             c.synced = false;
+            c.cache_live = false;
             c.taken = false;
             // A surviving session resends everything not yet acked; a lost one never will, so keep those unacked.
             c.buf = std::mem::take(&mut c.buf)
@@ -106,7 +112,8 @@ impl Handler for Shared {
                 .collect();
             c.topics.clone()
         };
-        let _ = conn.subscribe(vec![filter(rooms::TOPICS, false, false), filter(presence::TOPICS, false, false)]);
+        let cache_sub =
+            conn.subscribe(vec![filter(rooms::TOPICS, false, false), filter(presence::TOPICS, false, false)]).ok();
         // broadcast on every connect, so agents whose sessions predate it pick it up on their next attach.
         let mut wanted = vec![BROADCAST.to_owned()];
         if !session_present {
@@ -120,6 +127,7 @@ impl Handler for Shared {
             conn.unsubscribe(vec![format!("inbox/{}", self.addr)]).ok()
         };
         let mut c = self.lock();
+        c.cache_sub = cache_sub;
         c.barrier = barrier;
         c.up = true;
         self.cv.notify_all();
@@ -129,12 +137,18 @@ impl Handler for Shared {
         let mut c = self.lock();
         c.up = false;
         c.synced = false;
+        c.cache_live = false;
         c.taken = reason == Some(crate::mqtt::SESSION_TAKEN_OVER);
         self.cv.notify_all();
     }
 
     fn acked(&self, pkid: u16) {
         let mut c = self.lock();
+        // mosquitto sends a subscription's retained replay after its SUBACK, and whatever the old session had
+        // queued straight after the CONNACK, before it has even read the SUBSCRIBE.
+        if c.cache_sub == Some(pkid) {
+            c.cache_live = true;
+        }
         if c.barrier == Some(pkid) {
             c.synced = true;
             self.cv.notify_all();
@@ -156,6 +170,9 @@ impl Handler for Shared {
                 if is_ident(key, ID_MAX) {
                     let rec = if is_room { rooms::parse_room(&m.payload) } else { parse_presence(&m.payload) };
                     let mut c = self.lock();
+                    if !c.cache_live {
+                        return conn.ack(m.ack); // left over from the session's previous connection
+                    }
                     let cache = if is_room { &mut c.rooms } else { &mut c.agents };
                     match rec {
                         Some(rec) => cache.insert(key.to_owned(), rec),
@@ -571,8 +588,9 @@ impl Bus {
         Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
     }
 
-    /// Change how other agents see this one; the address stays.
-    pub fn describe(&self, name: Option<&str>, caps: Option<&[String]>) -> Result<()> {
+    /// Change how other agents see this one: its display name (@name mentions follow it), caps and one-line about
+    /// ("" clears it). The address never changes.
+    pub fn describe(&self, name: Option<&str>, caps: Option<&[String]>, about: Option<&str>) -> Result<()> {
         if self.addr != ADMIN {
             not_admin(name, "name")?;
         }
@@ -584,6 +602,24 @@ impl Bus {
         if let Some(caps) = caps {
             rec.insert("caps".into(), check_caps(caps)?.into());
         }
+        match about.map(check_about).transpose()? {
+            Some("") => drop(rec.shift_remove("about")),
+            Some(a) => drop(rec.insert("about".into(), a.into())),
+            None => {}
+        }
+        self.set_rec(rec);
+        self.touch(&writing, false)
+    }
+
+    /// Record in presence which MCP server version runs this agent ("mcp"), for the admin console. The MCP server
+    /// calls it once it has its Bus; other writers keep the field when they republish.
+    pub fn set_client_version(&self, version: &str) -> Result<()> {
+        if !is_version(version) {
+            return fail(format!("bad version {version:?}: use 1-32 ASCII letters, digits, '.', '+' or '-'"));
+        }
+        let writing = lock(&self.writing);
+        let mut rec = self.current()?;
+        rec.insert("mcp".into(), version.into());
         self.set_rec(rec);
         self.touch(&writing, false)
     }
@@ -887,5 +923,106 @@ impl Drop for Bus {
 impl From<ledger::LedgerError> for Error {
     fn from(e: ledger::LedgerError) -> Error {
         Error(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mqtt::Options;
+    use bytes::BytesMut;
+    use rumqttc::v5::mqttbytes::QoS;
+    use rumqttc::v5::mqttbytes::v5::{ConnAck, ConnectReturnCode, Packet, Publish, SubAck, SubscribeReasonCode};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    const RECORD: &str = r#"{"name": "n", "caps": [], "topics": [], "keep": false, "seen": 1}"#;
+    const ROOM: &str =
+        r#"{"mode": "announce", "moderators": [], "rules": "", "muted": [], "banned": [], "by": "admin", "ts": 1}"#;
+
+    /// One client of a broker that resumes a session the way mosquitto did in the 0.3.0 gate failure: right after the
+    /// CONNACK it sends retained copies queued for the old connection (cut off mid-replay by a takeover; their clears
+    /// never reached a QoS 0 subscription while offline), then answers the rooms/+ and agents/+ SUBSCRIBE with its
+    /// SUBACK and the real replay, then a live clear.
+    fn resuming_broker(listener: TcpListener) {
+        let (mut s, _) = listener.accept().expect("a client");
+        let mut buf = BytesMut::new();
+        let mut chunk = [0u8; 4096];
+        let send = |s: &mut std::net::TcpStream, p: Packet| {
+            let mut out = BytesMut::new();
+            p.write(&mut out, None).expect("encodes");
+            s.write_all(&out).expect("sent");
+        };
+        let retained = |topic: &str, payload: &str| {
+            let mut p = Publish::new(topic, QoS::AtMostOnce, payload.to_owned(), None);
+            p.retain = true;
+            Packet::Publish(p)
+        };
+        loop {
+            let packet = match Packet::read(&mut buf, None) {
+                Ok(p) => p,
+                Err(_) => match s.read(&mut chunk) {
+                    Ok(n) if n > 0 => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        continue;
+                    }
+                    _ => return,
+                },
+            };
+            match packet {
+                Packet::Connect(..) => {
+                    let ack = ConnAck { session_present: true, code: ConnectReturnCode::Success, properties: None };
+                    send(&mut s, Packet::ConnAck(ack));
+                    send(&mut s, retained("agents/gone-1", RECORD));
+                    send(&mut s, retained("rooms/gone", ROOM));
+                }
+                Packet::Subscribe(sub) => {
+                    let codes = sub.filters.iter().map(|_| SubscribeReasonCode::Success(QoS::AtMostOnce)).collect();
+                    send(&mut s, Packet::SubAck(SubAck { pkid: sub.pkid, return_codes: codes, properties: None }));
+                    if sub.filters.iter().any(|f| f.path == presence::TOPICS) {
+                        send(&mut s, retained("agents/here-1", RECORD));
+                        send(&mut s, retained("agents/leaving-1", RECORD));
+                        send(&mut s, retained("rooms/here", ROOM));
+                        send(&mut s, retained("agents/leaving-1", ""));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn caches_ignore_what_a_resumed_session_left_over() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().expect("bound").port();
+        let broker = std::thread::spawn(move || resuming_broker(listener));
+        let shared = Arc::new(Shared {
+            addr: "me-1".into(),
+            owner: true,
+            reply_id: "me-1".into(),
+            replies: Replies::default(),
+            st: Mutex::new(Cache::default()),
+            cv: Condvar::new(),
+            on_arrival: Mutex::new(None),
+        });
+        let opts = Options {
+            client_id: "me-1".into(),
+            clean_start: false,
+            expiry: 60,
+            receive_max: None,
+            manual_ack: false,
+            reconnect: None,
+        };
+        let conn = Conn::start("127.0.0.1", port, opts, shared.clone()).expect("connects");
+        let c = shared.lock();
+        let (c, _) = shared.cv.wait_timeout_while(c, TIMEOUT, |c| !c.synced).unwrap_or_else(|e| e.into_inner());
+        assert!(c.synced, "the barrier came");
+        let mut agents: Vec<_> = c.agents.keys().cloned().collect();
+        agents.sort();
+        assert_eq!(agents, ["here-1"], "the leftover gone-1 is ignored, the replay and the live clear apply");
+        assert_eq!(c.rooms.keys().collect::<Vec<_>>(), ["here"], "the rooms cache too");
+        drop(c);
+        conn.close();
+        broker.join().expect("the broker thread");
     }
 }

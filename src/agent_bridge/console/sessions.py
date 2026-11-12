@@ -124,6 +124,16 @@ def framework(key, reg, proc, session):
     return frameworks.get(key) or (only[0] if len(only) == 1 else None)
 
 
+MCP_VERSION = re.compile(r"[0-9A-Za-z.+-]{1,32}")
+
+
+def mcp_version(rec):
+    """The MCP server version a presence record carries ("mcp", from 0.3.0 on), or None. Any client can write
+    presence, so only a plain version string is taken."""
+    v = rec and rec.get("mcp")
+    return v if isinstance(v, str) and MCP_VERSION.fullmatch(v) else None
+
+
 def view(addr, rec, reg):
     """One session or agent as the page shows it. key is the address when on the bus, else the session id."""
     session = (reg and reg["session"]) or (rec and rec.get("session"))
@@ -179,6 +189,7 @@ def view(addr, rec, reg):
         "status": reg and reg["status"],
         "mode": reg and reg["mode"],
         "version": reg and reg["version"],
+        "mcp": mcp_version(rec),
         "desktop_id": reg and reg["desktop_id"],
         "started": reg and reg["started"],
         "in_registry": reg is not None,

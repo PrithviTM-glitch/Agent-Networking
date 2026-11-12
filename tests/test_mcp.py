@@ -17,6 +17,7 @@ from conftest import BIN
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+import agent_bridge
 from agent_bridge import _native
 
 SERVER = str(BIN / "agent-bridge-mcp")
@@ -130,6 +131,22 @@ async def sessions():
             assert [m["body"] for m in await call(b, "history", room=room, last=1)] == ["hi room"]
             assert [m["body"] for m in await call(b, "dms", peer=addr_a)] == ["hi bob"]
 
+            # Paging by seq: before= the oldest seq a page shows returns the entries before it.
+            await call(a, "dm", to=addr_b, text="again bob")
+            last = await call(b, "dms", peer=addr_a, last=1)
+            assert [m["body"] for m in last] == ["again bob"] and isinstance(last[0]["seq"], int)
+            assert [m["body"] for m in await call(b, "dms", peer=addr_a, before=last[0]["seq"])] == ["hi bob"]
+            page = await call(b, "history", room=room, last=1)
+            older = await call(b, "history", room=room, before=page[0]["seq"])
+            assert "room while down" in [m["body"] for m in older] and all(m["seq"] < page[0]["seq"] for m in older)
+
+            # describe: name, caps and about in place; "" clears about. Presence carries this server's version.
+            me = await call(a, "describe", caps=["sentry"], about="watches CI")
+            assert (me["name"], me["caps"], me["about"]) == ("alice", ["sentry"], "watches CI")
+            assert me["mcp"] == agent_bridge.__version__
+            assert not (await call(a, "describe", about="")).get("about"), "cleared"
+            assert (await call(a, "whoami"))["caps"] == ["sentry"]
+
             # Ledger: public resource, auto grant, exclusive write, FIFO wait, growing fencing tokens.
             db = f"{addr_a}/db"
             assert db in [r["id"] for r in (await call(b, "public"))["resources"]]
@@ -150,7 +167,18 @@ async def sessions():
                 await call(a, "release", lease_id=first["lease_id"])
             assert got["lease"]["token"] > first["token"] and got["at"] >= released
             await call(b, "renew", lease_id=got["lease"]["lease_id"], ttl=60)
+            mine = (await call(b, "leases"))["leases"]
+            assert [(x["lease_id"], x["token"]) for x in mine] == [(got["lease"]["lease_id"], got["lease"]["token"])], (
+                mine
+            )
             await call(b, "release", lease_id=got["lease"]["lease_id"])
+            assert (await call(b, "leases"))["leases"] == []
+            history = [e["event"] for e in (await call(a, "lease_history", resource=db))["events"]]
+            assert history == ["acquire", "release", "acquire", "renew", "release"], history
+            assert await fails(b, "lease_history", resource=db), "owner only"
+            assert (await call(a, "lease_history", resource="db", last=2))["events"] == (
+                await call(a, "lease_history", resource=db, last=2)
+            )["events"], "a bare name is one of yours"
 
             # Private resource: the request waits for the owner, who is told by ledgerd.
             await call(a, "add", name="secret", description="private notes")
@@ -165,6 +193,53 @@ async def sessions():
             await call(b, "release", lease_id=lease["lease_id"])
             await call(a, "update", name="secret", description="still private")
             await call(a, "remove", name="secret")
+
+            # request with wait blocks for the owner's answer; a denial is an answer, not an error.
+            await call(a, "add", name="vault", description="private")
+            answer = {}
+
+            async def asking():
+                answer["r"] = (await call(b, "request", resource=f"{addr_a}/vault", level="read", wait=15))["request"]
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(asking)
+                pending, deadline = [], time.monotonic() + 10
+                while not pending:
+                    assert time.monotonic() < deadline, "the waiting request never reached the owner"
+                    await anyio.sleep(0.2)
+                    asked = (await call(a, "grants"))["asked"]
+                    pending = [r["id"] for r in asked if r["status"] == "pending" and r["resource"].endswith("/vault")]
+                assert "r" not in answer, "still waiting for the owner"
+                await call(a, "deny", request_id=pending[0])
+            assert answer["r"]["status"] == "denied", answer
+            assert pending[0] in await ledgerd_notice(a), "the owner is told of the request"
+            await ledgerd_notice(b)  # and the requester of the denial: read both, so later checks see only theirs
+
+            # A request whose resource is removed mid-wait ends the wait at once, as "gone", not an error.
+            async with anyio.create_task_group() as tg:
+                answer.clear()
+
+                async def asking_gone():
+                    started = time.monotonic()
+                    answer["r"] = await call(b, "request", resource=f"{addr_a}/vault", level="read", wait=30)
+                    answer["took"] = time.monotonic() - started
+
+                tg.start_soon(asking_gone)
+                pending, deadline = [], time.monotonic() + 10
+                while not pending:
+                    assert time.monotonic() < deadline, "the waiting request never reached the owner"
+                    await anyio.sleep(0.2)
+                    asked = (await call(a, "grants"))["asked"]
+                    pending = [r["id"] for r in asked if r["status"] == "pending" and r["resource"].endswith("/vault")]
+                await call(a, "remove", name="vault")
+            assert answer["r"]["request"]["status"] == "gone" and answer["took"] < 15, answer
+            assert answer["r"]["error"] == f"request {pending[0]} is gone: the resource was removed or its owner left"
+            await ledgerd_notice(a)
+            await call(a, "add", name="vault", description="private")
+            assert "wait must be 0-3600" in await fails(
+                b, "request", resource=f"{addr_a}/vault", level="read", wait=4000
+            )
+            await call(a, "remove", name="vault")
 
             # Bad input: clean one-line tool errors, the server keeps working.
             for tool, args in [
@@ -330,12 +405,53 @@ def test_push():
     anyio.run(push)
 
 
+async def adopt():
+    """Under a session the MCP server posts as the session's own agent, the one its relay delivers for: an agent the
+    session registered through the CLI is adopted (so replies to it reach this server), with two the same one a relay
+    would pick, and only a session with no agent gets the address derived from its id."""
+    sid = str(uuid.uuid4())
+    env = env_for(sid, "adopt")
+
+    def register(name):
+        p = subprocess.run([BRIDGE, "register", name], env=env, capture_output=True, text=True, check=True)
+        return p.stdout.strip()
+
+    first, peer = register("adopted"), cli("register", "replier")
+    async with server(sid, "adopt") as s:
+        me = await call(s, "whoami")
+        assert me["addr"] == first and me["identity"] == "claude-code-session", me
+        await call(s, "dm", to=peer, text="ping")
+        cli("dm", peer, first, "pong")
+        assert [m["body"] for m in await call(s, "recv", wait=5)] == ["pong"], "the reply reaches the adopted agent"
+    second = register("adopted-two")
+    async with server(sid, "adopt") as s:
+        assert (await call(s, "whoami"))["addr"] == _native.relay_session_agent(sid) in (first, second)
+    lone = str(uuid.uuid4())
+    async with server(lone, "adopt-none") as s:
+        assert (await call(s, "whoami"))["addr"] == f"adopt-none-{_native.identity_short_hash(lone)}"
+        await call(s, "leave")
+    for a in (first, second, peer):
+        cli("leave", a)
+
+
+def test_adopt():
+    anyio.run(adopt)
+
+
 def test_arguments_start_nothing():
-    """--help prints usage and any argument is refused, before anything connects: a server started by mistake under a
-    session id would take that session's agent over from its real MCP server. A started server would wait on its
-    open stdin, so a prompt exit proves none ran."""
+    """--help and --version answer and any other argument is refused, before anything connects: a server started by
+    mistake under a session id would take that session's agent over from its real MCP server. A started server would
+    wait on its open stdin, so a prompt exit proves none ran."""
+    import agent_bridge
+
     env = env_for(f"session-a-{RUN}", "args")
-    for args, code, out in ((["--help"], 0, "usage: agent-bridge-mcp"), (["--port", "1"], 2, "unrecognized arguments")):
+    version = f"agent-bridge-mcp {agent_bridge.__version__}\n"
+    for args, code, out in (
+        (["--help"], 0, "usage: agent-bridge-mcp"),
+        (["--version"], 0, version),
+        (["-V"], 0, version),
+        (["--port", "1"], 2, "unrecognized arguments"),
+    ):
         pipe = subprocess.PIPE
         p = subprocess.Popen([SERVER, *args], env=env, stdin=pipe, stdout=pipe, stderr=pipe)
         try:

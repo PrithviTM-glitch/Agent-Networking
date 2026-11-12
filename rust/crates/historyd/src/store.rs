@@ -276,35 +276,46 @@ impl History {
         let (inbox, last) = (format!("inbox/{me}"), args.get("last").and_then(Value::as_i64).unwrap_or(0));
         let text = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned);
         let number = |k: &str| args.get(k).and_then(Value::as_f64);
+        // Paging by seq (the row id) follows storage order, which a sender's ts need not; entries carry their seq
+        // only when asked, so replies to older callers stay byte-identical to v0.1.0's.
+        let before_seq = args.get("before_seq").and_then(Value::as_i64);
+        let page = Page {
+            below: before_seq.unwrap_or(i64::MAX),
+            seq: before_seq.is_some() || args.get("seq") == Some(&Value::Bool(true)),
+        };
         self.tx(|db| {
             Ok(Ok(match op {
                 "room" => {
                     let topic = format!("room/{}", text("room").unwrap_or_default());
                     match number("before") {
-                        None => messages(db, "topic=?", params![topic, last])?,
-                        Some(before) => messages(db, "topic=? AND ts<?", params![topic, before, last])?,
+                        None => page.of(db, "topic=?", params![topic, page.below, last])?,
+                        Some(before) => page.of(db, "topic=? AND ts<?", params![topic, before, page.below, last])?,
                     }
                 }
                 "dms" => match text("peer") {
-                    None => messages(
+                    None => page.of(
                         db,
                         "topic=? OR (sender=? AND substr(topic, 1, 6)='inbox/')",
-                        params![inbox, me, last],
+                        params![inbox, me, page.below, last],
                     )?,
-                    Some(peer) => messages(
+                    Some(peer) => page.of(
                         db,
                         "(topic=? AND sender=?) OR (topic=? AND sender=?)",
-                        params![inbox, peer, format!("inbox/{peer}"), me, last],
+                        params![inbox, peer, format!("inbox/{peer}"), me, page.below, last],
                     )?,
                 },
-                "topic" => messages(db, "topic=?", params![text("topic"), last])?,
-                "broadcasts" => messages(
+                "topic" => page.of(db, "topic=?", params![text("topic"), page.below, last])?,
+                "broadcasts" => page.of(
                     db,
                     "topic=? AND sender=? AND ts>?",
-                    params![BROADCAST, ADMIN, number("since").unwrap_or_default(), last],
+                    params![BROADCAST, ADMIN, number("since").unwrap_or_default(), page.below, last],
                 )?,
                 "recent" if me != ADMIN => return Ok(Err(Bad("recent is for the admin console only".into()))),
-                "recent" => messages(db, "1", params![last])?,
+                "recent" => messages(db, "1", params![last], false)?,
+                "ping" if args.get("version") == Some(&Value::Bool(true)) => Map::from_iter([
+                    ("service".into(), "historyd".into()),
+                    ("version".into(), env!("CARGO_PKG_VERSION").into()),
+                ]),
                 "drop" if text("addr").is_some_and(|a| a != me) => {
                     return Ok(Err(Bad("drop: an agent drops only its own inbox".into())));
                 }
@@ -318,10 +329,24 @@ impl History {
     }
 }
 
+/// A history query's paging: rows below seq `below` (i64::MAX for no bound), entries with their seq when `seq`.
+struct Page {
+    below: i64,
+    seq: bool,
+}
+
+impl Page {
+    /// messages() for filter AND id < below; args end with below, then the row limit.
+    fn of<P: Params>(&self, db: &Connection, filter: &str, args: P) -> rusqlite::Result<Map> {
+        messages(db, &format!("({filter}) AND id<?"), args, self.seq)
+    }
+}
+
 /// The last rows of a query, oldest first, as wire entries; the oldest are left out if the reply is too big. The
 /// query's last parameter is the row limit.
-fn messages<P: Params>(db: &Connection, filter: &str, args: P) -> rusqlite::Result<Map> {
-    let sql = format!("SELECT topic, sender, body, ts, mentions FROM messages WHERE {filter} ORDER BY id DESC LIMIT ?");
+fn messages<P: Params>(db: &Connection, filter: &str, args: P, seq: bool) -> rusqlite::Result<Map> {
+    let sql =
+        format!("SELECT topic, sender, body, ts, mentions, id FROM messages WHERE {filter} ORDER BY id DESC LIMIT ?");
     let mut stmt = db.prepare(&sql)?;
     let rows = stmt.query_map(args, |r| {
         let mut entry = Map::new();
@@ -331,6 +356,9 @@ fn messages<P: Params>(db: &Connection, filter: &str, args: P) -> rusqlite::Resu
         entry.insert("ts".into(), float(r.get(3)?));
         if let Some(m) = r.get::<_, Option<String>>(4)?.filter(|m| !m.is_empty()) {
             entry.insert("mentions".into(), loads(m.as_bytes()).unwrap_or(Value::Null));
+        }
+        if seq {
+            entry.insert("seq".into(), r.get::<_, i64>(5)?.into());
         }
         Ok(entry)
     })?;
@@ -431,6 +459,50 @@ mod tests {
         assert_eq!(reply["truncated"], true);
         assert!(dumps(&reply).len() < MAX_REPLY && bodies(&reply).len() < 7);
         assert!(bodies(&reply).last().is_some_and(|b| b.ends_with('6')), "the newest are kept");
+    }
+
+    /// Pages follow storage order: a row stored later with an earlier sender ts is neither skipped nor repeated, and
+    /// seq appears only when asked for, so older callers get v0.1.0's exact entries.
+    #[test]
+    fn pages_by_seq_in_storage_order() {
+        let dir = temp("seq");
+        let mut h = History::open(&dir.join("h.db"), 86400).ok().expect("opens");
+        let m = |body: &str, ts: f64| json!({"from": "a-1", "body": body, "ts": ts}).to_string();
+        for (body, ts) in [("1", 1.0), ("2", 2.0), ("4", 4.0), ("3", 3.0), ("5", 5.0)] {
+            h.record("room/r", m(body, ts).as_bytes()).expect("records");
+            h.record("inbox/b-1", m(&format!("dm{body}"), ts).as_bytes()).expect("records");
+        }
+        let plain = ask(&mut h, r#"{"op": "room", "room": "r", "last": 2}"#, None);
+        assert!(plain["messages"].as_array().is_some_and(|m| m.iter().all(|e| e.get("seq").is_none())));
+        let (mut seen, mut req) = (Vec::new(), r#"{"op": "room", "room": "r", "last": 2, "seq": true}"#.to_owned());
+        loop {
+            let page = ask(&mut h, &req, None);
+            let entries = page["messages"].as_array().cloned().unwrap_or_default();
+            let Some(oldest) = entries.first().and_then(|e| e["seq"].as_i64()) else { break };
+            seen.splice(0..0, entries.iter().map(|e| e["body"].as_str().unwrap_or_default().to_owned()));
+            req = format!(r#"{{"op": "room", "room": "r", "last": 2, "before_seq": {oldest}}}"#);
+        }
+        assert_eq!(seen, ["1", "2", "4", "3", "5"], "every row once, in storage order");
+        // the room and inbox rows interleave: ids 2, 4 and 6 are dm1, dm2 and dm4
+        let dms = ask(&mut h, r#"{"op": "dms", "last": 2, "before_seq": 6}"#, Some("b-1"));
+        assert_eq!(bodies(&dms), ["dm1", "dm2"]);
+        assert!(
+            dms["messages"].as_array().is_some_and(|m| m.iter().all(|e| e["seq"].is_i64())),
+            "before_seq implies seq"
+        );
+        for (req, error) in [
+            (r#"{"op": "room", "room": "r", "before_seq": 0}"#, "before_seq: an entry's seq, an integer from 1"),
+            (r#"{"op": "room", "room": "r", "before_seq": 1.5}"#, "before_seq: an entry's seq, an integer from 1"),
+            (r#"{"op": "room", "room": "r", "seq": 1}"#, "seq: must be true or false"),
+            (r#"{"op": "recent", "seq": true}"#, "unknown fields for recent: seq"),
+        ] {
+            assert_eq!(ask(&mut h, req, Some("admin"))["error"], error, "{req}");
+        }
+        assert_eq!(ask(&mut h, r#"{"op": "ping"}"#, None), json!({"ok": true}));
+        assert_eq!(
+            ask(&mut h, r#"{"op": "ping", "version": true}"#, None),
+            json!({"ok": true, "service": "historyd", "version": env!("CARGO_PKG_VERSION")})
+        );
     }
 
     #[test]

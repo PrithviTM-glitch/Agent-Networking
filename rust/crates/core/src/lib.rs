@@ -19,6 +19,8 @@ pub mod request;
 pub mod rooms;
 pub mod service;
 pub mod stamp;
+pub mod text;
 pub mod validation;
+pub mod watch;
 
 pub use validation::{Error, Result};

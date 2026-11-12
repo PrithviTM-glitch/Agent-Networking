@@ -8,7 +8,7 @@ $ agent-bridge dm alpha-000001 beta-000002 hi ✓
 exit 0
 $ agent-bridge recv beta-000002
 exit 0
-{"topic": "inbox/beta-000002", "from": "alpha-000001", "body": "hi \u2713", "ts": <t>}
+{"topic": "inbox/beta-000002", "from": "alpha-000001", "body": "hi ✓", "ts": <t>}
 $ agent-bridge join alpha-000001 room1
 exit 0
 $ agent-bridge join beta-000002 room1
@@ -27,15 +27,15 @@ exit 0
 {"room": "room1", "mode": "open", "moderators": [], "rules": "", "muted": [], "banned": []}
 $ agent-bridge history room1
 exit 0
-{"topic": "room/room1", "from": "alpha-000001", "body": "[joined #room1] alpha, caps: x", "ts": <t>}
-{"topic": "room/room1", "from": "beta-000002", "body": "[joined #room1] beta", "ts": <t>}
-{"topic": "room/room1", "from": "beta-000002", "body": "@alpha-000001 hello", "ts": <t>, "mentions": ["alpha-000001"]}
+{"topic": "room/room1", "from": "alpha-000001", "body": "[joined #room1] alpha, caps: x", "ts": <t>, "seq": 2}
+{"topic": "room/room1", "from": "beta-000002", "body": "[joined #room1] beta", "ts": <t>, "seq": 3}
+{"topic": "room/room1", "from": "beta-000002", "body": "@alpha-000001 hello", "ts": <t>, "mentions": ["alpha-000001"], "seq": 4}
 $ agent-bridge dms beta-000002
 exit 0
-{"topic": "inbox/beta-000002", "from": "alpha-000001", "body": "hi \u2713", "ts": <t>}
+{"topic": "inbox/beta-000002", "from": "alpha-000001", "body": "hi ✓", "ts": <t>, "seq": 1}
 $ agent-bridge dms beta-000002 --with alpha-000001
 exit 0
-{"topic": "inbox/beta-000002", "from": "alpha-000001", "body": "hi \u2713", "ts": <t>}
+{"topic": "inbox/beta-000002", "from": "alpha-000001", "body": "hi ✓", "ts": <t>, "seq": 1}
 $ agent-bridge sub alpha-000001 t/x
 exit 0
 $ agent-bridge pub beta-000002 t/x raw text
@@ -90,7 +90,7 @@ exit 0
 {"ok": true, "lease": {"lease_id": "<id>", "resource": "alpha-000001/r1", "holder": "beta-000002", "level": "read", "expires_at": <t>}}
 $ agent-bridge ledger-raw bogus --as alpha-000001
 exit 1
-{"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, cancel, drop, dump"}
+{"ok": false, "error": "op: one of init, add, update, remove, ledger, public, request, grant, deny, grants, acquire, renew, release, cancel, leases, lease_history, drop, dump, ping"}
 $ agent-bridge ledger-raw add --as nobody-1 --name r2
 exit 1
 {"ok": false, "error": "no ledger for nobody-1, call init first"}

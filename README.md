@@ -118,6 +118,12 @@ cd Agent-Networking && docker compose up -d --build
 ```
 
 `docker compose ps` shows ledgerd and historyd as `healthy` once each has answered a request through the broker.
+Then `doctor` checks the whole setup: the broker, both services and their versions, your state and config directories,
+and your Claude Code hooks. It prints one OK, WARN or FAIL line per check, with what to do, and changes nothing:
+
+```bash
+agent-bridge doctor
+```
 
 Register two agents. Each `register` prints the new address, for example `alice-3f9a1c`:
 
@@ -151,51 +157,93 @@ agent-bridge say alice-3f9a1c ci "pipeline is red, @bob-77d0e2 can you look?"
 agent-bridge history ci
 ```
 
-Commands that return data print JSON, one object per line (`recv` one per message, so possibly none); `register`
+```bash
+agent-bridge watch ci --text
+```
+
+Commands that return data print JSON, one object per line (`recv` one per message, so possibly none), with text as
+written in UTF-8. `--text` on `recv`, `history`, `dms` and `watch` prints one line per message for people instead.
+`watch ROOM` follows a room until Ctrl-C: first its recent history, then each new message. It needs no agent. `register`
 prints just the address, and `keep`, `join`, `part`, `say`, `dm`, `sub`, `unsub`, `pub`, `leave` and `relay start`
 print nothing when they succeed. Errors are one line on stderr with a non-zero exit. A `say` whose `@word` matches no
 member of the room is still sent, with a one-line notice on stderr that it mentions nobody (`@@word` never mentions).
 `agent-bridge --help` lists the rest: moderation (`room`, `mod`, `mute`, `ban`, `kick`, ...), raw topics, and the
-ledger (`add`, `request`, `acquire`, ...).
+ledger (`add`, `request`, `acquire`, ...). Every command, the native and the Python ones, also answers `--version`.
+
+## Everyday commands
+
+- **Page back through history.** Each `history` and `dms` entry carries a `seq`. `--before SEQ`, given the oldest seq
+  you have, returns the page before it.
+- **Long or piped text.** `say` and `dm` take the text as an argument, `-` to read it from stdin, or `--file PATH`
+  (UTF-8, at most 64 KiB, not empty).
+- **Describe yourself.** `describe MY_ADDR --name N --caps a,b --about TEXT` changes your display name, caps or
+  one-line description (at most 200 bytes; `""` clears it). The address never changes, and `@name` mentions follow the
+  new name.
+- **Your leases.** `leases MY_ADDR` lists the leases you hold, soonest expiry first. `lease-history MY_ADDR NAME`
+  shows the last events of one of your resources (acquire, renew, release, break, revoke, expire, drop), and the
+  holder of a lease that expires without being renewed gets a DM saying so. `request ... --wait [S]` blocks until the
+  owner grants or denies the request (default 300 s, at most 3600).
+- **Run a command under a lock.** With `--exec`, `acquire` takes the lease, runs the command, renews the lease while
+  it runs and releases it when it exits. `--exec` comes last: everything after it is the command.
+
+  ```bash
+  agent-bridge acquire bob-77d0e2 alice-3f9a1c/staging-db write --exec ./migrate.sh --dry-run
+  ```
+
+  The command finds `AGENT_BRIDGE_LEASE_ID`, `AGENT_BRIDGE_LEASE_RESOURCE`, `AGENT_BRIDGE_LEASE_LEVEL` and, for a write
+  lease, the fencing token `AGENT_BRIDGE_FENCE_TOKEN` in its environment. SIGINT, SIGTERM and SIGHUP are passed on to
+  it. `acquire` exits with the command's status (128+N if signal N killed it), 127 if the command could not start,
+  and 75 if the command did not run to the end with the lease: the lease was refused (busy, no grant), or it was lost
+  while the command ran, in which case the command gets SIGTERM, then SIGKILL 10 s later. So 75 means "retry", while
+  any other code is the command's own.
 
 ## Upgrading
 
 What each release changes, and anything to do when upgrading, is in [CHANGELOG.md](CHANGELOG.md), which is also the
-text of each GitHub release. Install the new release's wheel over the old one, the same way as in the Quick start:
+text of each GitHub release. Upgrade the services first: a new release's services keep answering the previous
+release's commands, but new commands may need new services (0.3.0's `history` and `dms` need historyd 0.3.0). From
+your clone, check out the tag of the release you are installing:
+
+```bash
+git fetch --tags && git checkout v0.3.0 && docker compose up -d --build
+```
+
+Then install the release's wheel over the old one, the same way as in the Quick start:
 
 ```bash
 uv tool install --force ./agent_bridge-*-manylinux_2_28_$(uname -m).whl
 ```
 
-Then update the services from your clone, checking out the tag of the release you installed:
-
-```bash
-git fetch --tags && git checkout v0.2.1 && docker compose up -d --build
-```
-
 Running Claude Code sessions keep the old code until each part restarts:
 - **Hooks** run the new commands on their next start; nothing to do.
-- **Relays**: in each session, `agent-bridge relay stop` then `agent-bridge relay start`, or start a new session.
-  `relay stop` prints the relay's status after stopping it, so its `"live": false` is expected; `relay status` after
-  the start shows `"live": true`.
+- **Relays**: in each session, `agent-bridge relay restart` (before 0.3.0: `relay stop`, then `relay start`), or start
+  a new session. `relay stop` prints the relay's status after stopping it, so its `"live": false` is expected.
 - **MCP servers**: run `/mcp` in each session and reconnect `bridge`, or restart the session. A session that skips this
-  keeps the previous version's server for as long as it runs.
+  keeps the previous version's server for as long as it runs; with 0.3.0 that also means it keeps posting as a second,
+  derived address instead of the session's own agent.
 
-To roll back, install the previous release's wheel the same way and check out its tag before `docker compose up -d
---build`. ledgerd and historyd refuse a database whose schema is newer than they know, so a rollback across a schema
-change fails at start rather than touching the data.
+`agent-bridge doctor` then shows whether the CLI, the services and the installed wheel agree, and lists any relay still
+running a replaced binary.
+
+To roll back, check out the previous release's tag and run `docker compose up -d --build`, then install its wheel the
+same way. Roll back the commands together with the services: 0.3.0's `history`, `dms`, `leases` and `lease-history`
+fail with a one-line error against older services. ledgerd and historyd refuse a database whose schema is newer than
+they know, so a rollback across a schema change fails at start rather than touching the data.
 
 ## MCP server
 
-`agent-bridge-mcp` gives a Claude Code session 36 tools:
-- **the bus:** `connect`, `whoami`, `agents`, `rooms`, `join`, `part`, `say`, `history`, `dm`, `dms`, `sub`, `unsub`,
-  `pub`, `recv`, `keep`, `leave`;
+`agent-bridge-mcp` gives a Claude Code session 39 tools:
+- **the bus:** `connect`, `whoami`, `describe`, `agents`, `rooms`, `join`, `part`, `say`, `history`, `dm`, `dms`,
+  `sub`, `unsub`, `pub`, `recv`, `keep`, `leave` (`history` and `dms` entries carry their `seq`, and `before=SEQ` pages
+  back past them; `describe` sets the name, caps and a one-line `about` in place);
 - **room moderation:** `room_info`, `room_set`, `mod`, `mute`, `unmute`, `ban`, `unban`, `kick`;
-- **its ledger:** `add`, `update`, `remove`, `ledger`, `public`, `request`, `grant`, `deny`, `grants`, `acquire`,
-  `renew`, `release`.
+- **its ledger:** `add`, `update`, `remove`, `ledger`, `public`, `request` (with `wait`, it blocks for the owner's
+  answer), `grant`, `deny`, `grants`, `acquire`, `renew`, `release`, `leases`, `lease_history`.
 
-Each session gets a fixed address derived from its session id and project folder, and reattaches to it after a
-restart or resume. Text written by other agents comes back marked `UNTRUSTED DATA`.
+It posts as the session's own agent, the one the session's relay delivers for (an agent the session registered
+through the CLI), so replies reach it. A session with no agent gets a fixed address derived from its session id and
+project folder, and reattaches to it after a restart or resume. Its presence record carries its version as `mcp`.
+Text written by other agents comes back marked `UNTRUSTED DATA`.
 
 To add it for every session on the machine, once the commands are installed:
 
@@ -203,8 +251,9 @@ To add it for every session on the machine, once the commands are installed:
 claude mcp add --scope user bridge -- agent-bridge-mcp
 ```
 
-It takes no arguments: `--help` prints usage and any argument is refused (exit 2) before anything connects, so running
-it by hand inside a session never takes that session's agent from its real server.
+It takes no arguments: `--help` prints usage, `--version` prints the version, and any other argument is refused
+(exit 2) before anything connects, so running it by hand inside a session never takes that session's agent from its
+real server.
 
 The repository's own `.mcp.json` is for developing this project: it runs the server from the checkout's environment
 with `uv run --no-sync`, so starting a session never compiles anything. That makes every Claude Code session started
@@ -240,7 +289,10 @@ shims that run these two subcommands.
 - **Relay** (SessionStart): starts one background relay per session. The relay owns the session's bus connection and
   posts arriving messages into the conversation, framed as data from other agents, so an idle session wakes up when
   someone writes to it. Only `@mentioned` agents are woken by room messages; the rest wait as a backlog. It exits with
-  its session. `agent-bridge relay status` and `agent-bridge relay stop` manage it from inside the session.
+  its session. `agent-bridge relay status`, `relay stop` and `relay restart` manage it from inside the session; they
+  act on whichever Claude Code session's environment (`CLAUDE_CODE_SESSION_ID`) they run in. `relay status` shows the
+  relay's pid, uptime, binary and version, and `agent-bridge doctor` flags a relay still running a replaced binary
+  after an upgrade.
 - **Broadcasts** (UserPromptSubmit and SessionStart): shows the console's broadcasts to sessions that have no relay,
   including sessions that are not on the bus, on their next prompt. It asks historyd with a 1 s timeout and shows
   nothing if that fails.
@@ -572,28 +624,28 @@ scripts/gate.sh
 | `tests/test_history_parity.py` | The rollback image's Python historyd (`agent-bridge-historyd:1`, v0.1.0; `AGENT_BRIDGE_ROLLBACK_HISTORYD` names another) and `AGENT_BRIDGE_HISTORYD` taking turns on one database: nothing stored twice, every reply (queries, refusals, truncation, CorrelationData and ResponseTopic handling) byte for byte the same; skipped without the image, so it runs in CI's rollback job |
 | `tests/test_ledger_takeover.py` | A second ledgerd on one broker takes the session over and the first exits instead of taking it back (a module of its own, since every ledgerd shares the client id) |
 | `tests/test_ledger_golden.py` | A fixed script of 115 raw ledger requests (every op, every refusal text, busy and FIFO, fencing, redelivery replay, request topics, hostile input, dump truncation, drop) replayed against `AGENT_BRIDGE_LEDGERD`; the normalised replies (ids as R1/L1, timestamps as `<t>`, tokens from 1) must equal those v0.1.0's Python ledgerd gave, recorded in `tests/golden/ledgerd.jsonl`, apart from the Known differences and the deliberate changes since, which its docstring names; a deliberate change is a reviewed edit of that file |
-| `tests/test_ledger_parity.py` | The Rust ledgerd and its rollback, the Python ledgerd in `agent-bridge-ledgerd:2` built from v0.1.0, handing one `ledger.db` back and forth: the state reads the same both ways, a redelivered request is replayed from the other's stored answer, a waiter queued under one is served by the other, fencing tokens keep growing, one schema row; and an interrupted command-line acquire against the rollback, which refuses `cancel` as an unknown op, still ends quietly by its signal; skipped when that image is not built (CI's rollback job builds it) |
-| `tests/test_ledger.py` | Ledger semantics and their DMs, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, the replay window, quotas including the per-owner pending cap, waiters whose client left (a timeout shorter than the wait, SIGINT and SIGTERM cancelling a queued command-line acquire, a lease granted while the cancel is on its way), busy refusals naming the holders, a 10-process lock stress test, the admin dump, the stale sweep, the schema guard, the command line and `agent-bridge ledger-raw` |
+| `tests/test_ledger_parity.py` | ledgerd and its rollbacks. With the Python ledgerd in `agent-bridge-ledgerd:2` built from v0.1.0, handing one `ledger.db` back and forth: the state reads the same both ways, a redelivered request is replayed from the other's stored answer, a waiter queued under one is served by the other, fencing tokens keep growing, one schema row; and an interrupted command-line acquire against it, which refuses `cancel` as an unknown op, still ends quietly by its signal. With both that image and `agent-bridge-ledgerd:0.2.3`: a database holding 0.3.0's lease history opens and serves unchanged, the client names the missing `leases` op, and the history is intact afterwards. Each case is skipped when its image is not built (CI's rollback job builds both) |
+| `tests/test_ledger.py` | Ledger semantics and their DMs, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, the replay window, quotas including the per-owner pending cap, waiters whose client left (a timeout shorter than the wait, SIGINT and SIGTERM cancelling a queued command-line acquire, a lease granted while the cancel is on its way), busy refusals naming the holders, `leases`, the lease history with every kind of event and its bounds, the expiry DM, `ping`, a 10-process lock stress test, the admin dump, the stale sweep, the schema guard, the command line and `agent-bridge ledger-raw` |
 | `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice, arguments refused before anything connects |
 | `tests/test_host.py` | The agent-framework adapter: the generic host, Claude Code's session and process detection, the inbox socket, a fake session registry (the `.key` files never opened), transcripts, kind detection, and the native identity calls (project names, session addresses, `/proc` reads) |
 | `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, one channel notice per arrival across the relay taking the session and handing it back, adopting a CLI-registered agent, mentions waking only the mentioned agent |
 | `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho and none of the Python bus, CLI, relay, hooks, ledger or history modules |
 | `tests/test_conformance.py` | The `_native` contract listed above, with the bus behaviours summary |
-| `tests/test_harness.py` | The test harness and release tooling: a killed run's temp directory is swept by the next run, and nothing else is; `scripts/release-notes.sh` gives a tag exactly its CHANGELOG section and refuses a tag without one; `scripts/check-dist.sh` lets only one wheel per architecture and the sdist of the tag's version be published |
+| `tests/test_harness.py` | The test harness and release tooling: a killed run's temp directory is swept by the next run, and nothing else is; `scripts/release-notes.sh` gives a tag exactly its CHANGELOG section and refuses a tag without one; `scripts/check-dist.sh` lets only one wheel per architecture and the sdist of the tag's version be published; every command's `--version` and `-V` print `<command> <version>` with an empty environment |
 
-CI (`.github/workflows/ci.yml`, GitHub Actions) runs ruff; the Rust formatter, clippy and tests, including the ones
-that need Docker; builds manylinux wheels for x86_64 and aarch64, with the native binaries built inside the manylinux
+CI (`.github/workflows/ci.yml`, GitHub Actions) runs ruff; the Rust formatter, clippy and tests, including the ones that
+need Docker; builds manylinux wheels for x86_64 and aarch64, with the native binaries built inside the manylinux
 container, and the sdist. It checks each wheel's binaries (the wheel's architecture, nothing newer than glibc 2.28),
-then the installed wheel's commands (all but the hooks must answer `--help` without starting anything, and the hook
-shims stay silent), imports, packaged files, and that no deleted module came back. It runs the suite against the
-installed wheel, builds the Rust ledgerd and historyd images and runs each service's `--help` in them without a
-network, and builds the v0.1.0 rollback images to run the parity tests that hand one database between each Rust
-service and its rollback (a skipped parity test fails that job).
-`.github/workflows/release.yml` turns a `v*` tag into a GitHub Release with the wheels and the sdist, plus
-`THIRD_PARTY_LICENSES.md`, its notes being the tag's section of `CHANGELOG.md` (`scripts/release-notes.sh`; a tag
-without a section fails before anything is built). It can publish to PyPI once that is set up (see
-[Roadmap](#roadmap)); before the release and before the upload, `scripts/check-dist.sh` refuses anything in `dist`
-but one wheel per architecture and the sdist, of the tag's version.
+then the installed wheel's commands (all but the hooks must answer `--help` without starting anything, each prints
+`<command> <version>` for `--version`, and the hook shims stay silent), imports, packaged files, and that no deleted
+module came back. It runs the suite against the installed wheel, builds the Rust ledgerd and historyd images and runs
+each service's `--help` in them without a network, and builds the rollback images (v0.1.0's Python services and v0.2.3's
+Rust ledgerd) to run the parity tests that hand one database between each service and its rollbacks (a skipped parity
+test fails that job). `.github/workflows/release.yml` turns a `v*` tag into a GitHub Release with the wheels and the
+sdist, plus `THIRD_PARTY_LICENSES.md`, its notes being the tag's section of `CHANGELOG.md` (`scripts/release-notes.sh`;
+a tag without a section fails before anything is built). It can publish to PyPI once that is set up (see
+[Roadmap](#roadmap)); before the release and before the upload, `scripts/check-dist.sh` refuses anything in `dist` but
+one wheel per architecture and the sdist, of the tag's version.
 
 ## Rust implementation
 
@@ -649,9 +701,14 @@ checkout of `v0.1.0`), set the service to `image: agent-bridge-ledgerd:2` with n
 ["agent-bridge-ledgerd"]` and the healthcheck `["CMD",
 "agent-bridge-ledgerd", "--health"]`, then run `docker compose up -d ledgerd`. Both open the same `ledger.db` in the
 `ledger` volume. Both write the database's `schema` row (1) and refuse, before writing anything, a database whose schema
-is another version, so the rollback ends at the first migration. ledgerd starts the service only when given no
-arguments: `-h`/`--help` prints the usage, `--health` checks the running one, and anything else exits 2 before
-connecting, so a stray flag can never start a second ledgerd that takes the live one's session over.
+is another version, so the rollback ends at the first migration. The previous release's ledgerd is a rollback the same
+way: build `agent-bridge-ledgerd:0.2.3` from the v0.2.3 tag (`docker build --target ledgerd -t
+agent-bridge-ledgerd:0.2.3 rust` in a checkout of `v0.2.3`) and set the service's `image` to it, with no `build`;
+`tests/test_ledger_parity.py` runs against it too. Both rollbacks open a 0.3.0 database unchanged: the lease history
+is a table of its own, which they leave alone, and nothing is recorded in it while they run. ledgerd starts the
+service only when given no arguments: `-h`/`--help` prints the usage, `-V`/`--version` the version, `--health` checks
+the running one, and anything else exits 2 before connecting, so a stray flag can never start a second ledgerd that
+takes the live one's session over.
 
 historyd keeps v0.1.0's schema and row digests, so its Python implementation can take over the same `history.db`: a
 message either one stored is not stored again by the other, and a request gets the same reply from both, but for the
@@ -699,7 +756,9 @@ from Rust where Python parses it and refuses it by its fields; an integer longer
 infinity shows it as `{}` where Python shows `nan` or `inf`. The ledgerd changes since, none of which touch the
 database's layout, go away with a rollback: the `cancel` op (the rollback refuses it as an unknown op, so an interrupted
 command-line acquire stays queued until its deadline), the waiter cutoff at the request's expiry, the per-owner pending
-cap, the refusal of a lease you already hold, the reply window beyond 300 s, and the reworded refusals and DMs.
+cap, the refusal of a lease you already hold, the reply window beyond 300 s, and the reworded refusals and DMs; since
+0.3.0, the `leases`, `lease_history` and `ping` ops (a client is told the ledgerd is older than 0.3.0), the lease
+history and the expiry DM.
 
 ## Roadmap
 

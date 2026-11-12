@@ -14,6 +14,8 @@ const Markup = (() => {
   // And on how many blocks one message makes: each is an element where plain text was one node, so a backlog of
   // messages full of tiny fences would reach millions of nodes. Past the cap the rest of the body is one text run.
   const MAX_BLOCKS = 200;
+  // A cell this short (an MR id, a state, a count) never wraps, so a narrow column can't split it mid-token.
+  const NOWRAP_MAX = 12;
 
   // A table row's cells: outer pipes dropped, split on unescaped |, a \| kept as a literal |.
   function cells(line) {
@@ -94,6 +96,7 @@ const Markup = (() => {
   function cell(doc, tag, text, align) {
     const c = doc.createElement(tag);
     c.textContent = text;
+    if (text.length <= NOWRAP_MAX) c.className = "nw";
     if (align) c.style.textAlign = align;
     return c;
   }

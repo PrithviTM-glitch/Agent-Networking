@@ -204,16 +204,29 @@ impl Bus {
         call(py, &self.0, |b| b.leave())
     }
 
-    #[pyo3(signature = (name=None, caps=None))]
-    fn describe(
+    /// Change how other agents see this one: name (a display name: @name mentions follow it, the address never
+    /// changes), caps, and a one-line about ("" clears it). Returns the agent's presence record as published.
+    #[pyo3(signature = (name=None, caps=None, about=None))]
+    fn describe<'py>(
         &self,
-        py: Python<'_>,
-        name: Option<&Bound<'_, PyAny>>,
-        caps: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<()> {
+        py: Python<'py>,
+        name: Option<&Bound<'py, PyAny>>,
+        caps: Option<&Bound<'py, PyAny>>,
+        about: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
         let name = opt_ident(name, "name")?;
         let caps = caps.filter(|c| !c.is_none()).map(self::caps).transpose()?;
-        call(py, &self.0, move |b| b.describe(name.as_deref(), caps.as_deref()))
+        let about = about.filter(|a| !a.is_none()).map(|a| text(a, "about")).transpose()?;
+        let rec = call(py, &self.0, move |b| {
+            b.describe(name.as_deref(), caps.as_deref(), about.as_deref()).map(|()| b.rec())
+        })?;
+        dict(py, &rec)
+    }
+
+    /// Record the MCP server's version in this agent's presence ("mcp"), for the admin console.
+    fn set_client_version(&self, py: Python<'_>, version: &Bound<'_, PyAny>) -> PyResult<()> {
+        let version = text(version, "version")?;
+        call(py, &self.0, move |b| b.set_client_version(&version))
     }
 
     #[pyo3(signature = (room, mode=None, rules=None))]

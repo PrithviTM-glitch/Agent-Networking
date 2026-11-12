@@ -27,7 +27,9 @@ const DEDUPE_S: f64 = 300.0;
 const MAX_KEEP: f64 = MAX_TTL + MAX_WAIT;
 /// A waiter is dropped this long before its client stops listening, so its lease reply still reaches it.
 const REPLY_MARGIN: f64 = 1.0;
-const READ_ONLY: [&str; 4] = ["ledger", "public", "grants", "dump"];
+const READ_ONLY: [&str; 7] = ["ledger", "public", "grants", "dump", "leases", "lease_history", "ping"];
+/// lease events kept per resource, newest
+const MAX_EVENTS: i64 = 200;
 const WAITER: &str = "SELECT seq, resource, holder, level, topic, ttl, corr FROM waiters";
 
 const SCHEMA: &str = "
@@ -45,6 +47,8 @@ CREATE TABLE IF NOT EXISTS waiters(seq INTEGER PRIMARY KEY AUTOINCREMENT, resour
   corr BLOB);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS replies(key BLOB PRIMARY KEY, body TEXT, ts REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS lease_events(seq INTEGER PRIMARY KEY AUTOINCREMENT, resource TEXT NOT NULL, ts REAL NOT NULL,
+  event TEXT NOT NULL, lease_id TEXT NOT NULL, holder TEXT NOT NULL, level TEXT NOT NULL, token INTEGER, actor TEXT);
 INSERT OR IGNORE INTO meta VALUES ('fence', 0);
 CREATE INDEX IF NOT EXISTS resources_owner ON resources(owner);
 CREATE INDEX IF NOT EXISTS requests_resource ON requests(resource, holder);
@@ -54,6 +58,7 @@ CREATE INDEX IF NOT EXISTS leases_resource ON leases(resource);
 CREATE INDEX IF NOT EXISTS leases_holder ON leases(holder);
 CREATE INDEX IF NOT EXISTS waiters_resource ON waiters(resource, seq);
 CREATE INDEX IF NOT EXISTS replies_ts ON replies(ts);
+CREATE INDEX IF NOT EXISTS lease_events_resource ON lease_events(resource, seq);
 ";
 
 /// Why an op failed: refused (the message goes back) or broken (logged, "internal error" goes back).
@@ -321,6 +326,7 @@ impl Ledger {
         let body = match op {
             "init" => self.op_init(me, now)?,
             "dump" => self.op_dump(now)?,
+            "ping" => obj(json!({"service": "ledgerd", "version": env!("CARGO_PKG_VERSION")})),
             _ => {
                 if self.exec("UPDATE ledgers SET seen=? WHERE owner=?", params![now, me])? == 0 {
                     return bad(format!("no ledger for {me}, call init first"));
@@ -349,6 +355,10 @@ impl Ledger {
                     "renew" => self.op_renew(me, now, a("lease_id").unwrap_or_default(), n("ttl"))?,
                     "release" => self.op_release(me, a("lease_id").unwrap_or_default())?,
                     "cancel" => self.op_cancel(me, req.topic, a("correlation").unwrap_or_default())?,
+                    "leases" => self.op_leases(me)?,
+                    "lease_history" => {
+                        self.op_lease_history(me, a("resource").unwrap_or_default(), n("last") as i64)?
+                    }
                     "drop" => {
                         self.drop_ledger(me)?;
                         Map::new()
@@ -536,6 +546,7 @@ impl Ledger {
         for lease in self.rows("SELECT * FROM leases WHERE resource=? AND holder=?", [resource, holder])? {
             if level(s(&lease, "level")) > left {
                 self.exec("DELETE FROM leases WHERE id=?", [s(&lease, "id")])?;
+                self.event("revoke", &lease, Some(me))?;
                 ended.push(s(&lease, "id").to_owned());
             }
         }
@@ -596,7 +607,43 @@ impl Ledger {
             params![lid, resource, holder, lvl, token, now() + ttl],
         )?;
         let row = self.one("SELECT * FROM leases WHERE id=?", [&lid])?.unwrap_or_default();
+        self.event("acquire", &row, None)?;
         Ok(lease_view(&row))
+    }
+
+    /// Record what happened to a lease (its row as in the leases table) in its resource's bounded history.
+    fn event(&mut self, event: &str, lease: &Map, actor: Option<&str>) -> Res<()> {
+        let resource = s(lease, "resource");
+        // A run of renewals of one lease is one row with the latest time, so a long acquire --exec keeps the history.
+        if event == "renew"
+            && self.exec(
+                "UPDATE lease_events SET ts=? WHERE seq=(SELECT max(seq) FROM lease_events WHERE resource=?) \
+                 AND event='renew' AND lease_id=?",
+                params![now(), resource, s(lease, "id")],
+            )? > 0
+        {
+            return Ok(());
+        }
+        self.exec(
+            "INSERT INTO lease_events(resource, ts, event, lease_id, holder, level, token, actor) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                resource,
+                now(),
+                event,
+                s(lease, "id"),
+                s(lease, "holder"),
+                s(lease, "level"),
+                lease.get("token").and_then(Value::as_i64),
+                actor
+            ],
+        )?;
+        self.exec(
+            "DELETE FROM lease_events WHERE resource=? AND seq<=(SELECT seq FROM lease_events WHERE resource=? \
+             ORDER BY seq DESC LIMIT 1 OFFSET ?)",
+            params![resource, resource, MAX_EVENTS],
+        )?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -651,13 +698,13 @@ impl Ledger {
             return self.no_lease(lease_id);
         }
         let row = self.one("SELECT * FROM leases WHERE id=?", [lease_id])?.unwrap_or_default();
+        self.event("renew", &row, None)?;
         Ok(obj(json!({"lease": lease_view(&row)})))
     }
 
     fn op_release(&mut self, me: &str, lease_id: &str) -> Res<Map> {
         let Some(row) = self.one(
-            "SELECT l.resource, l.holder, l.level FROM leases l JOIN resources r ON r.id=l.resource \
-             WHERE l.id=? AND (l.holder=? OR r.owner=?)",
+            "SELECT l.* FROM leases l JOIN resources r ON r.id=l.resource WHERE l.id=? AND (l.holder=? OR r.owner=?)",
             [lease_id, me, me],
         )?
         else {
@@ -665,11 +712,54 @@ impl Ledger {
         };
         self.exec("DELETE FROM leases WHERE id=?", [lease_id])?;
         let (resource, holder) = (s(&row, "resource"), s(&row, "holder"));
-        if holder != me {
+        if holder == me {
+            self.event("release", &row, None)?;
+        } else {
+            self.event("break", &row, Some(me))?;
             self.notify(holder, format!("{me} ended your {} lease {lease_id} on {resource}", s(&row, "level")));
         }
         self.pump(resource)?;
         Ok(Map::new())
+    }
+
+    fn op_leases(&mut self, me: &str) -> Res<Map> {
+        let rows = self.rows(
+            "SELECT l.*, r.owner FROM leases l JOIN resources r ON r.id=l.resource WHERE l.holder=? ORDER BY l.expires",
+            [me],
+        )?;
+        let leases: Vec<Map> = rows
+            .iter()
+            .map(|row| {
+                let mut view = lease_view(row);
+                view.insert("owner".into(), row["owner"].clone());
+                view
+            })
+            .collect();
+        Ok(obj(json!({"leases": leases})))
+    }
+
+    /// The last events of one of me's resources, oldest first.
+    fn op_lease_history(&mut self, me: &str, resource: &str, last: i64) -> Res<Map> {
+        self.resource(resource, Some(me))?;
+        let rows = self.rows(
+            "SELECT * FROM (SELECT * FROM lease_events WHERE resource=? ORDER BY seq DESC LIMIT ?) ORDER BY seq",
+            params![resource, last],
+        )?;
+        let events: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let mut e = obj(json!({"ts": r["ts"], "event": r["event"], "lease_id": r["lease_id"],
+                                       "holder": r["holder"], "level": r["level"]}));
+                if !r["token"].is_null() {
+                    e.insert("token".into(), r["token"].clone());
+                }
+                if !r["actor"].is_null() {
+                    e.insert("by".into(), r["actor"].clone());
+                }
+                Value::Object(e)
+            })
+            .collect();
+        Ok(obj(json!({"resource": resource, "events": events})))
     }
 
     /// The refusal for a lease me may not touch: another agent's, or one that is gone.
@@ -787,9 +877,13 @@ impl Ledger {
             for (_, w, corr) in self.waiters(&format!("{WAITER} WHERE resource=?"), [r])? {
                 self.reply(s(&w, "topic"), corr, &error(why));
             }
-            for (table, col) in
-                [("waiters", "resource"), ("leases", "resource"), ("requests", "resource"), ("resources", "id")]
-            {
+            for (table, col) in [
+                ("waiters", "resource"),
+                ("leases", "resource"),
+                ("lease_events", "resource"),
+                ("requests", "resource"),
+                ("resources", "id"),
+            ] {
                 self.exec(&format!("DELETE FROM {table} WHERE {col}=?"), [r])?;
             }
         }
@@ -813,6 +907,9 @@ impl Ledger {
             self.reply(s(&w, "topic"), corr, &error(&why));
         }
         self.exec("DELETE FROM waiters WHERE holder=?", [who])?;
+        for lease in self.rows("SELECT * FROM leases WHERE holder=?", [who])? {
+            self.event("drop", &lease, Some(who))?;
+        }
         self.exec("DELETE FROM leases WHERE holder=?", [who])?;
         self.exec("DELETE FROM requests WHERE holder=? OR owner=?", [who, who])?;
         self.exec("DELETE FROM ledgers WHERE owner=?", [who])?;
@@ -832,9 +929,18 @@ impl Ledger {
     pub fn tick(&mut self) -> Res<()> {
         let now = now();
         self.exec("DELETE FROM replies WHERE ts<?", [now - DEDUPE_S])?;
-        for r in self.rows("SELECT DISTINCT resource FROM leases WHERE expires<=?", [now])? {
-            self.exec("DELETE FROM leases WHERE resource=? AND expires<=?", params![s(&r, "resource"), now])?;
-            self.pump(s(&r, "resource"))?;
+        let expired = self.rows("SELECT * FROM leases WHERE expires<=? ORDER BY resource, expires", [now])?;
+        let mut freed = BTreeSet::new();
+        for lease in &expired {
+            self.exec("DELETE FROM leases WHERE id=?", [s(lease, "id")])?;
+            self.event("expire", lease, None)?;
+            let (id, resource) = (s(lease, "id"), s(lease, "resource"));
+            let text = format!("your {} lease {id} on {resource} expired without renewal", s(lease, "level"));
+            self.notify(s(lease, "holder"), text);
+            freed.insert(resource.to_owned());
+        }
+        for resource in freed {
+            self.pump(&resource)?;
         }
         for (seq, w, corr) in self.waiters(&format!("{WAITER} WHERE deadline<=? ORDER BY seq"), [now])? {
             if self.exec("DELETE FROM waiters WHERE seq=?", [seq])? > 0 {
@@ -849,6 +955,8 @@ impl Ledger {
             self.exec("DELETE FROM presence WHERE keep=0 AND seen<?", [cutoff])?;
             // Granted requests are live permissions and stay; undecided and denied ones go once stale.
             self.exec("DELETE FROM requests WHERE status IN ('pending', 'denied') AND ts<?", [cutoff])?;
+            // events of resources a rollback ledgerd removed, which knows nothing of this table
+            self.exec("DELETE FROM lease_events WHERE resource NOT IN (SELECT id FROM resources)", [])?;
             for r in self
                 .rows("SELECT owner FROM ledgers WHERE seen<? AND owner NOT IN (SELECT addr FROM presence)", [cutoff])?
             {
@@ -929,6 +1037,65 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// One request as me through handle, with the reply and every notification it published.
+    fn ask(ledger: &mut Ledger, n: &mut u32, me: &str, body: Value) -> (Map, Vec<Outgoing>) {
+        let mut out = Vec::new();
+        *n += 1;
+        let corr = n.to_be_bytes();
+        ledger.handle(
+            &mut |o| out.push(o),
+            dumps(&body).as_bytes(),
+            Some("ledger/resp/t"),
+            Some(&corr),
+            Some(me),
+            None,
+        );
+        let reply = out.iter().find(|o| o.2.as_deref() == Some(&corr[..])).map(|o| o.1.clone()).unwrap_or_default();
+        (loads(reply.as_bytes()).and_then(|v| v.as_object().cloned()).unwrap_or_default(), out)
+    }
+
+    #[test]
+    fn lease_events_are_bounded_and_expiry_tells_the_holder() {
+        let dir = Dir::new("events");
+        let mut ledger = Ledger::open(&dir.join("ledger.db"), 3.0).ok().expect("opens");
+        let n = &mut 0;
+        for who in ["o-1", "h-1"] {
+            ask(&mut ledger, n, who, json!({"op": "init"}));
+        }
+        ask(&mut ledger, n, "o-1", json!({"op": "add", "name": "r", "visibility": "public", "max_level": "write"}));
+        ask(&mut ledger, n, "h-1", json!({"op": "request", "resource": "o-1/r", "level": "write"}));
+        let (pong, _) = ask(&mut ledger, n, "nobody-0", json!({"op": "ping"}));
+        assert_eq!(pong["service"], "ledgerd", "ping needs no ledger");
+        for _ in 0..(MAX_EVENTS + 5) {
+            let (r, _) = ask(&mut ledger, n, "h-1", json!({"op": "acquire", "resource": "o-1/r", "level": "write"}));
+            ask(&mut ledger, n, "h-1", json!({"op": "release", "lease_id": r["lease"]["lease_id"]}));
+        }
+        let (mine, _) = ask(&mut ledger, n, "h-1", json!({"op": "leases"}));
+        assert_eq!(mine["leases"], json!([]));
+        let history = json!({"op": "lease_history", "resource": "o-1/r", "last": 500});
+        let (h, _) = ask(&mut ledger, n, "o-1", history.clone());
+        assert_eq!(h["events"].as_array().map(Vec::len), Some(MAX_EVENTS as usize), "bounded per resource");
+        assert_eq!(h["events"][MAX_EVENTS as usize - 1]["event"], "release", "oldest first, newest last");
+        let (refused, _) = ask(&mut ledger, n, "h-1", history);
+        assert_eq!(refused["error"], "no such resource: o-1/r", "only the owner reads it");
+
+        let (r, _) =
+            ask(&mut ledger, n, "h-1", json!({"op": "acquire", "resource": "o-1/r", "level": "write", "ttl": 1}));
+        let lid = r["lease"]["lease_id"].as_str().unwrap_or_default().to_owned();
+        let (mine, _) = ask(&mut ledger, n, "h-1", json!({"op": "leases"}));
+        assert_eq!(mine["leases"][0]["owner"], "o-1");
+        ledger.db.execute("UPDATE leases SET expires=0", []).expect("ages the lease");
+        let mut out = Vec::new();
+        ledger.run(&mut |o| out.push(o), Ledger::tick).ok().expect("ticks");
+        let dm: Vec<&Outgoing> = out.iter().filter(|o| o.0 == "inbox/h-1").collect();
+        assert_eq!(dm.len(), 1, "{out:?}");
+        assert!(dm[0].1.contains(&format!("your write lease {lid} on o-1/r expired without renewal")), "{}", dm[0].1);
+        let (h, _) = ask(&mut ledger, n, "o-1", json!({"op": "lease_history", "resource": "o-1/r", "last": 1}));
+        assert_eq!(h["events"][0]["event"], "expire");
+        ask(&mut ledger, n, "o-1", json!({"op": "remove", "name": "r"}));
+        assert_eq!(ledger.count("SELECT count(*) FROM lease_events", []).ok(), Some(0), "removed with the resource");
     }
 
     #[test]

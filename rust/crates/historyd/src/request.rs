@@ -22,6 +22,9 @@ enum Check {
     Count(i64),
     Ts,
     Topic,
+    Flag,
+    /// a row id, 1 or more
+    Seq,
 }
 
 #[derive(Clone, Copy)]
@@ -38,12 +41,34 @@ fn fields(op: &str) -> &'static [Field] {
     use Check as C;
     use Fallback as D;
     match op {
-        "room" => &[("room", C::Ident("room"), D::Required), ("last", C::Last, D::Int(20)), ("before", C::Ts, D::Null)],
-        "dms" => &[("peer", C::Ident("address"), D::Null), ("last", C::Last, D::Int(20))],
-        "topic" => &[("topic", C::Topic, D::Required), ("last", C::Last, D::Int(20))],
-        "broadcasts" => &[("since", C::Ts, D::Float(0.0)), ("last", C::Last, D::Int(20))],
+        "room" => &[
+            ("room", C::Ident("room"), D::Required),
+            ("last", C::Last, D::Int(20)),
+            ("before", C::Ts, D::Null),
+            ("seq", C::Flag, D::Null),
+            ("before_seq", C::Seq, D::Null),
+        ],
+        "dms" => &[
+            ("peer", C::Ident("address"), D::Null),
+            ("last", C::Last, D::Int(20)),
+            ("seq", C::Flag, D::Null),
+            ("before_seq", C::Seq, D::Null),
+        ],
+        "topic" => &[
+            ("topic", C::Topic, D::Required),
+            ("last", C::Last, D::Int(20)),
+            ("seq", C::Flag, D::Null),
+            ("before_seq", C::Seq, D::Null),
+        ],
+        "broadcasts" => &[
+            ("since", C::Ts, D::Float(0.0)),
+            ("last", C::Last, D::Int(20)),
+            ("seq", C::Flag, D::Null),
+            ("before_seq", C::Seq, D::Null),
+        ],
         "recent" => &[("last", C::Count(RECENT_MAX), D::Int(100))],
         "drop" => &[("addr", C::Ident("address"), D::Null)],
+        "ping" => &[("version", C::Flag, D::Null)],
         _ => &[],
     }
 }
@@ -75,6 +100,14 @@ fn check(key: &str, check: Check, v: &Value) -> Result<Value, Bad> {
         Check::Topic => match v.as_str() {
             Some(s) => check_topic(s, false).map_err(field)?.into(),
             None => return Err(Bad(format!("{key}: topic must be a string, got {}", py_type(v)))),
+        },
+        Check::Flag => match v.as_bool() {
+            Some(b) => b.into(),
+            None => return Err(Bad(format!("{key}: must be true or false"))),
+        },
+        Check::Seq => match int(v).filter(|n| *n >= 1) {
+            Some(n) => n.into(),
+            None => return Err(Bad(format!("{key}: an entry's seq, an integer from 1"))),
         },
     })
 }
@@ -173,8 +206,14 @@ mod tests {
             "as: bad address 5: use 1-64 ASCII letters, digits, _ or -"
         );
         let r = parse(&json!({"op": "room", "room": "r", "before": null}), None).ok().unwrap();
-        assert_eq!(agent_bridge::json::dumps_map(&r.args), r#"{"room": "r", "last": 20, "before": null}"#);
+        assert_eq!(
+            agent_bridge::json::dumps_map(&r.args),
+            r#"{"room": "r", "last": 20, "before": null, "seq": null, "before_seq": null}"#
+        );
         let b = parse(&json!({"op": "broadcasts"}), None).ok().unwrap();
-        assert_eq!(agent_bridge::json::dumps_map(&b.args), r#"{"since": 0.0, "last": 20}"#);
+        assert_eq!(
+            agent_bridge::json::dumps_map(&b.args),
+            r#"{"since": 0.0, "last": 20, "seq": null, "before_seq": null}"#
+        );
     }
 }

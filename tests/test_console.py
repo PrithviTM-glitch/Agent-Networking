@@ -1187,6 +1187,10 @@ def test_metrics():
     assert any(lab.get("action") == "send" for lab, _ in s["agent_bridge_audit_entries"])
     assert "agent_bridge_ledgers" in s and "agent_bridge_leftover_containers" in s, sorted(s)
     assert "agent_bridge_scrape_error" not in s, s.get("agent_bridge_scrape_error")
+    import agent_bridge
+
+    build = {"version": agent_bridge.__version__, "native": _native.__version__}
+    assert s["agent_bridge_console_build_info"] == [(build, 1.0)], "tokenless, one series"
     sids = [lab["session_id"] for lab, _ in s["agent_bridge_session"]]
     assert len(sids) == len(set(sids)), "one agent_bridge_session series per session"
     assert "hello room" not in text and "please look" not in text, "no message text in metrics"
@@ -1259,6 +1263,13 @@ def test_admin_cli():
     [st] = cli_ok("status")
     assert st["connected"] is True and st["on_bus"] >= 3 and st["entries"] >= st["on_bus"], st
     assert st["sessions"] <= st["entries"] and "dropped" in st, st
+    import agent_bridge
+
+    assert st["version"] == agent_bridge.__version__, st
+    assert req("GET", "/api/state")[1]["version"] == {
+        "package": agent_bridge.__version__,
+        "native": _native.__version__,
+    }
     addrs = {a["addr"] for a in cli_ok("agents")}
     assert {"admin", "bob-1"} <= addrs, addrs
     seen = []
@@ -1383,6 +1394,16 @@ def test_audits():
             for e in log
         ), (action, target, result)
     print("audit ok")
+
+
+def test_mcp_version_from_presence():
+    """The MCP server's version, from its presence ("mcp", 0.3.0 on), reaches the agent list and the admin CLI; any
+    other value (presence is writable by any client) shows as none."""
+    presence("mcpv-a1b2c3", session=str(uuid.uuid4()), mcp="0.3.0")
+    presence("mcpv-d4e5f6", mcp="<b>0.3.0</b>")
+    assert wait_for(lambda: agent("mcpv-a1b2c3") and agent("mcpv-d4e5f6"))
+    assert agent("mcpv-a1b2c3")["mcp"] == "0.3.0" and agent("mcpv-d4e5f6")["mcp"] is None
+    assert [a["mcp"] for a in cli_ok("agents") if a["addr"] == "mcpv-a1b2c3"] == ["0.3.0"]
 
 
 def test_sessionless_agent_owns_no_process():
@@ -1511,6 +1532,8 @@ def test_message_markup():
     [table] = wrap[4]
     [thead, tbody] = table[4]
     assert [(c[0], c[2], c[3]) for c in thead[4][0][4]] == [("th", "name", ""), ("th", "state", "center")]
+    assert {c[1] for c in thead[4][0][4]} == {"nw"}, "short cells never wrap"
+    assert [c[1] for c in tbody[4][0][4]] == ["", "nw"], "a 25-character cell may wrap, a 3-character one not"
     rows = [[(c[0], c[2]) for c in tr[4]] for tr in tbody[4]]
     assert rows == [[("td", "<script>alert(1)</script>"), ("td", "a|b")], [("td", "one")]], "short rows unpadded"
     assert got["nosep"] == [["#text", "| a | b |\n| c | d |"]], "no separator: plain text"
@@ -1554,6 +1577,8 @@ def test_message_markup():
         assert big[name]["ms"] < 200 and kinds == ["pre"] * 200 + ["#text"], (name, big[name]["ms"], len(kinds))
     assert len("\n".join(["|" * 5001, "|" + "-|" * 5000, *["|"] * 22000]).encode()) <= 65536
     static = os.path.join(os.path.dirname(config.__file__), "console", "static")
+    with open(os.path.join(static, "app.js")) as f:
+        assert 'button("Refresh"' not in f.read(), "views refresh themselves (live updates), no Refresh buttons"
     for name in ("markup.js", "app.js"):
         with open(os.path.join(static, name)) as f:
             used = re.findall(r"\.innerHTML\b|\.outerHTML\b|insertAdjacentHTML|document\.write", f.read())

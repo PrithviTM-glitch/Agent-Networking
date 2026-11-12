@@ -51,6 +51,8 @@ nav h3 button{font-size:12px;padding:0 7px;line-height:18px}
 #title{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:9px 16px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
 #title h2{font-size:15px;margin:0;overflow-wrap:anywhere}
 #t2{font-size:12px;overflow-wrap:anywhere}
+#live{font-size:11px}
+#live.bad{color:var(--warn)}
 #tactions{display:flex;gap:6px;flex-wrap:wrap}
 #body{flex:1;overflow:auto;padding:8px 16px 16px}
 #compose{border-top:1px solid var(--line);padding:8px 16px 12px;background:var(--panel)}
@@ -86,6 +88,9 @@ th{color:var(--muted);font-weight:600;font-size:12px}
 .b pre.code{white-space:pre;overflow-x:auto;margin:4px 0}
 .mdtable{overflow-x:auto;margin:4px 0}
 .mdtable table{width:auto}
+/* break-word, unlike the inherited anywhere, keeps a column at least one token wide; short cells never wrap */
+.mdtable th,.mdtable td{overflow-wrap:break-word}
+.mdtable .nw{white-space:nowrap}
 .tablewrap{overflow-x:auto}
 pre.out{background:var(--code);border-radius:6px;padding:8px 10px;max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0 0}
 .act{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}

@@ -76,6 +76,14 @@ jobs:
                      agent-bridge-console agent-bridge-admin; do
             timeout 10 "$bin/$cmd" --help < /dev/null > /dev/null || { echo "$cmd --help failed"; exit 1; }
           done
+          # Every command reports the wheel's own version as "<command> <version>", the Rust binaries and the
+          # Python entry points alike (the shims run agent-bridge, which already reports it).
+          want=$(/tmp/wheel-env/bin/python -I -c 'import agent_bridge; print(agent_bridge.__version__)')
+          for cmd in agent-bridge agent-bridge-ledgerd agent-bridge-historyd agent-bridge-mcp agent-bridge-console \
+                     agent-bridge-admin; do
+            got=$(timeout 10 "$bin/$cmd" --version < /dev/null) || { echo "$cmd --version failed"; exit 1; }
+            test "$got" = "$cmd $want" || { echo "$cmd --version: '$got', expected '$cmd $want'"; exit 1; }
+          done
           # The hook shims reach the Rust hooks, which print nothing and exit 0 whatever the input.
           for hook in agent-bridge-relay-hook agent-bridge-broadcast-hook; do
             got=$(echo '{}' | timeout 10 "$bin/$hook") || { echo "$hook failed"; exit 1; }
@@ -124,9 +132,10 @@ jobs:
       - run: docker build --target historyd -t agent-bridge-ci:historyd rust
       - run: docker run --rm --network none agent-bridge-ci:historyd /agent-bridge-historyd --help
   rollback:
-    # The Python service images of v0.1.0 are the documented rollback: the parity tests hand one database back and
-    # forth between them and the Rust services, so a change to rows or replies that would break a rollback fails here.
-    # This job lives as long as the README offers those images, which ends at the first schema change.
+    # The documented rollbacks: the Python service images of v0.1.0, and the Rust ledgerd of v0.2.3, the last release
+    # before ledgerd's additive lease_events table. The parity tests hand one database back and forth between them and
+    # the services under test, so a change to rows or replies that would break a rollback fails here. This job lives
+    # as long as the README offers those images, which ends at the first schema change.
     needs: build
     runs-on: ubuntu-24.04
     steps:
@@ -135,16 +144,21 @@ jobs:
         with:
           ref: v0.1.0
           path: v0.1.0
+      - uses: actions/checkout@v7
+        with:
+          ref: v0.2.3
+          path: v0.2.3
       - uses: astral-sh/setup-uv@v10.3.2
       - uses: actions/download-artifact@v8
         with:
           name: wheel-x86_64
           path: dist
       - run: docker pull eclipse-mosquitto:2.0.22
-      - name: Build the rollback images from v0.1.0
+      - name: Build the rollback images from their tags
         run: |
           docker build -t agent-bridge-ledgerd:2 v0.1.0
           docker tag agent-bridge-ledgerd:2 agent-bridge-historyd:1
+          docker build --target ledgerd -t agent-bridge-ledgerd:0.2.3 v0.2.3/rust
       - name: Install the wheel and the test tools
         run: |
           uv venv .venv-wheel

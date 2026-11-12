@@ -46,6 +46,11 @@ fn load() -> Result<Config, String> {
     })
 }
 
+/// $XDG_CONFIG_HOME/agent-bridge (default ~/.config/agent-bridge): the console's admin token; 0700 from the console.
+pub fn config_dir() -> PathBuf {
+    xdg("XDG_CONFIG_HOME", ".config")
+}
+
 fn xdg(variable: &str, fallback: &str) -> PathBuf {
     let base =
         env::var_os(variable).filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| home().join(fallback));

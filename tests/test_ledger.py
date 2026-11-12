@@ -688,6 +688,181 @@ def test_busy_names_the_holders():
         subprocess.run([cli, "leave", me], capture_output=True)
 
 
+def test_leases_and_lease_history():
+    """leases lists what you hold; lease_history keeps what happened to an owner's resource, every kind of event
+    with who did it; an unrenewed lease's expiry is DMed to its holder; ping answers with no ledger."""
+    o, h, d = "hist-o1", "hist-h1", "hist-d1"
+    inbox = Watch(f"inbox/{h}")
+    for x in (o, h, d):
+        call("init", x)
+    call("add", o, name="r", visibility="public", max_level="write")
+    res = f"{o}/r"
+    grant = call("request", h, resource=res, level="write")["request"]
+    call("request", d, resource=res, level="write")
+    pong = call("ping", "nobody-0")
+    assert pong["service"] == "ledgerd" and pong["version"] == _native.__version__
+    assert "call init first" in err("leases", "nobody-0")["error"], "ping alone needs no ledger"
+
+    a = call("acquire", h, resource=res, level="write", ttl=30)["lease"]
+    for _ in range(3):
+        call("renew", h, lease_id=a["lease_id"], ttl=30)  # a run of renewals is one event
+    mine = call("leases", h)["leases"]
+    assert [(x["lease_id"], x["owner"], x["level"], x["token"]) for x in mine] == [
+        (a["lease_id"], o, "write", a["token"])
+    ]
+    assert call("leases", o)["leases"] == []
+    call("release", h, lease_id=a["lease_id"])
+    b = call("acquire", h, resource=res, level="write", ttl=30)["lease"]
+    call("release", o, lease_id=b["lease_id"])  # the owner breaks it
+    c = call("acquire", h, resource=res, level="write", ttl=30)["lease"]
+    call("deny", o, request_id=grant["id"])  # revokes the grant and ends the lease
+    e = call("acquire", d, resource=res, level="write", ttl=1)["lease"]
+    assert wait_for(lambda: not holders(res), 5), "the unrenewed lease expired"
+    f = call("acquire", d, resource=res, level="write", ttl=30)["lease"]
+    call("drop", d)
+
+    events = call("lease_history", o, resource=res, last=500)["events"]
+    got = [(x["event"], x["lease_id"], x["holder"], x.get("by")) for x in events]
+    assert got == [
+        ("acquire", a["lease_id"], h, None),
+        ("renew", a["lease_id"], h, None),
+        ("release", a["lease_id"], h, None),
+        ("acquire", b["lease_id"], h, None),
+        ("break", b["lease_id"], h, o),
+        ("acquire", c["lease_id"], h, None),
+        ("revoke", c["lease_id"], h, o),
+        ("acquire", e["lease_id"], d, None),
+        ("expire", e["lease_id"], d, None),
+        ("acquire", f["lease_id"], d, None),
+        ("drop", f["lease_id"], d, d),
+    ], got
+    assert all(x["level"] == "write" and x["token"] >= a["token"] for x in events)
+    assert [x["event"] for x in call("lease_history", o, resource=res, last=2)["events"]] == ["acquire", "drop"]
+    assert err("lease_history", h, resource=res)["error"] == f"no such resource: {res}", "only its owner reads it"
+    assert "last: number between 1 and 500" in err("lease_history", o, resource=res, last=501)["error"]
+
+    expired = call("acquire", o, resource=res, level="read", ttl=1)["lease"]
+    call("add", o, name="other")
+    gone = Watch(f"inbox/{o}")
+    assert wait_for(lambda: any(expired["lease_id"] in m["body"] for m in gone.json(f"inbox/{o}")), 5)
+    note = next(m for m in gone.json(f"inbox/{o}") if expired["lease_id"] in m["body"])
+    assert note["body"] == f"your read lease {expired['lease_id']} on {res} expired without renewal", note
+    assert not any("expired" in m["body"] for m in inbox.json(f"inbox/{h}")), "released, broken and revoked: no DM"
+    call("remove", o, name="r")
+    assert "no such resource" in err("lease_history", o, resource=res)["error"]
+    alive()
+
+
+def cli(*args, **kw):
+    return subprocess.run([str(BIN / "agent-bridge"), *args], capture_output=True, text=True, timeout=60, **kw)
+
+
+def cli_agent(name):
+    """A registered agent, since the ledger commands need one; leave() removes it."""
+    return cli("register", name, check=True).stdout.strip()
+
+
+def test_exec_runs_a_command_under_the_lease(tmp_path):
+    """acquire --exec: the lease and token reach the command, it is renewed while the command runs and released
+    after, signals sent to agent-bridge reach the command, and the exit status tells "retry" (75) from the command's
+    own."""
+    o, h = cli_agent("exec-owner"), cli_agent("exec-holder")
+    res = f"{o}/lk"
+    try:
+        assert cli("add", o, "lk", "--visibility", "public", "--max-level", "write").returncode == 0
+        call("init", h)
+        call("request", h, resource=res, level="write")
+
+        def run(*cmd, ttl="30", wait=None):
+            extra = ["--wait", wait] if wait else []
+            return [str(BIN / "agent-bridge"), "acquire", h, res, "write", "--ttl", ttl, *extra, "--exec", *cmd]
+
+        show = "echo $AGENT_BRIDGE_FENCE_TOKEN $AGENT_BRIDGE_LEASE_RESOURCE $AGENT_BRIDGE_LEASE_LEVEL"
+        p = subprocess.run(run("sh", "-c", show + " $AGENT_BRIDGE_LEASE_ID; exit 3"), capture_output=True, text=True)
+        token, resource, level, lease_id = p.stdout.split()
+        assert p.returncode == 3 and resource == res and level == "write" and int(token) > 0, p
+        assert len(lease_id) == 16 and not holders(res), "the command's status, and the lease is given back"
+
+        # renewed past its ttl while the command runs
+        p = subprocess.run(run("sh", "-c", "sleep 4", ttl="2"), capture_output=True, text=True, timeout=60)
+        assert p.returncode == 0 and p.stderr == "", p
+        events = [e["event"] for e in call("lease_history", o, resource=res)["events"]]
+        assert events[-3:] == ["acquire", "renew", "release"], events
+        by_name = cli("lease-history", o, "lk", "--last", "3")  # a bare NAME is one of MY_ADDR's resources
+        assert [e["event"] for e in json.loads(by_name.stdout)["events"]] == events[-3:], by_name
+
+        # never got it: 75, and the command did not run
+        held = call("acquire", o, resource=res, level="write", ttl=60)["lease"]
+        ran = tmp_path / "ran"
+        p = subprocess.run(run("touch", str(ran)), capture_output=True, text=True, timeout=60)
+        assert p.returncode == 75 and f"busy, held by {o}" in p.stderr and "touch was not run" in p.stderr, p
+        assert not ran.exists()
+
+        # lost it while running: the owner breaks the lease, the command gets SIGTERM, 75
+        trap = 'trap "echo stopped; exit 9" TERM; sleep 30 & wait'
+        proc = subprocess.Popen(
+            run("sh", "-c", trap, ttl="3", wait="10"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        call("release", o, lease_id=held["lease_id"])
+        assert wait_for(lambda: holders(res) == {h}, 10)
+        mine = call("leases", h)["leases"][0]["lease_id"]
+        call("release", o, lease_id=mine)
+        out, errs = proc.communicate(timeout=30)
+        assert proc.returncode == 75 and out == "stopped\n" and "ledger: lost the lease on" in errs, (out, errs)
+
+        # a signal sent to agent-bridge reaches the command, whose status is returned; the lease is released
+        proc = subprocess.Popen(
+            run("sh", "-c", 'trap "exit 7" TERM; sleep 30 & wait'), stderr=subprocess.PIPE, text=True
+        )
+        assert wait_for(lambda: holders(res) == {h}, 10)
+        time.sleep(0.3)  # the shell has set its trap
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(15) == 7 and wait_for(lambda: not holders(res), 5)
+
+        # killed by a signal: 128+n; not startable: 127, released
+        p = subprocess.run(run("sh", "-c", "kill -9 $$"), capture_output=True, text=True, timeout=60)
+        assert p.returncode == 137, p
+        p = subprocess.run(run(str(tmp_path / "no-such-command")), capture_output=True, text=True, timeout=60)
+        assert p.returncode == 127 and "cannot run" in p.stderr and not holders(res), p
+    finally:
+        cli("leave", h)
+        cli("leave", o)
+
+
+def test_request_waits_for_the_answer():
+    """request --wait blocks until the owner answers: granted is exit 0, denied and still pending are exit 1."""
+    o, r = cli_agent("wait-owner"), cli_agent("wait-req")
+    try:
+        cli("add", o, "priv", check=True)
+        cli("add", o, "pub", "--visibility", "public", check=True)
+        p = cli("request", r, f"{o}/pub", "read", "--wait")
+        assert p.returncode == 0 and json.loads(p.stdout)["request"]["status"] == "granted", "auto-granted at once"
+
+        def ask(level, then):
+            proc = subprocess.Popen(
+                [str(BIN / "agent-bridge"), "request", r, f"{o}/priv", level, "--wait", "20"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert wait_for(lambda: any(q["status"] == "pending" for q in call("grants", o)["asked"]), 10)
+            pending = next(q for q in call("grants", o)["asked"] if q["status"] == "pending")
+            call(then, o, request_id=pending["id"])
+            out, errs = proc.communicate(timeout=30)
+            return proc.returncode, out, errs, pending["id"]
+
+        code, out, _, _ = ask("read", "grant")
+        assert code == 0 and json.loads(out)["request"]["status"] == "granted", out
+        code, out, errs, rid = ask("write", "deny")
+        assert code == 1 and errs.strip() == f"ledger: {o} denied your write request for {o}/priv (request_id {rid})"
+        p = cli("request", r, f"{o}/priv", "write", "--wait", "1")
+        assert p.returncode == 1 and "still pending after 1 s (request_id" in p.stderr, p
+        assert "wait: number between 0 and 3600" in cli("request", r, f"{o}/priv", "write", "--wait", "3601").stderr
+    finally:
+        cli("leave", r)
+        cli("leave", o)
+
+
 def test_replay_window():
     """A stored answer lives as long as its request can be redelivered: max(300 s, the request's
     MessageExpiryInterval), capped at MAX_TTL + MAX_WAIT. Rows are purged 300 s after their ts by this ledgerd and by
@@ -832,10 +1007,10 @@ def test_stale():
     print("stale ok")
 
 
-def test_a_newer_schema_is_refused():
+def test_a_newer_schema_is_refused(tmp_path):
     """ledgerd refuses a ledger.db whose schema version it does not know, before writing anything to it, so a
     rollback can never touch a database a newer ledgerd migrated."""
-    db = os.path.join(tempfile.mkdtemp(), "ledger.db")
+    db = str(tmp_path / "ledger.db")
     with sqlite3.connect(db) as conn:
         conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
         conn.execute("INSERT INTO meta VALUES ('schema', 2)")
@@ -853,14 +1028,16 @@ def test_a_newer_schema_is_refused():
         )
 
 
-def test_arguments_start_nothing():
+def test_arguments_start_nothing(tmp_path):
     """Only no arguments runs ledgerd: --help and refused arguments exit before a connection or the database is
     opened, so a stray flag can never start a second ledgerd on the live defaults."""
-    db = os.path.join(tempfile.mkdtemp(), "ledger.db")
+    db = str(tmp_path / "ledger.db")
     env = {**os.environ, "LEDGER_DB": db, "AGENT_BRIDGE_PORT": "1"}  # nothing listens there
     for args, code, out, err in (
         (["--help"], 0, "usage: agent-bridge-ledgerd", ""),
         (["-h"], 0, "usage: agent-bridge-ledgerd", ""),
+        (["--version"], 0, f"agent-bridge-ledgerd {_native.__version__}\n", ""),
+        (["-V"], 0, f"agent-bridge-ledgerd {_native.__version__}\n", ""),
         (["--bogus"], 2, "", "agent-bridge-ledgerd: error: unrecognized arguments: --bogus"),
         (["--health", "x"], 2, "", "unrecognized arguments: x"),
         (["--hea"], 2, "", "unrecognized arguments: --hea"),  # no abbreviations

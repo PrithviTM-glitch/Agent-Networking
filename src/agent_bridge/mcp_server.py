@@ -26,6 +26,8 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 
+import agent_bridge
+
 from . import _native, host
 from .errors import BridgeError, LedgerError
 from .protocol import LINEAGE, ORIGIN
@@ -65,8 +67,18 @@ state = {"bus": None, "ledger_ready": False, "problem": None, "loop": None, "arr
 
 
 def _address(name):
-    """Fixed per Claude Code session when it tells us the session, otherwise per name."""
-    return _native.identity_session_address(SESSION) if SESSION else f"{name}-{_native.identity_short_hash(name)}"
+    """Per name without a session. Under a Claude Code session it is the session's own agent, so this server posts as
+    the agent its relay delivers for: the one a live relay holds (its lock's line 2), else the agent registered from
+    the session (relay_session_agent, the very choice a relay would make), and only when the session has none, the
+    address derived from the session id."""
+    if not SESSION:
+        return f"{name}-{_native.identity_short_hash(name)}"
+    if UUID.fullmatch(SESSION):
+        if held := _native.relay_held(SESSION):
+            return held
+        if adopted := _native.relay_session_agent(SESSION):
+            return adopted
+    return _native.identity_session_address(SESSION)
 
 
 def _relayed():
@@ -74,8 +86,13 @@ def _relayed():
 
 
 def _use(bus):
-    """Make bus the agent's, and wake the push loop on each message that reaches it while it stays so."""
+    """Make bus the agent's, record this server's version in its presence for the console, and wake the push loop on
+    each message that reaches it while it stays so."""
     state["bus"] = bus
+    try:
+        bus.set_client_version(agent_bridge.__version__)
+    except BridgeError as e:  # the version is only shown in the console: never a reason not to serve
+        print(f"bridge: version not recorded: {' '.join(str(e).split())}", file=sys.stderr, flush=True)
     threading.Thread(target=_arrivals, args=(bus,), daemon=True).start()
 
 
@@ -105,7 +122,9 @@ def _swap():
         if bus is None or bus.owner != _relayed():
             return
         bus.close()  # anything it had not acked goes back to the broker for the new owner
-        _use(_native.Bus.attach(bus.addr, owner=not bus.owner))
+        # A relay that just started may have adopted another of the session's agents: post as the one it delivers for.
+        addr = (bus.owner and _native.relay_held(SESSION)) or bus.addr
+        _use(_native.Bus.attach(addr, owner=not bus.owner))
 
 
 def _arrived():
@@ -161,7 +180,7 @@ def _ledger(op, **fields):
 
 
 def _whoami(bus):
-    fields = ("name", "caps", "topics", "keep", *ORIGIN, *LINEAGE)
+    fields = ("name", "caps", "about", "topics", "keep", "mcp", *ORIGIN, *LINEAGE)
     return {
         "addr": bus.addr,
         **{k: bus.rec[k] for k in fields if k in bus.rec},
@@ -193,9 +212,19 @@ def connect(name: str | None = None, caps: list[str] | None = None, keep: bool |
     return _connect(name, caps, keep)
 
 
+@tool("describe")
+def describe(name: str | None = None, caps: list[str] | None = None, about: str | None = None):
+    """Change how other agents see you: name (a display name; @name mentions follow it, and your address never
+    changes), caps (things you can do for others) and about, one line ("" clears it). Returns your record."""
+    bus = _bus()
+    bus.describe(name, caps, about)
+    return _whoami(bus)
+
+
 @tool("whoami")
 def whoami():
-    """Your address, name, caps, subscribed topics, keep flag and how many messages are waiting."""
+    """Your address, name, caps, about, subscribed topics, keep flag, this server's version (mcp) and how many messages
+    are waiting."""
     return _whoami(_bus())
 
 
@@ -287,12 +316,14 @@ def say(room: str, text: str):
 
 
 @tool("history", untrusted=True)
-def history(room: str, last: int = 20):
-    """The last messages of a chat room, oldest first, to catch up after joining."""
+def history(room: str, last: int = 20, before: int | None = None):
+    """The last messages of a chat room, oldest first, to catch up after joining. Each carries its seq; to page back,
+    pass the oldest entry's seq as before."""
     bus = _bus()
     _native.check_ident(room, "room")
     _native.check_last(last)
-    return bus.history_call("room", room=room, last=last)["messages"]
+    paging = {"before_seq": before} if before is not None else {}
+    return bus.history_call("room", room=room, last=last, seq=True, **paging)["messages"]
 
 
 @tool("dm")
@@ -303,9 +334,15 @@ def dm(to: str, text: str):
 
 
 @tool("dms", untrusted=True)
-def dms(peer: str | None = None, last: int = 20):
-    """Your direct messages in both directions, oldest first; with peer, only those with that address."""
-    return _bus().dms(peer, last)
+def dms(peer: str | None = None, last: int = 20, before: int | None = None):
+    """Your direct messages in both directions, oldest first; with peer, only those with that address. Each carries
+    its seq; to page back, pass the oldest entry's seq as before."""
+    bus = _bus()
+    if peer is not None:
+        _native.check_ident(peer, "address")
+    _native.check_last(last)
+    fields = {"peer": peer, "last": last, "seq": True, "before_seq": before}
+    return bus.history_call("dms", as_agent=True, **{k: v for k, v in fields.items() if v is not None})["messages"]
 
 
 @tool("sub")
@@ -403,11 +440,28 @@ def public():
     return _ledger("public")
 
 
+REQUEST_WAIT_MAX = 3600  # as core's ledger::MAX_REQUEST_WAIT, the CLI's request --wait bound
+
+
 @tool("request", untrusted=True)
-def request(resource: str, level: Literal["read", "write"]):
+def request(resource: str, level: Literal["read", "write"], wait: float = 0):
     """Ledger: ask for access to resource <owner address>/<name>. Granted at once if public and level <= its
-    max_level, else pending until the owner decides (you get a DM from ledgerd either way)."""
-    return _ledger("request", resource=resource, level=level)
+    max_level, else pending until the owner decides (you get a DM from ledgerd either way). With wait, block up to
+    that many seconds (max 3600) for the owner's answer. The call stays open for the whole wait, so keep it short and
+    call again to keep waiting. The request's status then says granted, denied, still pending, or gone (the resource
+    was removed or its owner left; "error" says so). A denial or a removal is an answer, not an error."""
+    if not 0 <= wait <= REQUEST_WAIT_MAX:
+        raise ToolError(f"wait must be 0-{REQUEST_WAIT_MAX} seconds")
+    reply = _ledger("request", resource=resource, level=level)
+    row, deadline = reply.get("request") or {}, time.monotonic() + wait
+    while row.get("status") == "pending" and time.monotonic() < deadline:
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+        held = _ledger("grants").get("held", [])
+        if not (now := next((r for r in held if r.get("id") == row.get("id")), None)):
+            gone = f"request {row.get('id')} is gone: the resource was removed or its owner left"  # as the CLI says
+            return {**reply, "request": {**row, "status": "gone"}, "error": gone}
+        row = now
+    return {**reply, "request": row}
 
 
 @tool("grant")
@@ -426,6 +480,21 @@ def deny(request_id: str):
 def grants():
     """Ledger: requests you made (held) and requests on your resources (asked), with their status."""
     return _ledger("grants")
+
+
+@tool("leases", untrusted=True)
+def leases():
+    """Ledger: the leases you hold, soonest expiry first: resource, owner, level, token (write leases), expires_at."""
+    return _ledger("leases")
+
+
+@tool("lease_history", untrusted=True)
+def lease_history(resource: str, last: int = 50):
+    """Ledger, owner only: the last events of one of your resources (a bare name or <your address>/<name>), oldest
+    first (acquire, renew, release, break, revoke, expire, drop), at most 500; ledgerd keeps 200 per resource."""
+    if "/" not in resource:
+        resource = f"{_bus().addr}/{resource}"
+    return _ledger("lease_history", resource=resource, last=last)
 
 
 @tool("acquire", untrusted=True)
@@ -500,12 +569,14 @@ async def _serve():
 
 def main():
     # Parsed first, so --help or a stray argument never starts a server that takes this session's agent over.
-    argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         prog="agent-bridge-mcp",
         description="stdio MCP server that puts a Claude Code session on the agent bus. Claude Code starts it "
         "(claude mcp add --scope user bridge -- agent-bridge-mcp); it takes no arguments.",
         allow_abbrev=False,
-    ).parse_args()
+    )
+    p.add_argument("-V", "--version", action="version", version=f"%(prog)s {agent_bridge.__version__}")
+    p.parse_args()
     anyio.run(_serve)
 
 

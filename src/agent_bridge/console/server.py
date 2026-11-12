@@ -8,6 +8,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+import agent_bridge
+
 from .. import _native, config
 from ..errors import HistoryError
 from . import actions, admin, auth, capacity, events, kill, leaks, metrics, processes, sessions, usage
@@ -52,6 +54,7 @@ def state(_query):
         "connected": admin.held["bus"] is not None,
         "rooms": admin.settings,
         "broker": {"dropped": admin.dropped()},
+        "version": {"package": agent_bridge.__version__, "native": _native.__version__},
     }
 
 
@@ -199,6 +202,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     p = argparse.ArgumentParser(description="The agent bus admin console on 127.0.0.1 (MONITOR_PORT, default 10000).")
     p.add_argument("--headless", action="store_true", help="serve the API and /metrics only, no web page")
+    p.add_argument("-V", "--version", action="version", version=f"%(prog)s {agent_bridge.__version__}")
     a = p.parse_args()
     Handler.token, Handler.headless = auth.load_token(), a.headless
     server = ThreadingHTTPServer(("127.0.0.1", auth.PORT), Handler)

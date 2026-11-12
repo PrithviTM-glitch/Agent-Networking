@@ -7,8 +7,10 @@ use crate::mqtt::{Conn, DialError, Handler, Message, Options};
 use crate::request::{self, Replies, Sent};
 use serde_json::Value;
 use std::fmt;
+use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 /// An ok:false reply, a timeout or a malformed reply; reply holds the reply.
 #[derive(Debug)]
@@ -120,6 +122,7 @@ pub fn call_over(
     timeout: Option<f64>,
 ) -> Result<Map, LedgerError> {
     let timeout = timeout_for(&fields, timeout);
+    let newer = op.as_str().filter(|o| NEWER_OPS.contains(o)).map(str::to_owned);
     let mut req = Map::new();
     req.insert("op".into(), op);
     req.extend(fields);
@@ -147,10 +150,23 @@ pub fn call_over(
     };
     match crate::json::loads(&payload) {
         Some(Value::Object(reply)) if reply.get("ok") == Some(&Value::Bool(true)) => Ok(reply),
-        Some(Value::Object(reply)) => Err(LedgerError { reply }),
+        Some(Value::Object(reply)) => match newer {
+            Some(op) if reply.get("error").and_then(Value::as_str).is_some_and(|e| e.starts_with("op: one of")) => {
+                Err(LedgerError::new(format!("ledgerd is older than 0.3.0 and has no {op} op")))
+            }
+            _ => Err(LedgerError { reply }),
+        },
         _ => Err(LedgerError::new("malformed reply")),
     }
 }
+
+/// Ops a ledgerd before 0.3.0 does not know: its refusal is turned into one that says so.
+const NEWER_OPS: [&str; 3] = ["leases", "lease_history", "ping"];
+/// The exit status of acquire --exec when it never got the lease or lost it while the command ran (EX_TEMPFAIL).
+pub const EXEC_NO_LEASE: i32 = 75;
+/// How long a command that lost its lease gets between SIGTERM and SIGKILL.
+const EXEC_GRACE: Duration = Duration::from_secs(10);
+pub const MAX_REQUEST_WAIT: f64 = 3600.0;
 
 fn fields_wait(req: &Map) -> f64 {
     req.get("wait").and_then(Value::as_f64).filter(|w| w.is_finite()).unwrap_or(0.0)
@@ -242,6 +258,176 @@ pub fn call_value(op: Value, as_: Option<Value>, fields: Map, timeout: Option<f6
     let reply = call_over(&c, &own.0, &request::reply_topic("ledger", ""), op, as_, fields, timeout);
     c.close();
     reply
+}
+
+fn map(pairs: &[(&str, Value)]) -> Map {
+    pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect()
+}
+
+fn text_of<'a>(m: &'a Value, pointer: &str) -> &'a str {
+    m.pointer(pointer).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// request, then wait up to wait seconds for the owner's answer by reading grants once a second. Ok is the granted
+/// request (without "ok"); denied and still pending are errors, and a pending request stays pending.
+pub fn request_wait(addr: &str, resource: &str, level: &str, wait: f64) -> Result<Map, LedgerError> {
+    if !(0.0..=MAX_REQUEST_WAIT).contains(&wait) {
+        return Err(LedgerError::new(format!("wait: number between 0 and {}", fmt_g(MAX_REQUEST_WAIT))));
+    }
+    call("init", addr, Map::new(), None)?;
+    let fields = map(&[("resource", resource.into()), ("level", level.into())]);
+    let mut row = Value::Object(call("request", addr, fields, None)?).get("request").cloned().unwrap_or_default();
+    let id = text_of(&row, "/id").to_owned();
+    let deadline = Instant::now() + Duration::from_secs_f64(wait);
+    loop {
+        match text_of(&row, "/status") {
+            "granted" => return Ok(map(&[("request", row)])),
+            "denied" => {
+                let owner = text_of(&row, "/owner");
+                return Err(LedgerError::new(format!(
+                    "{owner} denied your {level} request for {resource} (request_id {id})"
+                )));
+            }
+            _ => {}
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(LedgerError::new(format!("still pending after {} s (request_id {id})", fmt_g(wait))));
+        }
+        std::thread::sleep(left.min(Duration::from_secs(1)));
+        let grants = Value::Object(call("grants", addr, Map::new(), None)?);
+        let held = grants.get("held").and_then(Value::as_array).cloned().unwrap_or_default();
+        row = held.into_iter().find(|r| text_of(r, "/id") == id).ok_or_else(|| {
+            LedgerError::new(format!("request {id} is gone: the resource was removed or its owner left"))
+        })?;
+    }
+}
+
+static FORWARD: AtomicI32 = AtomicI32::new(0);
+
+/// A signal sent to this process with kill(2) is passed on to the command; one the terminal sent to the whole
+/// foreground process group (si_code > 0) already reached it, so it is only noted.
+extern "C" fn on_forward(signo: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    let sent = !info.is_null() && unsafe { (*info).si_code } <= 0;
+    FORWARD.store(if sent { signo } else { -signo }, Ordering::SeqCst);
+}
+
+fn forward_signals() {
+    for signo in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction =
+                on_forward as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as libc::sighandler_t;
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigaction(signo, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+fn status_code(status: ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status.code().or_else(|| status.signal().map(|n| 128 + n)).unwrap_or(1)
+}
+
+/// acquire --exec: take the lease, run cmd with it (AGENT_BRIDGE_FENCE_TOKEN, AGENT_BRIDGE_LEASE_ID, _RESOURCE and
+/// _LEVEL in its environment), renew it every ttl/3 while cmd runs, and release it when cmd exits. Returns cmd's
+/// exit status (128+n if signal n killed it), 127 if cmd could not be started, or EXEC_NO_LEASE (75) if the lease
+/// was refused or lost; losing it sends cmd SIGTERM, then SIGKILL after EXEC_GRACE. Messages go to stderr.
+pub fn exec(addr: &str, resource: &str, level: &str, ttl: Option<f64>, wait: Option<f64>, cmd: &[String]) -> i32 {
+    let fail = |text: String| {
+        eprintln!("ledger: {}", text.split_whitespace().collect::<Vec<_>>().join(" "));
+        EXEC_NO_LEASE
+    };
+    let Some((program, args)) = cmd.split_first() else { return fail("--exec needs a command".into()) };
+    let ttl = ttl.unwrap_or(60.0);
+    let mut fields = map(&[("resource", resource.into()), ("level", level.into()), ("ttl", ttl.into())]);
+    if let Some(w) = wait {
+        fields.insert("wait".into(), w.into());
+    }
+    // before the acquire, so a signal between the lease and the spawn is still seen
+    forward_signals();
+    let lease = match call("init", addr, Map::new(), None).and_then(|_| call("acquire", addr, fields, None)) {
+        Ok(reply) => reply.get("lease").cloned().unwrap_or_default(),
+        Err(e) => return fail(format!("{e}; {program} was not run")),
+    };
+    let lease_id = text_of(&lease, "/lease_id").to_owned();
+    let release = || {
+        let _ = call("release", addr, map(&[("lease_id", lease_id.clone().into())]), Some(5.0));
+    };
+    let got = FORWARD.load(Ordering::SeqCst);
+    if got != 0 {
+        release();
+        return 128 + got.abs();
+    }
+    let mut command = Command::new(program);
+    command.args(args).env("AGENT_BRIDGE_LEASE_ID", &lease_id).env("AGENT_BRIDGE_LEASE_RESOURCE", resource);
+    command.env("AGENT_BRIDGE_LEASE_LEVEL", level).env_remove("AGENT_BRIDGE_FENCE_TOKEN");
+    if let Some(token) = lease.get("token").and_then(Value::as_i64) {
+        command.env("AGENT_BRIDGE_FENCE_TOKEN", token.to_string());
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            release();
+            eprintln!("ledger: cannot run {program}: {e}");
+            return 127;
+        }
+    };
+    let pid = child.id() as libc::pid_t;
+    let started = Instant::now();
+    let mut expires = started + Duration::from_secs_f64(ttl);
+    let mut renew_at = started + Duration::from_secs_f64(ttl / 3.0);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                release();
+                return status_code(status);
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        let got = FORWARD.swap(0, Ordering::SeqCst);
+        if got > 0 {
+            unsafe { libc::kill(pid, got) };
+        }
+        let now = Instant::now();
+        if now >= renew_at {
+            let left = expires.saturating_duration_since(now).as_secs_f64();
+            let fields = map(&[("lease_id", lease_id.clone().into()), ("ttl", ttl.into())]);
+            match call("renew", addr, fields, Some(left.clamp(1.0, 5.0))) {
+                Ok(_) => {
+                    let now = Instant::now();
+                    expires = now + Duration::from_secs_f64(ttl);
+                    renew_at = now + Duration::from_secs_f64(ttl / 3.0);
+                }
+                // gone, someone else's now, or not renewable before it runs out: the lock no longer protects cmd
+                Err(e) if e.to_string().starts_with("no such lease") || e.to_string().starts_with("lease ") => {
+                    return lost(&mut child, pid, &format!("{e}"), resource, program);
+                }
+                Err(e) if left <= 2.0 => return lost(&mut child, pid, &e.to_string(), resource, program),
+                Err(_) => renew_at = now + Duration::from_secs(1),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    release();
+    EXEC_NO_LEASE
+}
+
+/// The lease is gone while cmd still runs: SIGTERM, then SIGKILL after EXEC_GRACE.
+fn lost(child: &mut std::process::Child, pid: libc::pid_t, why: &str, resource: &str, program: &str) -> i32 {
+    eprintln!("ledger: lost the lease on {resource} ({why}); stopping {program}");
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = Instant::now() + EXEC_GRACE;
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            return EXEC_NO_LEASE;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    EXEC_NO_LEASE
 }
 
 #[cfg(test)]

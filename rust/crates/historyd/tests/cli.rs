@@ -95,7 +95,18 @@ fn arguments_never_start_the_service() {
     for help in ["--help", "-h"] {
         let out = run(port, &dir, &[help], Duration::from_secs(3));
         assert_eq!(out.status.code(), Some(0));
-        assert!(String::from_utf8_lossy(&out.stdout).starts_with("usage: agent-bridge-historyd [-h] [--health]\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).starts_with("usage: agent-bridge-historyd [-h] [--health] [-V]\n")
+        );
+    }
+    for version in ["--version", "-V"] {
+        let out = run(port, &dir, &[version], Duration::from_secs(3));
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("agent-bridge-historyd {}\n", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(out.stderr.is_empty());
     }
     // argparse's (allow_abbrev=False) usage line, error line and status, as the Python historyd prints them
     for (bad, extra) in
@@ -105,7 +116,7 @@ fn arguments_never_start_the_service() {
         assert_eq!(out.status.code(), Some(2), "{bad:?}");
         let err = String::from_utf8_lossy(&out.stderr);
         let want = format!(
-            "usage: agent-bridge-historyd [-h] [--health]\nagent-bridge-historyd: error: unrecognized arguments: {extra}\n"
+            "usage: agent-bridge-historyd [-h] [--health] [-V]\nagent-bridge-historyd: error: unrecognized arguments: {extra}\n"
         );
         assert_eq!(err, want);
     }

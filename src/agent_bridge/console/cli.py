@@ -14,6 +14,8 @@ import sys
 import time
 import urllib.parse
 
+import agent_bridge
+
 from . import auth
 
 
@@ -74,7 +76,7 @@ def show(*rows):
         print(json.dumps(row), flush=True)
 
 
-AGENT_FIELDS = ("addr", "session", "parent", "friendly", "kind", "subagent", "alive", "status", "rooms", "pid")
+AGENT_FIELDS = ("addr", "session", "parent", "friendly", "kind", "subagent", "alive", "status", "rooms", "pid", "mcp")
 
 
 def since(text):
@@ -149,6 +151,7 @@ def status(_a):
             "messages": len(st["messages"]),
             "jobs_running": sum(j["state"] == "running" for j in st["jobs"]),
             "dropped": st.get("broker", {}).get("dropped"),
+            "version": st.get("version", {}).get("package"),
         }
     )
 
@@ -279,6 +282,7 @@ def metrics(_a):
 
 def main():
     p = _Parser(prog="agent-bridge-admin", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-V", "--version", action="version", version=f"%(prog)s {agent_bridge.__version__}")
     s = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 
     def cmd(name, fn, help, *args):

@@ -5,8 +5,8 @@
 
 use crate::json::{Map, float};
 use crate::validation::{
-    Result, TOPICS_MAX, check_body_value, check_caps_value, check_ident, check_mentions, check_topic_value, check_ts,
-    fail, is_count, is_uuid,
+    Result, TOPICS_MAX, check_about, check_body_value, check_caps_value, check_ident, check_mentions,
+    check_topic_value, check_ts, fail, is_count, is_uuid, is_version,
 };
 use serde_json::Value;
 
@@ -56,6 +56,14 @@ pub fn parse_presence(payload: &[u8]) -> Option<Map> {
         rec.insert("pid".into(), d["pid"].clone());
         rec.insert("pid_start".into(), d["pid_start"].clone());
     }
+    // Optional, from 0.3.0: kept when well formed and dropped otherwise, never refusing the record. A writer older
+    // than 0.3.0 leaves them out when it rewrites the record, and they stay gone until the agent sets them again.
+    if let Some(v) = d.get("mcp").and_then(Value::as_str).filter(|v| is_version(v)) {
+        rec.insert("mcp".into(), v.into());
+    }
+    if let Some(a) = d.get("about").and_then(Value::as_str).filter(|a| !a.is_empty() && check_about(a).is_ok()) {
+        rec.insert("about".into(), a.into());
+    }
     Some(rec)
 }
 
@@ -99,6 +107,19 @@ fn message(topic: &str, d: &Map) -> Result<Map> {
 mod tests {
     use super::*;
     use crate::json::dumps_map;
+
+    #[test]
+    fn presence_keeps_the_0_3_fields_when_well_formed() {
+        let base = r#""name": "a", "caps": [], "topics": [], "keep": false, "seen": 1"#;
+        let rec =
+            parse_presence(format!(r#"{{{base}, "mcp": "0.3.0", "about": "on the console"}}"#).as_bytes()).unwrap();
+        assert_eq!((rec["mcp"].as_str(), rec["about"].as_str()), (Some("0.3.0"), Some("on the console")));
+        for bad in [r#""mcp": "0.3 0""#, r#""mcp": 3"#, r#""about": "two\nlines""#, r#""about": """#, r#""about": 5"#] {
+            let rec =
+                parse_presence(format!("{{{base}, {bad}}}").as_bytes()).expect("the record itself is still valid");
+            assert!(!rec.contains_key("mcp") && !rec.contains_key("about"), "{bad}");
+        }
+    }
 
     #[test]
     fn messages() {

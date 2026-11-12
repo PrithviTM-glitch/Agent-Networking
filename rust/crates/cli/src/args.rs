@@ -21,7 +21,7 @@ shape only: any local process can claim any address. Room moderation (mode, mode
 the same reason.";
 
 #[derive(Parser)]
-#[command(name = "agent-bridge", about = ABOUT, long_about = LONG_ABOUT, disable_version_flag = true)]
+#[command(name = "agent-bridge", version, about = ABOUT, long_about = LONG_ABOUT)]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Cmd,
@@ -70,6 +70,7 @@ pub enum RelayAction {
     Start,
     Stop,
     Status,
+    Restart,
     Run,
 }
 
@@ -146,12 +147,18 @@ pub enum Cmd {
     /// post to a chat room; @name / @address of a member and @all mention
     ///
     /// Post to a chat room. @name / @address of a room member and @all mention; any other @word stays plain text
-    /// (@@word never mentions), and stderr says which words mentioned nobody.
+    /// (@@word never mentions), and stderr says which words mentioned nobody. TEXT - reads the text from stdin, and --file PATH from a file (UTF-8, the same limits as TEXT; one final newline
+    /// is dropped).
     Say {
         #[arg(value_name = "MY_ADDR")]
         addr: String,
         room: String,
-        text: String,
+        /// the message, or - for stdin
+        #[arg(required_unless_present = "file")]
+        text: Option<String>,
+        /// read the message from this file instead
+        #[arg(long, value_name = "PATH", conflicts_with = "text")]
+        file: Option<std::path::PathBuf>,
     },
     /// a room's settings: info ROOM, or set MY_ADDR ROOM --mode/--rules
     Room {
@@ -178,19 +185,37 @@ pub enum Cmd {
     /// ban ADDR and drop it from the room (briefly takes its session over, its relay reconnects) (admin or a moderator)
     Kick(Moderation),
     /// a chat room's transcript, to catch up after joining
+    ///
+    /// Entries come oldest first, each with its "seq"; for the page before, pass the oldest entry's seq to --before.
     History {
         room: String,
         #[arg(long, default_value_t = 20, allow_negative_numbers = true)]
         last: i64,
+        /// only entries older than this seq (paging back)
+        #[arg(long, value_name = "SEQ", allow_negative_numbers = true)]
+        before: Option<i64>,
+        /// one readable line per message instead of JSON
+        #[arg(long)]
+        text: bool,
     },
     /// direct message one agent
+    ///
+    /// TEXT - reads the text from stdin, and --file PATH from a file (UTF-8, the same limits as TEXT; one final newline
+    /// is dropped).
     Dm {
         #[arg(value_name = "MY_ADDR")]
         addr: String,
         to: String,
-        text: String,
+        /// the message, or - for stdin
+        #[arg(required_unless_present = "file")]
+        text: Option<String>,
+        /// read the message from this file instead
+        #[arg(long, value_name = "PATH", conflicts_with = "text")]
+        file: Option<std::path::PathBuf>,
     },
     /// your direct messages, both directions
+    ///
+    /// Entries come oldest first, each with its "seq"; for the page before, pass the oldest entry's seq to --before.
     Dms {
         #[arg(value_name = "MY_ADDR")]
         addr: String,
@@ -198,6 +223,12 @@ pub enum Cmd {
         peer: Option<String>,
         #[arg(long, default_value_t = 20, allow_negative_numbers = true)]
         last: i64,
+        /// only entries older than this seq (paging back)
+        #[arg(long, value_name = "SEQ", allow_negative_numbers = true)]
+        before: Option<i64>,
+        /// one readable line per message instead of JSON
+        #[arg(long)]
+        text: bool,
     },
     /// subscribe to a raw topic, + and # wildcards work
     Sub {
@@ -225,12 +256,62 @@ pub enum Cmd {
         /// block up to N seconds (max 3600) for a message
         #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
         wait: f64,
+        /// one readable line per message instead of JSON
+        #[arg(long)]
+        text: bool,
     },
-    /// this Claude Code session's relay into its inbox: start (the SessionStart hook), stop, status; run PID START
-    /// is what start launches
+    /// follow a room live until Ctrl-C, after its last few messages
     ///
-    /// status prints {"session", "live", "lock"}. stop prints that same line once the relay has stopped, so its
-    /// "live" is false: the state after the stop, not before it. start prints nothing.
+    /// It reads over a connection of its own, so it needs no address and never takes a session or relay over; muted
+    /// and banned senders are left out, as recv leaves them out.
+    Watch {
+        room: String,
+        /// how many past messages to show first
+        #[arg(long, default_value_t = 20, allow_negative_numbers = true)]
+        last: i64,
+        /// one readable line per message instead of JSON
+        #[arg(long)]
+        text: bool,
+    },
+    /// change your display name, caps or self-description
+    ///
+    /// The address never changes. @name mentions follow the new name. --about "" clears the description, --caps ""
+    /// the caps.
+    Describe {
+        #[arg(value_name = "MY_ADDR")]
+        addr: String,
+        /// a new display name
+        #[arg(long)]
+        name: Option<String>,
+        /// comma-separated things you can do for others
+        #[arg(long)]
+        caps: Option<String>,
+        /// a one-line description of yourself, at most 200 bytes
+        #[arg(long)]
+        about: Option<String>,
+    },
+    /// check this machine's bridge: broker, services, directories, versions, relays and hooks
+    ///
+    /// One line per check, OK, WARN or FAIL, with what to do; exit 1 if any check fails. It only reads: it never
+    /// creates the state directory, starts or stops a relay, or edits settings. Checks: broker (reachable), ledgerd
+    /// and historyd (answer, and their versions), state_dir and config_dir (exist, yours, modes), cli_lock
+    /// (writable), versions (this CLI, the services and the installed wheel agree), relays (a live relay on a
+    /// replaced or different binary, or whose session ended) and hooks (each agent-bridge hook in
+    /// ~/.claude/settings.json runs an existing program).
+    Doctor {
+        /// one JSON object per check: {"check", "status": "ok"|"warn"|"fail", "detail", ...}
+        #[arg(long)]
+        json: bool,
+    },
+    /// this Claude Code session's relay into its inbox: start (the SessionStart hook), stop, status, restart; run PID
+    /// START is what start launches
+    ///
+    /// status prints {"session", "live", "lock", "pid", "started", "uptime_s", "binary", "version"}; the last five
+    /// are null while no relay is live, version is null for a relay older than 0.3.0, and binary ends in " (deleted)"
+    /// when the relay still runs a file an upgrade replaced: restart it. stop prints that same line once the relay
+    /// has stopped, so its "live" is false: the state after the stop, not before it. restart stops this session's
+    /// relay, starts it again on the installed binary and prints the line once it is live; it runs only inside the
+    /// session, without --session. start prints nothing.
     Relay {
         #[arg(default_value = "start")]
         action: RelayAction,
@@ -287,11 +368,17 @@ pub enum Cmd {
         addr: String,
     },
     /// ledger: ask for access to OWNER/NAME
+    ///
+    /// With --wait it blocks until the owner answers, checking every second: granted prints the request (exit 0);
+    /// denied, or still pending after S seconds, is an error (exit 1) and a pending request stays pending.
     Request {
         #[arg(value_name = "MY_ADDR")]
         addr: String,
         resource: String,
         level: Level,
+        /// wait up to S seconds (default 300, max 3600) for the owner to grant or deny it
+        #[arg(long, value_name = "S", num_args = 0..=1, default_missing_value = "300", allow_negative_numbers = true)]
+        wait: Option<f64>,
     },
     /// ledger: grant a pending request on your resource
     Grant {
@@ -311,6 +398,13 @@ pub enum Cmd {
         addr: String,
     },
     /// ledger: take a lease, read is shared, write exclusive with a fencing token
+    ///
+    /// With --exec CMD [ARGS...] (last on the line: everything after it is the command) it takes the lease, runs CMD
+    /// with AGENT_BRIDGE_LEASE_ID, AGENT_BRIDGE_LEASE_RESOURCE, AGENT_BRIDGE_LEASE_LEVEL and, for write,
+    /// AGENT_BRIDGE_FENCE_TOKEN in its environment, renews the lease every ttl/3 while CMD runs, releases it when CMD
+    /// exits, and exits with CMD's status (128+N if signal N killed it). SIGINT, SIGTERM and SIGHUP are passed on to
+    /// CMD. Exit 75 means CMD did not run to the end with the lease: it was refused (busy, no grant) or lost while CMD
+    /// ran (CMD then gets SIGTERM, and SIGKILL 10 s later); the stderr line says which. Exit 127: CMD could not start.
     Acquire {
         #[arg(value_name = "MY_ADDR")]
         addr: String,
@@ -322,6 +416,9 @@ pub enum Cmd {
         /// seconds to queue if busy, default 0
         #[arg(long, allow_negative_numbers = true)]
         wait: Option<f64>,
+        /// run CMD [ARGS...] while holding the lease
+        #[arg(long, value_name = "CMD", num_args = 1.., allow_hyphen_values = true)]
+        exec: Option<Vec<String>>,
     },
     /// ledger: extend a lease
     Renew {
@@ -337,6 +434,22 @@ pub enum Cmd {
         #[arg(value_name = "MY_ADDR")]
         addr: String,
         lease_id: String,
+    },
+    /// ledger: the leases you hold (resource, owner, level, token for write, expires_at), soonest expiry first
+    Leases {
+        #[arg(value_name = "MY_ADDR")]
+        addr: String,
+    },
+    /// ledger: the last lease events of one of your resources (acquire, renew, release, break, revoke, expire, drop)
+    #[command(name = "lease-history")]
+    LeaseHistory {
+        #[arg(value_name = "MY_ADDR")]
+        addr: String,
+        /// one of your resources, by name or OWNER/NAME
+        resource: String,
+        /// how many events, 1-500, default 50
+        #[arg(long, allow_negative_numbers = true)]
+        last: Option<i64>,
     },
 }
 

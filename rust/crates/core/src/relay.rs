@@ -1,5 +1,5 @@
 //! A session relay as others see it: its lock file, <data dir>/relay/<session id>.lock, flocked exclusively by the
-//! live relay and holding its pid, then the address it relays for. The console, the hooks and the CLI read it here;
+//! live relay and holding its pid, then the address it relays for, then (from 0.3.0) its version. The console, the hooks and the CLI read it here;
 //! the relay itself is the CLI's `relay run`.
 
 use crate::validation::{ID_MAX, Result, check_session, is_ident, os_error};
@@ -34,6 +34,32 @@ fn lock_lines(session: &str) -> Vec<String> {
 pub fn held(session: &str) -> Option<String> {
     let lines = lock_lines(session);
     lines.get(1).filter(|a| is_ident(a, ID_MAX) && live(session)).cloned()
+}
+
+/// The live relay's version, from its lock file; None if it is not live or predates 0.3.0.
+pub fn version(session: &str) -> Option<String> {
+    let lines = lock_lines(session);
+    lines.get(2).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty() && live(session))
+}
+
+/// The live relay's pid, or None.
+pub fn pid(session: &str) -> Option<i32> {
+    lock_lines(session).first().and_then(|l| l.trim().parse().ok()).filter(|p| *p > 0 && live(session))
+}
+
+/// When a process started, in epoch seconds: its start ticks after boot (/proc/PID/stat) plus the boot time.
+pub fn started(pid: i32) -> Option<f64> {
+    let ticks = crate::host::stat(pid.into())?.start as f64;
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let boot: f64 = stat.lines().find_map(|l| l.strip_prefix("btime "))?.trim().parse().ok()?;
+    // SAFETY: sysconf only reads a configuration value.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (hz > 0).then(|| boot + ticks / hz as f64)
+}
+
+/// The executable a process runs, as /proc/PID/exe names it: " (deleted)" at the end once the file was replaced.
+pub fn binary(pid: i32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.to_string_lossy().into_owned())
 }
 
 /// SIGTERM session's relay and wait for its lock to free; false if it outlived timeout.

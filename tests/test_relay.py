@@ -264,6 +264,10 @@ async def coexist(inbox, sender, console, room):
             posts = len(inbox.posts)
             await call(s, "say", room=room, text="from mcp")
             await call(s, "join", room=f"{room}b")
+            # describe rewrites presence over the publish-only Bus, so the relay keeps the session: the messages
+            # below still arrive through it exactly once.
+            me = await call(s, "describe", about="under a relay")
+            assert me["about"] == "under a relay" and me["delivery"] == "relay", me
             await anyio.to_thread.run_sync(sender.join, f"{room}b")
             sender.dm(ADDR, "once")
             sender.say(f"{room}b", "joined through mcp")

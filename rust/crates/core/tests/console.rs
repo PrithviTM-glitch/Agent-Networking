@@ -51,7 +51,7 @@ fn observer_admin_and_describe() {
     assert_eq!((got[0]["topic"].as_str(), got[0]["from"].as_str()), (Some("broadcast"), Some("admin")));
     assert_eq!(a.broadcast("x").unwrap_err().0, "only the admin console can broadcast");
 
-    a.describe(Some("renamed"), Some(&["triage".to_string()])).expect("describe");
+    a.describe(Some("renamed"), Some(&["triage".to_string()]), None).expect("describe");
     let rec = presence::find(&a.addr).unwrap().expect("still live");
     assert!(rec["name"] == "renamed" && rec["caps"] == serde_json::json!(["triage"]), "{rec:?}");
     until(
@@ -59,7 +59,7 @@ fn observer_admin_and_describe() {
         "the new name",
         |e| matches!(e, Event::Presence { addr, rec: Some(r) } if *addr == a.addr && r["name"] == "renamed"),
     );
-    assert_eq!(a.describe(Some("Admin"), None).unwrap_err().0, "name 'Admin' is reserved for the admin console");
+    assert_eq!(a.describe(Some("Admin"), None, None).unwrap_err().0, "name 'Admin' is reserved for the admin console");
     assert_eq!(obs.dropped(), 0);
 
     // A publish-only Bus (the MCP server's while a relay owns the session) speaks as the agent but never receives;

@@ -89,7 +89,7 @@ fn row(addr: &str, rec: &Map, now: f64) -> Map {
         out.insert(key.into(), rec[key].clone());
     }
     out.insert("idle_s".into(), ((now - seen(rec)).round_ties_even() as i64).into());
-    for key in ORIGIN.iter().chain(LINEAGE.iter()) {
+    for key in ORIGIN.iter().chain(LINEAGE.iter()).chain(&["about", "mcp"]) {
         if let Some(v) = rec.get(*key) {
             out.insert((*key).into(), v.clone());
         }

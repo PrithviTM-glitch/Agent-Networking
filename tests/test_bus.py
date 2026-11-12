@@ -5,7 +5,9 @@ The tests are one scenario in file order: later ones use the agents, rooms and l
 
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -689,6 +691,171 @@ def test_retained_replay_precedes_the_barrier(s):
         for info in [evil.publish(f"agents/{x}", b"", qos=1, retain=True) for x in addrs]:
             info.wait_for_publish(10)
         evil.loop_stop()
+
+
+def test_describe_and_client_version(s):
+    """describe changes a live agent's name, caps and one-line about; set_client_version puts the MCP server's version
+    in presence ("mcp"). Both are in the retained record, and another 0.3.0 writer's read-modify-write keeps them."""
+    a, lib = s.a, s.lib
+    rec = lib.describe(name="lib2", caps=["y", "z"], about="watching the build")
+    assert (rec["name"], rec["caps"], rec["about"]) == ("lib2", ["y", "z"], "watching the build")
+    lib.set_client_version("0.3.0+dev.1")
+    assert {k: agents()[lib.addr].get(k) for k in ("name", "about", "mcp")} == {
+        "name": "lib2",
+        "about": "watching the build",
+        "mcp": "0.3.0+dev.1",
+    }
+    run("keep", lib.addr, "on")  # another process rewrites lib's record (and takes its session over once)
+    settle(lib, a)
+    for rec in (agents()[lib.addr], lib.cached_agent(lib.addr)):
+        assert (rec["keep"], rec.get("about"), rec.get("mcp")) == (True, "watching the build", "0.3.0+dev.1"), rec
+    run("keep", lib.addr, "off")
+    settle(lib, a)
+    assert "about" not in lib.describe(about=""), "an empty about clears it"
+    assert "about" not in agents()[lib.addr] and agents()[lib.addr]["mcp"] == "0.3.0+dev.1"
+    for kw in ({"about": "two\nlines"}, {"about": "x" * 201}, {"about": "  "}, {"name": "a b"}, {"caps": ["a b"]}):
+        raises(lib.describe, **kw)
+    for version in ("", "0.3 0", "x" * 33, "0.3.0\u202e"):
+        raises(lib.set_client_version, version)
+    assert agents()[lib.addr]["mcp"] == "0.3.0+dev.1", "a refused version changes nothing"
+    lib.describe(name="lib", caps=["x"])
+
+
+def test_cli_text_input(s, tmp_path):
+    """say and dm take TEXT, - for stdin or --file PATH, under the same rules as TEXT. One trailing newline (\\n or
+    \\r\\n) is dropped, so echo and heredocs send what was typed; everything else is kept byte-exact."""
+    a, b, room = s.a, s.b, f"stdin-{RUN}"
+    tricky = "multi\nline with `backticks`, $(no subshell) and 'quotes' é ✓"
+
+    def piped(*args, data):
+        return subprocess.run([BRIDGE, *args], input=data, env=env(), capture_output=True)
+
+    run("join", b, room)
+    assert piped("say", a, room, "-", data=(tricky + "\r\n").encode()).returncode == 0
+    path = tmp_path / "msg.txt"
+    path.write_bytes((tricky + "\n").encode())
+    run("dm", a, b, "--file", str(path))
+    for data in (b"two\n\n", b"trail  \n", b"no newline"):
+        assert piped("dm", a, b, "-", data=data).returncode == 0, data
+    got = [(m["topic"], m["body"]) for m in lines("recv", b) if m["from"] == a]
+    want = [(f"room/{room}", tricky), (f"inbox/{b}", tricky)]
+    assert got == want + [(f"inbox/{b}", x) for x in ("two\n", "trail  ", "no newline")], got
+    for args, data, err in (
+        (["dm", a, b, "-"], b"\xff\xfe", "stdin is not UTF-8"),
+        (["dm", a, b, "-"], b"", "text is empty"),
+        (["dm", a, b, "-"], b"\n", "text is empty"),
+        (["dm", a, b, "-"], b"x" * (BODY_MAX + 1), f"text is {BODY_MAX + 1} bytes, the limit is {BODY_MAX}"),
+        (["dm", a, b, "-"], b"x" * (BODY_MAX + 1) + b"\n", f"the limit is {BODY_MAX}"),
+        (["say", a, room, "--file", str(tmp_path / "missing")], b"", str(tmp_path / "missing")),
+    ):
+        p = piped(*args, data=data)
+        line = p.stderr.decode().strip()
+        assert p.returncode != 0 and err in line and "\n" not in line, (args, p.stderr)
+    fails("dm", a, b, "text", "--file", str(path))
+    assert piped("dm", a, b, "-", data=b"x" * BODY_MAX).returncode == 0, "exactly the limit"
+    for end in (b"\n", b"\r\n"):
+        assert piped("dm", a, b, "-", data=b"x" * BODY_MAX + end).returncode == 0, ("the limit, then", end)
+    assert [len(m["body"]) for m in lines("recv", b)] == [BODY_MAX] * 3, "nothing refused was sent"
+    run("part", b, room)
+
+
+def test_cli_output(s):
+    """CLI JSON shows text as written (only what a terminal would act on stays escaped); --text prints a line each."""
+    a, b, room = s.a, s.b, f"out-{RUN}"
+    run("join", b, room)
+    run("say", a, room, "café ✓ \u202eevil")
+    out = run("history", room).splitlines()[-1]  # after bob's join notice
+    assert '"café ✓ \\u202eevil"' in out and json.loads(out)["body"] == "café ✓ \u202eevil", out
+    clock = r"(\d{4}-\d\d-\d\d )?\d\d:\d\d:\d\d"
+    hist = run("history", room, "--text").splitlines()
+    assert re.fullmatch(rf"{clock} #{room} {a}: café ✓ \\u202eevil", hist[-1]), hist
+    run("say", a, room, f"two\nlines @{b}")
+    run("dm", a, b, "psst\r")
+    text = run("recv", b, "--text").splitlines()[-4:]  # after bob's own join notice, if any
+    want = [
+        rf"{clock} #{room} {a}: café ✓ \\u202eevil",
+        rf"{clock} #{room} {a} \(mentions you\): two",
+        rf"  lines @{b}",
+        rf"{clock} DM {a} -> {b}: psst\\r",
+    ]
+    assert len(text) == len(want) and all(re.fullmatch(w, t) for w, t in zip(want, text, strict=True)), text
+    assert re.fullmatch(rf"{clock} DM {a} -> {b}: psst\\r", run("dms", b, "--with", a, "--last", "1", "--text")), "dms"
+    run("part", b, room)
+
+
+def test_history_paging(s):
+    """history and dms page back with --before SEQ, the seq of the oldest entry already shown."""
+    a, b, room = s.a, s.b, f"page-{RUN}"
+    for i in range(7):
+        run("say", a, room, f"p{i}")
+        run("dm", a, b, f"d{i}")
+    lines("recv", b)
+    for show, prefix in ((["history", room], "p"), (["dms", b, "--with", a], "d")):
+        seen, before = [], []
+        for _ in range(3):  # 3 pages of 3: past the 7 (dms goes on into the earlier tests' DMs)
+            page = lines(*show, "--last", "3", *before)
+            assert all(isinstance(m["seq"], int) for m in page) and page == sorted(page, key=lambda m: m["seq"])
+            seen = [m["body"] for m in page] + seen
+            before = ["--before", str(page[0]["seq"])]
+        assert seen[-7:] == [f"{prefix}{i}" for i in range(7)], (show, seen)
+        assert "seq" in fails(*show, "--before", "0")
+    assert lines("history", room, *before) == [], "the room's first page was the last"
+
+
+def test_watch(s):
+    """watch prints a room's last messages, then new ones live, never a post the room's settings forbid; it is nobody's
+    agent, and Ctrl-C ends it with exit 0."""
+    a, b, room = s.a, s.b, f"watch-{RUN}"
+    for i in range(3):
+        run("say", a, room, f"old{i}")
+    w = subprocess.Popen([BRIDGE, "watch", room, "--last", "2"], env=env(), stdout=subprocess.PIPE, text=True)
+    try:
+        got = [json.loads(w.stdout.readline()) for _ in range(2)]
+        assert [(m["topic"], m["body"]) for m in got] == [(f"room/{room}", "old1"), (f"room/{room}", "old2")], got
+        console = Bus.register("admin", addr="admin", keep=True, admin=True)
+        try:
+            console.mute(room, b)
+            run("say", b, room, "muted, never shown", ok=False)
+            evil = raw_client()
+            raw_pub(evil, f"room/{room}", json.dumps({"from": b, "body": "spoofed past the mute", "ts": 1.0}))
+            evil.loop_stop()
+            run("say", a, room, "live é")
+            live = []  # the mute notice (from admin) comes first
+            while not live or live[-1]["body"] != "live é":
+                live.append(json.loads(w.stdout.readline()))
+            assert [m["from"] for m in live] == ["admin", a], live
+        finally:
+            console.unmute(room, b)
+            console.leave()
+        assert not [x for x in agents() if x.startswith("watch-")], "never in presence"
+        w.send_signal(signal.SIGINT)
+        assert w.wait(10) == 0
+    finally:
+        w.kill()
+    w = subprocess.Popen([BRIDGE, "watch", room, "--last", "1", "--text"], env=env(), stdout=subprocess.PIPE, text=True)
+    try:
+        first = w.stdout.readline()
+        w.send_signal(signal.SIGTERM)
+        assert w.wait(10) == 0 and re.fullmatch(rf".* #{room} (admin|{a}): .*\n", first), first
+    finally:
+        w.kill()
+
+
+def test_cli_describe(s):
+    """describe changes an agent's name, caps and about from the shell."""
+    a = s.a
+    run("describe", a, "--about", "on call for sentry")
+    assert agents()[a]["about"] == "on call for sentry"
+    run("describe", a, "--name", "alice2", "--caps", "x,y")
+    assert {k: agents()[a][k] for k in ("name", "caps", "about")} == {
+        "name": "alice2",
+        "caps": ["x", "y"],
+        "about": "on call for sentry",
+    }
+    run("describe", a, "--about", "")
+    assert "about" not in agents()[a]
+    assert "one line" in fails("describe", a, "--about", "a\nb")
+    run("describe", a, "--name", "alice", "--caps", "sentry,grafana")
 
 
 def test_bad_arguments(s):

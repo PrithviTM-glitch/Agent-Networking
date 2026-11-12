@@ -129,6 +129,39 @@ pub fn dms(addr: &str, peer: Option<&str>, last: i64) -> crate::Result<Vec<Map>>
     Ok(messages(call("dms", Some(addr), f, TIMEOUT)?))
 }
 
+/// A room's last messages, oldest first, each with its "seq"; before_seq (an entry's seq) pages back past it. Needs a
+/// 0.3.0 historyd: an older one answers "unknown fields for room: seq".
+pub fn room_paged(room: &str, last: i64, before_seq: Option<i64>) -> crate::Result<Vec<Map>> {
+    check_ident(room, "room")?;
+    check_last(last)?;
+    let mut f = fields(&[("room", room.into()), ("last", last.into())]);
+    paging(&mut f, before_seq)?;
+    Ok(messages(call("room", None, f, TIMEOUT)?))
+}
+
+/// dms with each entry's "seq", paging back past before_seq like room_paged.
+pub fn dms_paged(addr: &str, peer: Option<&str>, last: i64, before_seq: Option<i64>) -> crate::Result<Vec<Map>> {
+    check_ident(addr, "address")?;
+    if let Some(p) = peer {
+        check_ident(p, "address")?;
+    }
+    check_last(last)?;
+    let mut f = fields(&[("peer", peer.map_or(Value::Null, Value::from)), ("last", last.into())]);
+    paging(&mut f, before_seq)?;
+    Ok(messages(call("dms", Some(addr), f, TIMEOUT)?))
+}
+
+fn paging(f: &mut Map, before_seq: Option<i64>) -> crate::Result<()> {
+    f.insert("seq".into(), true.into());
+    if let Some(seq) = before_seq {
+        if seq < 1 {
+            return crate::validation::fail("--before: an entry's seq, an integer from 1");
+        }
+        f.insert("before_seq".into(), seq.into());
+    }
+    Ok(())
+}
+
 /// A raw topic's last messages, oldest first.
 pub fn topic(topic: &str, last: i64) -> crate::Result<Vec<Map>> {
     check_topic(topic, false)?;

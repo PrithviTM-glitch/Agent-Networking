@@ -24,6 +24,10 @@ pub const RESERVED: [&str; 6] = ["agents", "inbox", "ledger", "broadcast", "room
 /// The services' request/response levels: RPC traffic, never shown as messages.
 pub const SERVICES: [&str; 2] = ["ledger", "history"];
 pub const ADMIN: &str = "admin";
+/// A presence record's optional one-line self-description (describe --about), in bytes.
+pub const ABOUT_MAX: usize = 200;
+/// A program version in presence ("mcp"): what agent_bridge.__version__ prints, e.g. 0.3.0.
+pub const VERSION_MAX: usize = 32;
 
 /// Bad input, an unknown address or a broker problem; the message is one line.
 #[derive(Debug, Clone, PartialEq)]
@@ -201,6 +205,23 @@ pub fn check_body(value: &str) -> Result<&str> {
     check_text(value, "text", BODY_MAX)
 }
 
+/// An agent's one-line self-description: at most ABOUT_MAX bytes of text, no line breaks, not blank ("" clears it).
+pub fn check_about(value: &str) -> Result<&str> {
+    if check_text(value, "about", ABOUT_MAX)?.contains(['\n', '\r']) {
+        return fail("about is one line");
+    }
+    if !value.is_empty() && value.trim().is_empty() {
+        return fail("about is blank: \"\" clears it");
+    }
+    Ok(value)
+}
+
+/// A program version as presence carries it: 1-32 of ASCII letters, digits, '.', '+' and '-'.
+pub fn is_version(value: &str) -> bool {
+    (1..=VERSION_MAX).contains(&value.len())
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
+}
+
 /// A room post, DM or broadcast: a body with something in it. Raw topic payloads may be empty (check_body).
 pub fn check_message(value: &str) -> Result<&str> {
     if check_body(value)?.trim().is_empty() {
@@ -371,6 +392,12 @@ mod tests {
             assert!(check_body(blank).is_ok(), "a raw payload may be empty");
         }
         assert_eq!(check_message(" x ").unwrap(), " x ");
+        assert_eq!(check_about("building the console").unwrap(), "building the console");
+        assert_eq!(check_about("two\nlines").unwrap_err().0, "about is one line");
+        assert!(check_about(&"x".repeat(ABOUT_MAX + 1)).is_err() && check_about("").is_ok());
+        assert_eq!(check_about("  ").unwrap_err().0, "about is blank: \"\" clears it");
+        assert!(is_version("0.3.0") && is_version("0.3.0+dev.1") && is_version("unknown"));
+        assert!(!is_version("") && !is_version("0.3 0") && !is_version(&"9".repeat(VERSION_MAX + 1)));
         assert_eq!(check_body_value(&json!(7)).unwrap_err().0, "text must be a string, got int");
     }
 

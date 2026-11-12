@@ -14,7 +14,7 @@ mod store;
 use agent_bridge::config;
 use agent_bridge::mqtt::{Conn, Handler, Message, Options, SESSION_TAKEN_OVER, filter};
 use agent_bridge::protocol::NEVER;
-use agent_bridge::service::{Mode, mode};
+use agent_bridge::service::{Mode, mode, version_line};
 use rumqttc::v5::mqttbytes::v5::{PublishProperties, RetainForwardRule};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -87,6 +87,10 @@ fn main() {
         }
         Mode::Help => {
             print!("{}", args::USAGE);
+            return;
+        }
+        Mode::Version => {
+            println!("{}", version_line("agent-bridge-historyd"));
             return;
         }
         Mode::Bad(text) => {
