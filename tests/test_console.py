@@ -1478,6 +1478,10 @@ def test_ledger_no_reply_wording(monkeypatch):
         assert ("it may still have been applied, check the ledger view" in str(e.value)) == applied, (op, e.value)
 
 
+# A loose backstop against runaway rendering only, never the proof of a fix: the slowest large case takes about 140 ms
+# locally and 207 ms on a shared CI runner, and the old amplification took 0.9 s, so time can't tell a bug from a slow
+# machine. The exact, machine-independent guards are the counts: cells built, lines scanned, blocks made.
+MARKUP_BACKSTOP_MS = 5000
 MARKUP_JS = """
 const M = require(process.argv[1]);
 // A stub document: elements record their tag, class, children, text and style; setting innerHTML throws.
@@ -1495,14 +1499,16 @@ const out = {};
 for (const [name, text] of Object.entries(JSON.parse(require("fs").readFileSync(0, "utf8")))) {
   const root = node("div"), t0 = process.hrtime.bigint();
   M.render(doc, root, text, (p, t) => p.append(doc.createTextNode(t)));
-  out[name] = {ms: Number(process.hrtime.bigint() - t0) / 1e6, tree: root.kids.map(tree)};
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  out[name] = {ms, scanned: M.stats.scanned, lines: text.split("\\n").length, tree: root.kids.map(tree)};
 }
 process.stdout.write(JSON.stringify(out));
 """
 
 
 def markup(**cases):
-    """markup.js's rendering of each case under node: {ms, tree}, the tree as [tag, class, text, align, children]."""
+    """markup.js's rendering of each case under node: {ms, scanned, lines, tree}, the tree as [tag, class, text, align,
+    children], scanned the lines its look-ahead examined."""
     js = os.path.join(os.path.dirname(config.__file__), "console", "static", "markup.js")
     p = subprocess.run(
         ["node", "-e", MARKUP_JS, js], input=json.dumps(cases), capture_output=True, text=True, timeout=30
@@ -1561,9 +1567,11 @@ def test_message_markup():
         padded="\nx\n".join(["\n".join(["|" + "a|" * 50, "|" + "-|" * 50, *["|"] * 500])] * 54),
     )
     assert big["cols50"]["tree"][0][:2] == ["div", "mdtable"] and big["rows500"]["tree"][0][:2] == ["div", "mdtable"]
+    for name, r in big.items():
+        assert r["scanned"] <= r["lines"], f"{name}: each line is looked ahead at most once ({r['scanned']} scanned)"
+        assert r["ms"] < MARKUP_BACKSTOP_MS, (name, r["ms"])
     for name in ("cols51", "rows501", "amplify", "fences"):
         assert [n[0] for n in big[name]["tree"]] == ["#text"], f"{name} stays plain text"
-        assert big[name]["ms"] < 200, (name, big[name]["ms"])
 
     def count(n):
         return (n[0] in ("th", "td")) + sum(count(k) for k in (n[4] if n[0] != "#text" else []))
@@ -1571,10 +1579,10 @@ def test_message_markup():
     tables = [n for n in big["padded"]["tree"] if n[:2] == ["div", "mdtable"]]
     assert len(tables) == 54, f"each of the 54 tables renders ({len(tables)})"
     cells_made = sum(count(n) for n in big["padded"]["tree"])
-    assert cells_made <= 32 * 1024 and big["padded"]["ms"] < 200, (cells_made, big["padded"]["ms"])
+    assert cells_made <= 32 * 1024, f"rows are never padded ({cells_made} cells)"
     for name in ("closed", "tiny"):
         kinds = [n[0] for n in big[name]["tree"]]
-        assert big[name]["ms"] < 200 and kinds == ["pre"] * 200 + ["#text"], (name, big[name]["ms"], len(kinds))
+        assert kinds == ["pre"] * 200 + ["#text"], (name, len(kinds))
     assert len("\n".join(["|" * 5001, "|" + "-|" * 5000, *["|"] * 22000]).encode()) <= 65536
     static = os.path.join(os.path.dirname(config.__file__), "console", "static")
     with open(os.path.join(static, "app.js")) as f:

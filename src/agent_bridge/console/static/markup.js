@@ -1,8 +1,8 @@
-// Message markup for the console page: ``` fenced blocks render as monospace <pre>, and Markdown pipe tables (a
-// header row, then a |---| separator, alignment colons allowed) as a real <table>, short rows unpadded. Everything is built as DOM nodes
-// with textContent only, so message text can never inject markup; anything malformed (an unclosed fence, a table
-// without its separator or with a mismatched one) stays plain text. No DOM is assumed: render() takes the document,
-// so the tests run it under node with a stub.
+// Message markup for the console page: ``` fenced blocks render as monospace <pre>, and Markdown pipe tables (a header
+// row, then a |---| separator, alignment colons allowed) as a real <table>, short rows unpadded. Everything is built as
+// DOM nodes with textContent only, so message text can never inject markup; anything malformed (an unclosed fence, a
+// table without its separator or with a mismatched one) stays plain text. No DOM is assumed: render() takes the
+// document, so the tests run it under node with a stub.
 "use strict";
 const Markup = (() => {
   const FENCE = /^\s*```/;
@@ -16,6 +16,9 @@ const Markup = (() => {
   const MAX_BLOCKS = 200;
   // A cell this short (an MR id, a state, a count) never wraps, so a narrow column can't split it mid-token.
   const NOWRAP_MAX = 12;
+  // Lines the last blocks() call examined looking ahead (fence closers, table rows): never more than the body has,
+  // which the tests assert, so a rescan per opener or per row (quadratic, output unchanged) can't come back unseen.
+  const stats = {scanned: 0};
 
   // A table row's cells: outer pipes dropped, split on unescaped |, a \| kept as a literal |.
   function cells(line) {
@@ -40,7 +43,9 @@ const Markup = (() => {
   function alignment(sep, n) {
     const a = cells(sep);
     if (a.length !== n || !a.every(c => SEP_CELL.test(c))) return null;
-    return a.map(c => (c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : ""));
+    const side = c =>
+      c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : "";
+    return a.map(side);
   }
 
   // The body as segments: {kind: "text", text}, {kind: "code", text} or {kind: "table", head, align, rows}.
@@ -53,6 +58,7 @@ const Markup = (() => {
     };
     let closers = true; // false once an opener found no closer: none after a later line either, so stop looking
     let made = 0;
+    stats.scanned = 0;
     for (let i = 0; i < lines.length; ) {
       if (made === MAX_BLOCKS) {
         for (; i < lines.length; i++) plain.push(lines[i]);
@@ -61,7 +67,10 @@ const Markup = (() => {
       const line = lines[i];
       if (closers && FENCE.test(line)) {
         let end = -1;
-        for (let j = i + 1; j < lines.length; j++) if (lines[j].trim() === "```") { end = j; break; } // from i, linear
+        for (let j = i + 1; j < lines.length; j++) {
+          stats.scanned++;
+          if (lines[j].trim() === "```") { end = j; break; } // from i, linear
+        }
         if (end < 0) closers = false;
         if (end > i) {
           flush();
@@ -74,7 +83,7 @@ const Markup = (() => {
         const head = cells(line), align = head.length <= MAX_COLS && alignment(lines[i + 1], head.length);
         if (align) {
           let j = i + 2;
-          while (j < lines.length && lines[j].trim().startsWith("|")) j++;
+          while (j < lines.length && lines[j].trim().startsWith("|")) { stats.scanned++; j++; }
           if (j - i - 2 <= MAX_ROWS) {
             flush();
             out.push({kind: "table", head, align, rows: lines.slice(i + 2, j).map(cells)});
@@ -130,6 +139,6 @@ const Markup = (() => {
     }
   }
 
-  return {blocks, cells, render, MAX_COLS, MAX_ROWS, MAX_BLOCKS};
+  return {blocks, cells, render, stats, MAX_COLS, MAX_ROWS, MAX_BLOCKS};
 })();
 if (typeof module !== "undefined") module.exports = Markup;
