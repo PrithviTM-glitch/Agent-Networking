@@ -114,6 +114,13 @@ fn start() -> World {
 fn normal(text: &str) -> String {
     let (b, mut out, mut i) = (text.as_bytes(), String::new(), 0);
     while i < b.len() {
+        // a quoted id first: one that happens to start with ten digits must not be taken for a time
+        let hex = b[i..].iter().take_while(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()).count();
+        if i > 0 && b[i - 1] == b'"' && hex == 16 && b.get(i + 16) == Some(&b'"') {
+            out.push_str("<id>");
+            i += 16;
+            continue;
+        }
         let digits = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
         let starts_word = i == 0 || !b[i - 1].is_ascii_alphanumeric();
         if starts_word && digits == 10 && b[i] == b'1' {
@@ -123,12 +130,6 @@ fn normal(text: &str) -> String {
             }
             out.push_str("<t>");
             i = end;
-            continue;
-        }
-        let hex = b[i..].iter().take_while(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()).count();
-        if i > 0 && b[i - 1] == b'"' && hex == 16 && b.get(i + 16) == Some(&b'"') {
-            out.push_str("<id>");
-            i += 16;
             continue;
         }
         let ch = text[i..].chars().next().expect("a char");
@@ -265,16 +266,15 @@ fn a_relay_ends_with_its_claude_while_the_broker_is_down() {
     let w = start();
     let (fake, relay) = relayed(&w, "8f1c1b8e-2d64-4a51-9a3c-6f0e5b7d2a11");
     let _ = Command::new("docker").args(["rm", "-f", &w.broker]).output();
-    std::thread::sleep(Duration::from_secs(3));
+    // its claude ends only once the relay is waiting for the broker, however slow the machine is
+    log_until(&w, "the broker outage", |log| log.contains("broker unreachable, waiting for it"));
     let ended = Instant::now();
     drop(fake);
     while Path::new(&format!("/proc/{relay}")).exists() && ended.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(20));
     }
     let took = ended.elapsed();
-    let log = relay_log(&w);
-    assert!(took < Duration::from_secs(2), "the relay took {took:?} to notice its claude ended\n{log}");
-    assert!(log.contains("broker unreachable, waiting for it"), "{log}");
+    assert!(took < Duration::from_secs(2), "the relay took {took:?} to notice its claude ended\n{}", relay_log(&w));
 }
 
 /// While a session's relay is live, say, dm, pub and describe from that session go over a connection of their own and never
@@ -423,21 +423,44 @@ fn a_relay_restarts_itself_on_an_upgraded_binary() {
     let settled = Command::new("touch").args(["-d", "-1 minute"]).arg(&bin).status().expect("touch runs");
     assert!(settled.success());
     let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let row = status();
-        assert_eq!(row["live"], true, "the lock is held throughout\n{}", relay_log(&w));
-        if row["binary"] == bin.display().to_string() {
-            assert_eq!(row["pid"], pid, "exec keeps the process");
-            assert_eq!(row["version"], env!("CARGO_PKG_VERSION"));
-            break;
-        }
+    // /proc/PID/exe flips at the exec itself, before the new image has logged or rewritten its lock lines
+    while status()["binary"] != bin.display().to_string() {
+        assert_eq!(status()["live"], true, "the lock is held throughout\n{}", relay_log(&w));
         assert!(Instant::now() < deadline, "the relay never restarted\n{}", relay_log(&w));
         std::thread::sleep(Duration::from_millis(100));
     }
-    let log = relay_log(&w);
+    let kept = format!("session {session}: kept its lock across the restart");
+    let log = log_until(&w, "the new image's start lines", |log| {
+        log.matches("relaying for claude pid").count() == 2 && log.contains(&kept)
+    });
     assert!(log.contains(&format!("binary replaced, restarting on {}", bin.display())), "{log}");
-    assert_eq!(log.matches("relaying for claude pid").count(), 2, "{log}");
-    assert!(log.contains(&format!("session {session}: kept its lock across the restart")), "never unlocked\n{log}");
+    // its address and version (lock lines 2 and 3) come back once the new image has registered
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let row = loop {
+        let row = status();
+        assert_eq!(row["live"], true, "the lock is held throughout\n{}", relay_log(&w));
+        if !row["version"].is_null() {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "the new image never wrote its version\n{}", relay_log(&w));
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(row["pid"], pid, "exec keeps the process");
+    assert_eq!(row["version"], env!("CARGO_PKG_VERSION"));
+}
+
+/// The relay log once done(log) holds, polled up to 15 s: the relay writes it from its own process, after whatever
+/// state change the test saw.
+fn log_until(w: &World, what: &str, done: impl Fn(&str) -> bool) -> String {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let log = relay_log(w);
+        if done(&log) {
+            return log;
+        }
+        assert!(Instant::now() < deadline, "the relay log never showed {what}\n{log}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The session's inbox socket, as a list of what the relay posted to it.
@@ -468,11 +491,12 @@ fn a_wake_filter_holds_plain_posts_until_a_mention() {
         .ok()
         .and_then(|t| t.lines().nth(1).map(str::to_owned))
         .expect("the relay's address");
+    // the filter first, so not even the join notices below can wake the session, however late they arrive
+    assert!(w.run(&["relay", "wake", "lane", "mentions", "--session", session]).status.success());
     let peer = String::from_utf8_lossy(&w.run(&["register", "peer"]).stdout).trim().to_owned();
     for who in [&addr, &peer] {
         assert!(w.run(&["join", who, "lane"]).status.success());
     }
-    assert!(w.run(&["relay", "wake", "lane", "mentions", "--session", session]).status.success());
     // the relay takes its session back about a second after the join took it over
     std::thread::sleep(Duration::from_secs(3));
     posts.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -621,4 +645,7 @@ fn a_relay_survives_a_failed_restart() {
 fn normalises_times_and_ids() {
     let text = r#"{"ts": 1793294701.3971186, "id": "0123456789abcdef", "token": 3, "n": 12345678901}"#;
     assert_eq!(normal(text), r#"{"ts": <t>, "id": "<id>", "token": 3, "n": 12345678901}"#);
+    // an id that starts with a time-shaped run of digits is still an id, and a quoted time is still a time
+    let text = r#"{"id": "1234567890abcdef", "ts": 1794957030.0274324, "seen": "1794957030"}"#;
+    assert_eq!(normal(text), r#"{"id": "<id>", "ts": <t>, "seen": "<t>"}"#);
 }
