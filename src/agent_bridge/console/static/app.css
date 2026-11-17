@@ -113,3 +113,18 @@ pre.out{background:var(--code);border-radius:6px;padding:8px 10px;max-height:320
   dl{grid-template-columns:1fr}
   dt{margin-top:6px}
 }
+.b a.autolink{color:var(--accent);text-decoration:underline dotted}
+.b .copy{cursor:copy;border-bottom:1px dotted var(--muted)}
+.b .copy.done{border-bottom-color:var(--ok)}
+.msg.reply{margin-left:24px;border-left:2px solid var(--line);padding-left:10px}
+.msg .re{color:var(--muted);font-size:12px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.msg.flash{background:var(--sel)}
+.msg.link,.link{cursor:pointer}
+span.link{color:var(--accent)}
+button.mini{padding:0 6px;font-size:11px;line-height:16px}
+.card.pin{border-color:var(--accent)}
+.card.pin .h{display:flex;gap:8px;align-items:baseline;margin-bottom:4px}
+.card.pin .who{font-weight:600}
+.card.pin .t{color:var(--muted);font-size:12px}
+.card.pin textarea{width:100%;box-sizing:border-box;font:inherit}
+.b.collapsed{max-height:16em;overflow:hidden;-webkit-mask-image:linear-gradient(#000 75%,transparent)}

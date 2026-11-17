@@ -2,7 +2,7 @@
 //! the GIL, and none holds a lock while it waits, so a thread blocked in recv never stalls another's say. Arguments
 //! are checked as the Python Bus checks them: a wrong type is a one-line BridgeError, never a TypeError.
 
-use crate::args::{caps, ident, ident_cap, last, opt_ident, text, wait};
+use crate::args::{caps, ident, ident_cap, last, opt_ident, opt_text, text, wait};
 use crate::convert::{dict, dicts, from_py, object};
 use crate::errors::bridge;
 use agent_bridge::bus;
@@ -125,25 +125,54 @@ impl Bus {
         call(py, &self.0, move |b| b.unsub(&topic))
     }
 
-    /// Post to a room; returns {"mentions": [addr, ...], "unresolved": [word, ...]}: whom it mentioned, and the @words
-    /// that matched no member of the room (sent as plain text, mentioning nobody).
+    /// Post to a room, as a reply to the message whose id is reply_to if given. Returns {"mentions": [addr, ...],
+    /// "unresolved": [word, ...], "absent": [word, ...]}: whom it mentioned, the @words that matched no member of the
+    /// room (sent as plain text, mentioning nobody), and those of them that name a live agent not in the room.
+    #[pyo3(signature = (room, body, reply_to=None))]
     fn say<'py>(
         &self,
         py: Python<'py>,
         room: &Bound<'py, PyAny>,
         body: &Bound<'py, PyAny>,
+        reply_to: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let (room, body) = (ident(room, "room")?, text(body, "text")?);
-        let said = call(py, &self.0, move |b| b.say(&room, &body))?;
+        let (room, body, reply_to) = (ident(room, "room")?, text(body, "text")?, opt_text(reply_to, "reply_to")?);
+        let said = call(py, &self.0, move |b| b.say_replying(&room, &body, reply_to.as_deref()))?;
         let mut out = Map::new();
         out.insert("mentions".into(), said.mentions.into());
         out.insert("unresolved".into(), said.unresolved.into());
+        out.insert("absent".into(), said.absent.into());
         dict(py, &out)
     }
 
-    fn dm(&self, py: Python<'_>, to: &Bound<'_, PyAny>, body: &Bound<'_, PyAny>) -> PyResult<()> {
-        let (body, to) = (text(body, "text")?, ident(to, "address")?);
-        call(py, &self.0, move |b| b.dm(&to, &body))
+    /// Send a direct message, as a reply to the message whose id is reply_to if given.
+    #[pyo3(signature = (to, body, reply_to=None))]
+    fn dm(
+        &self,
+        py: Python<'_>,
+        to: &Bound<'_, PyAny>,
+        body: &Bound<'_, PyAny>,
+        reply_to: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let (body, to, reply_to) = (text(body, "text")?, ident(to, "address")?, opt_text(reply_to, "reply_to")?);
+        call(py, &self.0, move |b| b.dm_replying(&to, &body, reply_to.as_deref()))
+    }
+
+    /// Pin text as the room's pinned message, replacing any (admin or a moderator); returns {"text", "by", "ts"}.
+    fn pin<'py>(
+        &self,
+        py: Python<'py>,
+        room: &Bound<'py, PyAny>,
+        text: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let (room, body) = (ident(room, "room")?, crate::args::text(text, "text")?);
+        dict(py, &call(py, &self.0, move |b| b.pin(&room, &body))?)
+    }
+
+    /// Clear the room's pinned message (admin or a moderator).
+    fn unpin(&self, py: Python<'_>, room: &Bound<'_, PyAny>) -> PyResult<()> {
+        let room = ident(room, "room")?;
+        call(py, &self.0, move |b| b.unpin(&room))
     }
 
     #[pyo3(name = "pub")]

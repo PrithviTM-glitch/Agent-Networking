@@ -3,6 +3,7 @@
 The tests are one scenario in file order: later ones use the agents, rooms and log entries earlier ones made.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -636,8 +637,8 @@ def test_message_rules(s):
         raises(fn, *args)
     run("pub", a, f"rules{RUN}/t", "")  # a raw payload may still be empty
     said = lib.say(room, "see the @mentions field, @ALICE")
-    assert said == {"mentions": [a], "unresolved": ["mentions"]}, "sent anyway; names match without case"
-    assert lib.say(room, "plain") == {"mentions": [], "unresolved": []}
+    assert said == {"mentions": [a], "unresolved": ["mentions"], "absent": []}, "sent anyway; names match without case"
+    assert lib.say(room, "plain") == {"mentions": [], "unresolved": [], "absent": []}
     p = subprocess.run([BRIDGE, "say", a, room, "ask @nobody"], env=env(), capture_output=True, text=True)
     assert p.returncode == 0 and p.stdout == "" and "@nobody" in p.stderr, (p.returncode, p.stdout, p.stderr)
     got = [(m["body"], m.get("mentions")) for m in lib.recv(5) + lib.recv(0.5) if m["topic"] == f"room/{room}"]
@@ -856,6 +857,79 @@ def test_cli_describe(s):
     assert "about" not in agents()[a]
     assert "one line" in fails("describe", a, "--about", "a\nb")
     run("describe", a, "--name", "alice", "--caps", "sentry,grafana")
+
+
+def test_message_ids_and_replies(s):
+    """A message's id is derived the same way on every path (CLI recv, the native Bus, the Observer, CLI history and
+    dms, _native.message_id over a raw history entry, and Python's own sha256), for a 0.3.0-style sender too and for
+    a ts that went through historyd's storage. reply_to names it, and every path shows the reply as one."""
+    a, b, lib, room = s.a, s.b, s.lib, f"ids-{RUN}"
+    lib.join(room)
+    run("join", b, room)
+    while lib.recv(0.5):
+        pass
+    lines("recv", b)
+    observer = _native.Observer()
+    assert observer.next(5)[0] == "connected"
+    topic, old_ts = f"room/{room}", 1794518700.0857205
+    run("say", a, room, "parent from a 0.3.1 CLI")
+    evil = raw_client()
+    raw_pub(evil, topic, json.dumps({"from": a, "body": "from a 0.3.0 sender", "ts": old_ts}))
+    evil.loop_stop()
+    bodies_ = {"parent from a 0.3.1 CLI", "from a 0.3.0 sender"}
+
+    def observed(event):
+        """One Observer event as a batch: [] on a timeout (stop), the message, or [{}] for anything else (go on)."""
+        return [] if event is None else [event[2]] if event[0] == "message" else [{}]
+
+    def gather(take):
+        got = {}
+        while not bodies_ <= set(got) and (batch := take()):
+            got.update({m["body"]: m for m in batch if m.get("topic") == topic})
+        return got
+
+    paths = {
+        "cli recv": gather(lambda: lines("recv", b, "--wait", "5")),
+        "bus recv": gather(lambda: lib.recv(5)),
+        "observer": gather(lambda: observed(observer.next(5))),
+        "cli history": {m["body"]: m for m in lines("history", room)},
+    }
+    raw = {m["body"]: m for m in _native.history_call("room", room=room, last=10)["messages"]}
+    for body in bodies_:
+        entry = raw[body]
+        expect = hashlib.sha256(f"{topic}\n{entry['from']}\n{entry['ts']!r}".encode()).hexdigest()[:16]
+        assert _native.message_id(topic, entry["from"], entry["ts"]) == expect, body
+        ids = {path: got[body].get("id") for path, got in paths.items()}
+        assert set(ids.values()) == {expect}, (body, expect, ids)
+    assert raw["from a 0.3.0 sender"]["ts"] == old_ts, "the ts round-trips through historyd's storage"
+
+    parent = paths["cli recv"]["parent from a 0.3.1 CLI"]["id"]
+    assert lib.say(room, "a reply over the Bus", reply_to=parent)["mentions"] == []
+    run("say", a, room, "a reply from the CLI", "--reply-to", parent)
+    lib.dm(b, "a DM reply", reply_to=parent)
+    replies = {"a reply over the Bus", "a reply from the CLI", "a DM reply"}
+    got = {}
+    while not replies <= set(got) and (batch := lines("recv", b, "--wait", "5")):
+        got.update({m["body"]: m for m in batch})
+    assert {got[r].get("reply_to") for r in replies} == {parent}, got
+    obs = {}
+    while not replies <= set(obs) and (event := observer.next(5)):
+        if event[0] == "message":
+            obs[event[2]["body"]] = event[2]
+    observer.close()
+    logged = {m["body"]: m for m in lines("history", room)} | {
+        m["body"]: m for m in lines("dms", b, "--with", lib.addr)
+    }
+    for r in replies:
+        assert obs[r]["reply_to"] == logged[r]["reply_to"] == parent, r
+        assert obs[r]["id"] == logged[r]["id"] == got[r]["id"], r
+    assert f"(re {parent[:8]}): a reply from the CLI" in run("history", room, "--text")
+    assert "reply_to" not in logged["from a 0.3.0 sender"], "only replies carry it"
+    raises(lib.say, room, "x", reply_to="nope")
+    raises(lib.dm, b, "x", reply_to=parent.upper())
+    assert "bad reply_to" in fails("say", a, room, "x", "--reply-to", "zz")
+    lib.part(room)
+    run("part", b, room)
 
 
 def test_bad_arguments(s):

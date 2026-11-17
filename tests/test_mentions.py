@@ -3,11 +3,13 @@ only the mentioned agent, the quiet backlog) is in test_relay.py. The tests are 
 """
 
 import json
+import subprocess
 import uuid
 from types import SimpleNamespace
 
 import paho.mqtt.client as mqtt
 import pytest
+from conftest import BIN, wait_for
 
 from agent_bridge import _native, config
 from agent_bridge.errors import BridgeError
@@ -72,15 +74,51 @@ def test_unknown_mentions_are_sent_as_text():
     outsider = Bus.register("outsider")
     for b in (S.alice, S.bob1, S.bob2, S.carol):
         heard(b, 0.5)
-    for body, word in (("hi @nobody", "nobody"), (f"hi @{outsider.addr}", outsider.addr)):
-        assert S.alice.say(ROOM, body) == {"mentions": [], "unresolved": [word]}
+    for body, word, absent in (("hi @nobody", "nobody", []), (f"hi @{outsider.addr}", outsider.addr, [outsider.addr])):
+        assert S.alice.say(ROOM, body) == {"mentions": [], "unresolved": [word], "absent": absent}
         assert heard(S.carol) == [{"body": body}], "plain text: no mentions, no for_me"
     bobs = sorted([S.bob1.addr, S.bob2.addr])
-    assert S.alice.say(ROOM, "@BOB and @Nobody") == {"mentions": bobs, "unresolved": ["Nobody"]}
+    assert S.alice.say(ROOM, "@BOB and @Nobody") == {"mentions": bobs, "unresolved": ["Nobody"], "absent": []}
     assert heard(S.bob1)[-1] == {"mentions": bobs, "for_me": True, "body": "@BOB and @Nobody"}
     for b in (S.bob2, S.carol):
         heard(b, 0.5)
     outsider.close()
+
+
+def test_admin_me_and_absent_agents():
+    """@admin mentions the admin console, which joins no room; @me mentions nobody and is never reported; an @word
+    naming a live agent outside the room comes back in absent as well as unresolved (the CLI says so on stderr)."""
+    observer = _native.Observer()
+    assert observer.next(5)[0] == "connected"
+    said = S.alice.say(ROOM, "@admin please look, and ping @me later")
+    assert said == {"mentions": ["admin"], "unresolved": [], "absent": []}, said
+    assert heard(S.carol) == [
+        {"mentions": ["admin"], "for_me": False, "body": "@admin please look, and ping @me later"}
+    ]
+    seen = []
+    while (event := observer.next(5)) and not (event[0] == "message" and event[2]["topic"] == f"room/{ROOM}"):
+        seen.append(event[0])
+    observer.close()
+    assert event and event[2].get("for_admin") is True, (event, seen)
+    logged = _native.history_call("room", room=ROOM, last=1)["messages"][-1]
+    assert logged["mentions"] == ["admin"], "the console backfills its mentions from history"
+
+    S.carol.part(ROOM)
+    left = lambda: f"room/{ROOM}" not in (S.alice.cached_agent(S.carol.addr) or {}).get("topics", [])  # noqa: E731
+    assert wait_for(left, 5), "alice's cache has carol's part"
+    gone = S.alice.say(ROOM, f"@carol and @{S.carol.addr.upper()}, still there?")
+    assert gone == {
+        "mentions": [],
+        "unresolved": ["carol", S.carol.addr.upper()],
+        "absent": ["carol", S.carol.addr.upper()],
+    }
+    p = subprocess.run(
+        [str(BIN / "agent-bridge"), "say", S.alice.addr, ROOM, "@carol?"], capture_output=True, text=True
+    )
+    assert p.returncode == 0 and f"@carol is not in #{ROOM}" in p.stderr, p.stderr
+    S.carol.join(ROOM)
+    for b in (S.alice, S.bob1, S.bob2, S.carol):
+        heard(b, 0.5)
 
 
 def test_moderation_still_applies():

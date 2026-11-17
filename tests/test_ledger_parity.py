@@ -236,8 +236,9 @@ def test_an_interrupted_acquire_against_the_rollback(tmp_path):
 
 @pytest.mark.parametrize(("image", "command"), ROLLBACKS)
 def test_the_lease_history_survives_a_rollback(state_dir, tmp_path, image, command):
-    """lease_events is additive: a rollback opens and serves a database that has it, without recording into it, and
-    this ledgerd finds its history intact afterwards. The rollback has no leases op, and the client says so."""
+    """lease_events and claims are additive: a rollback opens and serves a database that has them, without recording
+    into them, and this ledgerd finds its history and claims intact afterwards. The rollback has no leases or claims
+    op, and the client says which version it needs."""
     data = str(tmp_path)
     db, log = os.path.join(data, "ledger.db"), os.path.join(state_dir, "ledgerd.log")
     o, h = "parh-o1", "parh-h1"
@@ -254,6 +255,7 @@ def test_the_lease_history_survives_a_rollback(state_dir, tmp_path, image, comma
         assert [x["lease_id"] for x in call("leases", h)["leases"]] == [held["lease_id"]]
         events = call("lease_history", o, resource=f"{o}/lk")["events"]
         assert [e["event"] for e in events] == ["acquire", "release", "acquire"]
+        claimed = call("claim", h, room="parity", key="K-1", note="kept")["claim"]
         before = state()
         ledgerd.stop()
 
@@ -261,6 +263,8 @@ def test_the_lease_history_survives_a_rollback(state_dir, tmp_path, image, comma
         assert state() == before, "the rollback reads what this ledgerd wrote"
         with pytest.raises(LedgerError, match="ledgerd is older than 0.3.0 and has no leases op"):
             call("leases", h)
+        with pytest.raises(LedgerError, match="ledgerd is older than 0.3.1 and has no claims op"):
+            call("claims", h, room="parity")
         call("release", h, lease_id=held["lease_id"])
         again = call("acquire", h, resource=f"{o}/lk", level="write", ttl=60)["lease"]
         assert again["token"] > held["token"]
@@ -271,6 +275,7 @@ def test_the_lease_history_survives_a_rollback(state_dir, tmp_path, image, comma
         ledgerd = Rust(db, log)
         assert state() == after
         assert call("lease_history", o, resource=f"{o}/lk")["events"] == events, "kept, and nothing recorded meanwhile"
+        assert call("claims", h, room="parity")["claims"] == [claimed], "the claim survives the rollback"
         call("release", h, lease_id=call("acquire", h, resource=f"{o}/lk", level="write", ttl=5)["lease"]["lease_id"])
         assert len(call("lease_history", o, resource=f"{o}/lk")["events"]) == 5
         ledgerd.stop()

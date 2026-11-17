@@ -268,7 +268,10 @@ def console(ledgerd, historyd, state_dir):
     state["c"] = raw_client()
     env = {k: v for k, v in os.environ.items() if k not in ("XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR")}
     prom = fake_server(FakePrometheus)
+    with open(os.path.join(TMP, "links.json"), "w") as f:
+        json.dump(LINK_RULES, f)
     env.update(
+        AGENT_BRIDGE_LINKS=os.path.join(TMP, "links.json"),
         HOME=HOME,
         PATH=f"{FAKE_BIN}:{os.environ['PATH']}",
         MONITOR_PORT=str(WEB),
@@ -911,6 +914,60 @@ def test_admin_mentions():
     w.loop_stop()
 
 
+def test_claims_pins_replies():
+    """0.3.1: the Claims view and admin release, the pinned message (set, shown, cleared, audited), replies sent
+    from the console carrying reply_to, and an @admin mention reaching the console marked for_admin."""
+    room = f"pins{RUN_ID}"
+    ev = Events()
+    asker = _native.Bus.register("asker", [], False)
+    try:
+        asker.join(room)
+        _native.ledger_call("init", asker.addr)
+        _native.ledger_call("claim", asker.addr, room=room, key="APP-9", note="mine")
+        rows = req("GET", "/api/claims")[1]["claims"]
+        assert [(c["room"], c["key"], c["holder"], c["note"]) for c in rows if c["room"] == room] == [
+            (room, "APP-9", asker.addr, "mine")
+        ], rows
+        ok("/api/claims/release", {"room": room, "key": "APP-9"})
+        assert not [c for c in req("GET", "/api/claims")[1]["claims"] if c["room"] == room]
+        assert "admin" not in [x["owner"] for x in req("GET", "/api/ledger")[1]["ledgers"]], "no admin ledger made"
+        refused("/api/claims/release", {"room": room, "key": "APP-9"}, "no claim")
+
+        ok("/api/room/pin", {"room": room, "text": "## digest\n!1 open"})
+        got = ev.find(lambda e: e["kind"] == "pin" and e["room"] == room and e["pin"])
+        assert got["pin"]["text"] == "## digest\n!1 open" and got["pin"]["by"] == "admin", got
+        assert req("GET", "/api/state")[1]["pins"][room]["text"] == "## digest\n!1 open"
+        refused("/api/room/pin", {"room": room, "text": "  "}, "clear it instead")
+        refused("/api/room/pin", {"room": room, "clear": "yes"}, "clear must be")
+        ok("/api/room/pin", {"room": room, "clear": True})
+        assert ev.find(lambda e: e["kind"] == "pin" and e["room"] == room and e["pin"] is None)
+        assert room not in req("GET", "/api/state")[1]["pins"]
+
+        asker.say(room, "@admin can you look?")
+        q = ev.find(lambda e: e["kind"] == "msg" and e["msg"]["body"] == "@admin can you look?")["msg"]
+        assert q["for_admin"] is True and "admin" in q["mentions"] and len(q["id"]) == 16, q
+        ok("/api/send", {"kind": "room", "target": room, "text": "on it", "reply_to": q["id"]})
+        [m] = [x for x in asker.recv(5) if x["body"] == "on it"]
+        assert m["reply_to"] == q["id"] and m["from"] == "admin", m
+        # A freshly opened page gets history with the same ids, so replies thread there too.
+        assert wait_for(lambda: "on it" in {x["body"] for x in req("GET", "/api/state")[1]["messages"]})
+        backlog = {x["body"]: x for x in req("GET", "/api/state")[1]["messages"]}
+        assert backlog["@admin can you look?"]["id"] == q["id"], "history carries the id live messages have"
+        assert backlog["on it"]["reply_to"] == q["id"] and backlog["on it"]["id"] == m["id"]
+        refused("/api/send", {"kind": "topic", "target": "t/x", "text": "x", "reply_to": q["id"]}, "only room and dm")
+        refused("/api/send", {"kind": "room", "target": room, "text": "x", "reply_to": "nope"}, "bad reply_to")
+    finally:
+        asker.leave()
+    log = [json.loads(x) for x in open(os.path.join(DATA, "admin-audit.jsonl"))]
+    done = {(e["action"], e["target"], e["result"]) for e in log}
+    for want in [
+        ("claims/release", f"claim:{room}/APP-9", "released as admin"),
+        ("room/pin", f"room:{room}", "pinned 17 chars"),
+        ("room/pin", f"room:{room}", "pin cleared"),
+    ]:
+        assert want in done, (want, sorted(done)[-8:])
+
+
 def test_room_settings():
     presence("mod-a1b2c3", topics=["room/set"])
     presence("loud-a1b2c3", topics=["room/set"])
@@ -1218,7 +1275,7 @@ def test_headless():
     line = p.stdout.readline()
     assert line.startswith(f"headless: API on http://127.0.0.1:{port}/api") and state["token"] not in line, line
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    for path in ("/", "/app.js", "/app.css"):
+    for path in ("/", "/app.js", "/app.css", "/markup.js", "/links.js"):
         c.request("GET", path, headers={"Host": f"127.0.0.1:{port}"})
         r = c.getresponse()
         r.read()
@@ -1266,6 +1323,9 @@ def test_admin_cli():
     import agent_bridge
 
     assert st["version"] == agent_bridge.__version__, st
+    assert st["links"] == len(LINK_RULES), "the console loaded the rules file named by AGENT_BRIDGE_LINKS"
+    assert req("GET", "/api/state")[1]["links"] == {"rules": LINK_RULES, "error": None}
+    assert req("GET", "/links.js")[0] == 200, "the page loads links.js"
     assert req("GET", "/api/state")[1]["version"] == {
         "package": agent_bridge.__version__,
         "native": _native.__version__,
@@ -1591,6 +1651,206 @@ def test_message_markup():
         with open(os.path.join(static, name)) as f:
             used = re.findall(r"\.innerHTML\b|\.outerHTML\b|insertAdjacentHTML|document\.write", f.read())
             assert not used, f"{name} must build markup with textContent only, found {used}"
+
+
+LINK_RULES = [
+    {"name": "mr", "pattern": "!([0-9]+)", "url": "https://git.example.com/g/p/-/merge_requests/{1}"},
+    {"name": "issue", "pattern": "([A-Z][A-Z0-9_]*-[A-Z0-9]+)", "url": "https://issues.example.com/issues/?q={1}"},
+]
+LINKS_JS = """
+const L = require(process.argv[1]), M = require(process.argv[2]);
+const node = tag => {
+  const n = {tag, className: "", kids: [], _text: null};
+  Object.defineProperty(n, "textContent", {set(v) { n._text = String(v); }, get() { return n._text; }});
+  Object.defineProperty(n, "innerHTML", {set() { throw new Error("innerHTML used"); }});
+  n.append = (...k) => n.kids.push(...k);
+  return n;
+};
+const doc = {createElement: node, createTextNode: t => ({tag: "#text", text: t})};
+const tree = n => n.tag === "#text" ? ["#text", n.text]
+  : [n.tag, n.className, n._text, n.href || "", n.rel || "", n.target || "", n.kids.map(tree)];
+const q = JSON.parse(require("fs").readFileSync(0, "utf8")), out = {};
+// Each pattern as the page compiles it, against every token: the groups, or null.
+if (q.slow) {
+  const res = q.patterns.map(p => new RegExp("^(?:" + p + ")$")), t0 = process.hrtime.bigint();
+  for (const re of res) for (const w of q.slow) re.exec(w);
+  out.slow_ms = Number(process.hrtime.bigint() - t0) / 1e6;
+}
+out.match = q.patterns.map(p => q.tokens.map(t => {
+  const m = new RegExp("^(?:" + p + ")$").exec(t);
+  return m && Array.from(m).slice(1).map(g => g === undefined ? null : g);
+}));
+const rules = L.compile(q.rules);
+out.compiled = rules.map(r => r.name);
+out.render = q.cases.map(t => {
+  const root = node("div");
+  L.render(doc, root, t, rules, () => {});
+  return root.kids.map(tree);
+});
+const cell = (p, t) => L.render(doc, p, t, rules, () => {});
+const root = node("div");
+M.render(doc, root, q.table, (p, t) => p.append(doc.createTextNode(t)), cell);
+out.table = root.kids.map(tree);
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def links_js(**q):
+    static = os.path.join(os.path.dirname(config.__file__), "console", "static")
+    p = subprocess.run(
+        ["node", "-e", LINKS_JS, os.path.join(static, "links.js"), os.path.join(static, "markup.js")],
+        input=json.dumps({"patterns": [], "tokens": [], "rules": [], "cases": [], "table": "", **q}),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+def test_link_rules():
+    """console-links.json: only a regex subset that means the same in Python and JavaScript, in a bounded shape, and
+    URLs whose scheme and host no message text can reach. A bad rule refuses the whole file, with the reason."""
+    from agent_bridge.console import links
+
+    good = [
+        "!([0-9]+)",
+        "([A-Z][A-Z0-9_]*-[A-Z0-9]+)",
+        "(?:SENTRY|APP)-([0-9A-Z]+)",
+        "([a-f0-9]{7,40})",
+        r"#(\d+)",
+        r"(\w+)/(\w+)!(\d+)",
+        r"([\-\w]+)\.(?:py|rs)",
+        r"([^\s/@]+)@(v?[0-9.]+)",
+        "([A-Z]+-[0-9A-Z]+)",
+        r"(\w{3})-(\d{4})(-[a-z]+)?",
+        r"(?:x|[a-z]+)-(\d+)",
+        r"([a-z]+-[a-z-]+)",
+    ]
+    assert [links.check_pattern(p) for p in good] == [1, 1, 1, 1, 1, 3, 1, 2, 1, 3, 1, 1]
+    follow = "must be followed by one plain character it cannot match"
+    for p, why in [
+        # Shapes a crafted 200-character word could make slow: adjacent or unseparated repeats, many optional parts,
+        # repeated groups, and more than one group of alternatives.
+        (r"[a-z]+[a-z]+[a-z]+[a-z]+[a-z]+-(\d+)", follow),
+        ("[a-z]{1,200}" * 5 + r"-(\d+)", follow),
+        (r"(\w*\w*)", follow),
+        ("([a-z]+[a-z0-9]+)", follow),
+        ("([a-z]+[0-9]{3}[a-z]+-)", follow),  # an exact count does not separate
+        (r"([.\w]+\.x)", follow),  # the class matches the ".", so it does not separate
+        (r"(.+)-(\d+)", follow),
+        ("(?:[a-z]+|x)[a-z]+(y)", follow),  # a repeat ending a branch waits after the group
+        ("(a+|b)c+(d)", follow),
+        (r"[a-z]?[a-z]?[a-z]?[a-z]?[a-z]{4}-(\d+)", "at most 3 optional parts"),  # 2^n in V8 with a class
+        ("(a?a?a?a?aaaa)", "at most 3 optional parts"),  # and in Python's engine with literals
+        ("(?:a|a)(?:b|b)(x)", "only one group may contain |"),
+        ("(a+)+", "never repeated"),
+        ("(?:ab)+(c)", "never repeated"),
+        ("(a|b)+", "never repeated"),
+        ("((a+)b){2}", "never repeated"),
+        (r"(a)\1", "escape"),
+        (r"(\p{L})", "escape"),
+        ("(?=a)(b)", "only ( and (?:"),
+        ("(?P<x>a)", "only ( and (?:"),
+        ("(?i)(a)", "only ( and (?:"),
+        ("^(a)$", "no ^ or $"),
+        ("abc", "1 to 3 capture groups"),
+        ("(a)(b)(c)(d)", "1 to 3 capture groups"),
+        ("(a", "unclosed ("),
+        ("a)(b", "unbalanced )"),
+        ("([[:alpha:]])", "[ inside a class"),
+        ("([]a)", "may not be empty"),
+        ("(a{2,1})", "quantifier"),
+        ("(a**)", "something to repeat"),
+        ("(a}", "must be escaped"),
+        ("(a b)", "printable ASCII"),
+        ("(" + "a" * 200 + ")", "1 to 200"),
+        ("([z-a])", "pattern:"),
+    ]:
+        with pytest.raises(links.Bad, match=re.escape(why)):
+            links.check_pattern(p)
+    links.check_url("https://git.example.com/g/p/-/merge_requests/{1}?x={1}#{1}", 1)
+    for url, why in [
+        ("javascript:alert({1})", "http(s)://host"),
+        ("https://{1}.example.com/", "http(s)://host"),
+        ("https://git.example.com{1}", "http(s)://host"),
+        ("http://git.example.com/a b", "http(s)://host"),
+        ("https://git.example.com/{4}", "only braces"),
+        ("https://git.example.com/{x}", "only braces"),
+        ("https://git.example.com/{2}", "past the pattern"),
+        ("https://git.exämple.com/{1}", "ASCII"),
+    ]:
+        with pytest.raises(links.Bad, match=re.escape(why)):
+            links.check_url(url, 1)
+    assert links.check(LINK_RULES) == LINK_RULES
+    for rules, why in [
+        ({"name": "x"}, "JSON list"),
+        ([LINK_RULES[0]] * 21, "at most 20"),
+        ([{**LINK_RULES[0], "extra": 1}], "rule 1: each rule is"),
+        ([LINK_RULES[0], {**LINK_RULES[1], "name": "Bad Name"}], "rule 2: name"),
+        ([{**LINK_RULES[0], "pattern": "(a+)+"}], "rule 1: a group may only be optional"),
+    ]:
+        with pytest.raises(links.Bad, match=re.escape(why)):
+            links.check(rules)
+
+    # Every accepted pattern matches exactly the same tokens, with the same groups, in both engines.
+    tokens = ["!1432", "!12a", "APP-4SV", "SENTRY-12", "SENTRYX-1", "deadbee1", "#77", "a/b!3", "x.py", "a.b.rs",
+              "pkg@v1.2", "é", "#١٢", "!", "", "_/_!0", "A-", "!0123456789"]  # fmt: skip
+    js = links_js(patterns=good, tokens=tokens)["match"]
+    py = [[(m.groups() if (m := re.fullmatch(f"(?:{p})", t, re.ASCII)) else None) for t in tokens] for p in good]
+    assert js == [[list(g) if g is not None else None for g in row] for row in py], (js, py)
+    assert any(g for row in py for g in row), "the samples exercise matches, not only misses"
+
+    # A loose backstop against runaway matching only, never the proof (the shape rules above are): every accepted
+    # pattern against 2000 crafted 200-character words, each a run of one character with no way to finish the match.
+    # A refused shape takes seconds to minutes per word; these take milliseconds in all.
+    words = [c * 199 + "~" for c in "aA0_-./@!#xZ9v"] + [(a + b) * 100 for a, b in ("a-", "A-", "a1", "!1", "@v", "x.")]
+    slow = links_js(patterns=good, slow=(words * 100)[:2000])["slow_ms"]
+    assert slow < MARKUP_BACKSTOP_MS, slow
+
+
+def test_link_rendering():
+    """Links from text only: an href stays on its template's origin whatever the token holds, nothing but http(s)
+    is ever linked, hashes and paths become copy spans, and long tokens or huge bodies stay bounded."""
+    hostile_rule = {"name": "raw", "pattern": "!([^\\s]+)", "url": "https://git.example.com/mr/{1}"}
+    out = links_js(
+        rules=[LINK_RULES[1], hostile_rule, {"name": "js", "pattern": "x(.)", "url": "javascript:alert({1})"}],
+        cases=[
+            "see !1432, and deadbeef12 at ~/src/x.py.",
+            "!//evil.com !@evil.com:80 !..%2F../x?y=1#z !.. !.",
+            "xy javascript:alert(1) (APP-4SV) 1234567 decade /",
+            "!" + "1" * 200,
+            "!1 " * 2500,
+        ],
+        table="| id |\n|---|\n| APP-7 |",
+    )
+    assert out["compiled"] == ["issue", "raw", "js"], "a javascript: template compiles but never yields a link"
+    [first, hostile, plain, long, many] = out["render"]
+    assert first == [
+        ["#text", "see "],
+        ["a", "autolink", "!1432", "https://git.example.com/mr/1432", "noopener noreferrer", "_blank", []],
+        ["#text", ", and "],
+        ["span", "copy", "deadbeef12", "", "", "", []],
+        ["#text", " at "],
+        ["span", "copy", "~/src/x.py", "", "", "", []],
+        ["#text", "."],
+    ], first
+    hrefs = [n[3] for n in hostile if n[0] == "a"]
+    assert hostile[-1] == ["#text", " !.. !."], "a . or .. capture links nothing"
+
+    assert len(hrefs) == 3 and all(h.startswith("https://git.example.com/mr/") for h in hrefs), hostile
+    assert "%2F%2Fevil.com" in hrefs[0] and "%40evil.com%3A80" in hrefs[1] and "%3Fy%3D1%23z" in hrefs[2], hrefs
+    assert [n[0] for n in plain] == ["#text", "a", "#text"], "only APP-4SV links; no javascript:, number or word"
+    assert plain[1][3] == "https://issues.example.com/issues/?q=APP-4SV" and plain[1][2] == "APP-4SV", plain
+    assert long == [["#text", "!" + "1" * 200]], "a token over 200 characters is never matched"
+    assert sum(n[0] == "a" for n in many) == 2000, "at most 2000 tokens are matched per text run"
+    cell = out["table"][0][6][0][6][1][6][0][6][0]  # div > table > tbody > tr > td
+    assert cell[0] == "td" and cell[6][0][:4] == [
+        "a",
+        "autolink",
+        "APP-7",
+        "https://issues.example.com/issues/?q=APP-7",
+    ]
 
 
 def test_native_only_imports():

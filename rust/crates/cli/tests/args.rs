@@ -63,3 +63,39 @@ fn help_says_what_prints_json() {
     let say = text(&run(&["say", "--help"], b"").stdout);
     assert!(say.contains("any other @word stays plain text") && say.contains("@@word never mentions"), "{say}");
 }
+
+#[test]
+fn relay_wake_filters_are_kept_per_session() {
+    /// removed when the test ends, failed assertions included
+    struct Gone(std::path::PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let state = Gone(std::env::temp_dir().join(format!("agent-bridge-args-wake-{}", std::process::id())));
+    let session = "2f1e0d9c-8b7a-4655-9443-322110fedcba";
+    let wake = |args: &[&str]| {
+        let out = Command::new(RUST)
+            .args(["relay", "wake"])
+            .args(args)
+            .args(["--session", session])
+            .env("AGENT_BRIDGE_PORT", "1")
+            .env("XDG_STATE_HOME", &state.0)
+            .env_remove("AGENT_BRIDGE_LOG")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .expect("the CLI runs");
+        (out.status.code(), text(&out.stdout), text(&out.stderr))
+    };
+    let rooms = |json: &str| format!("{{\"session\": \"{session}\", \"rooms\": {json}}}\n");
+    assert_eq!(wake(&[]), (Some(0), rooms("{}"), String::new()));
+    assert_eq!(wake(&["mrs", "mentions"]), (Some(0), rooms("{\"mrs\": \"mentions\"}"), String::new()));
+    assert_eq!(wake(&["noisy", "admin"]).1, rooms("{\"mrs\": \"mentions\", \"noisy\": \"admin\"}"));
+    assert_eq!(wake(&["mrs"]).1, rooms("{\"mrs\": \"mentions\"}"));
+    assert_eq!(wake(&["ops"]).1, rooms("{\"ops\": \"all\"}"), "a room without a filter wakes on everything");
+    assert_eq!(wake(&["mrs", "all"]).1, rooms("{\"noisy\": \"admin\"}"), "all removes the filter");
+    let (code, _, err) = wake(&["mrs", "loud"]);
+    assert_eq!((code, err.as_str()), (Some(1), "wake mode: one of all, mentions, admin, got \"loud\"\n"));
+    assert_eq!(wake(&["a/b", "all"]).0, Some(1));
+}

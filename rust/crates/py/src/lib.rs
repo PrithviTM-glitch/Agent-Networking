@@ -108,6 +108,13 @@ fn rooms_info<'py>(py: Python<'py>, room: &Bound<'py, PyAny>) -> PyResult<Bound<
     dict(py, &py.detach(move || rooms::info(&room)).map_err(bridge)?)
 }
 
+/// A message's id, as recv, history and the Observer show it: for ids on raw history_call entries (topic, from, ts).
+#[pyfunction]
+fn message_id(topic: &Bound<'_, PyAny>, from_: &Bound<'_, PyAny>, ts: f64) -> PyResult<String> {
+    let (topic, from) = (args::text(topic, "topic")?, args::text(from_, "from")?);
+    Ok(agent_bridge::protocol::message_id(&topic, &from, ts))
+}
+
 #[pyfunction]
 fn rooms_listing<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
     dicts(py, &py.detach(rooms::listing).map_err(bridge)?)
@@ -158,6 +165,28 @@ fn relay_stop(py: Python<'_>, session: &Bound<'_, PyAny>, timeout: f64) -> PyRes
 fn relay_session_agent(py: Python<'_>, session: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
     let session = args::session(session)?;
     py.detach(move || relay::session_agent(&session)).map_err(bridge)
+}
+
+/// The session's relay wake filters, room -> "mentions" or "admin" (relay.wake_modes); other rooms wake on everything.
+#[pyfunction]
+fn relay_wake_modes<'py>(py: Python<'py>, session: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyDict>> {
+    let session = args::session(session)?;
+    let modes = py.detach(move || relay::wake_modes(&session)).map_err(bridge)?;
+    dict(py, &modes)
+}
+
+/// Set room's wake mode for session ("all", "mentions" or "admin"; "all" removes the filter) and return the filters.
+#[pyfunction]
+fn relay_set_wake<'py>(
+    py: Python<'py>,
+    session: &Bound<'py, PyAny>,
+    room: &str,
+    mode: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let session = args::session(session)?;
+    let (room, mode) = (room.to_owned(), mode.to_owned());
+    let modes = py.detach(move || relay::set_wake(&session, &room, &mode)).map_err(bridge)?;
+    dict(py, &modes)
 }
 
 /// comm, ppid and start time in clock ticks of a live process, or None.
@@ -281,6 +310,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(presence_need, m)?)?;
     m.add_function(wrap_pyfunction!(presence_wipe, m)?)?;
     m.add_function(wrap_pyfunction!(rooms_info, m)?)?;
+    m.add_function(wrap_pyfunction!(message_id, m)?)?;
     m.add_function(wrap_pyfunction!(rooms_listing, m)?)?;
     m.add_function(wrap_pyfunction!(rooms_view, m)?)?;
     m.add("ROOM_OPEN", dict(py, &rooms::open())?)?;
@@ -293,6 +323,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(relay_held, m)?)?;
     m.add_function(wrap_pyfunction!(relay_stop, m)?)?;
     m.add_function(wrap_pyfunction!(relay_session_agent, m)?)?;
+    m.add("RELAY_WAKE_MODES", relay::WAKE_MODES.to_vec())?;
+    m.add_function(wrap_pyfunction!(relay_wake_modes, m)?)?;
+    m.add_function(wrap_pyfunction!(relay_set_wake, m)?)?;
     m.add_function(wrap_pyfunction!(identity_read_proc, m)?)?;
     m.add_function(wrap_pyfunction!(identity_session_address, m)?)?;
     m.add_function(wrap_pyfunction!(identity_short_hash, m)?)?;

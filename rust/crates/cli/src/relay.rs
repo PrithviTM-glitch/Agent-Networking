@@ -14,7 +14,10 @@ use agent_bridge::broker::os_text;
 use agent_bridge::bus::Bus;
 use agent_bridge::json::{Map, dumps_map, float};
 use agent_bridge::protocol::BROADCAST;
-use agent_bridge::relay::{BACKLOG, binary, live, lock_path, pid, session_agent, started, stop, version};
+use agent_bridge::relay::{
+    BACKLOG, WAKE_MODES, binary, live, lock_path, pid, session_agent, set_wake, started, stop, version, wake_modes,
+    wake_path, wakes,
+};
 use agent_bridge::stamp::stamp;
 use agent_bridge::validation::{ID_MAX, check_session, fail, is_ident, os_error};
 use agent_bridge::{Error, Result, claude, config, host, identity};
@@ -139,6 +142,10 @@ impl Arrived {
     fn clear(&self) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
+
+    fn is_set(&self) -> bool {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Relay this session's messages until its session's process ends or SIGTERM.
@@ -153,20 +160,30 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
     let path = lock_path(&session)?;
     let dir = path.parent().unwrap_or(&path);
     std::fs::create_dir_all(dir).map_err(|e| config::data_error(&e, dir))?;
-    let mut lock = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
-        .open(&path)
-        .map_err(|e| config::data_error(&e, &path))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            log(&format!("session {session}"), "already running");
-            return Ok(());
+    let mut lock = match inherited_lock(&path) {
+        // a relay that re-executed itself after an upgrade: it already holds this session's lock
+        Some(lock) => {
+            log(&format!("session {session}"), "kept its lock across the restart");
+            lock
         }
-        Err(TryLockError::Error(e)) => return Err(os_error(&e, Some(&path))),
-    }
+        None => {
+            let lock = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .open(&path)
+                .map_err(|e| config::data_error(&e, &path))?;
+            match lock.try_lock() {
+                Ok(()) => lock,
+                Err(TryLockError::WouldBlock) => {
+                    log(&format!("session {session}"), "already running");
+                    return Ok(());
+                }
+                Err(TryLockError::Error(e)) => return Err(os_error(&e, Some(&path))),
+            }
+        }
+    };
+    let execed_at = take_env(EXECED_ENV).and_then(|t| t.parse::<f64>().ok());
     let io = |e: std::io::Error| os_error(&e, Some(&path));
     lock.set_len(0).and_then(|_| writeln!(lock, "{}", std::process::id())).map_err(io)?;
     identity::set_ancestor(claude_pid);
@@ -190,14 +207,21 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
     log(&bus.addr, &format!("relaying for claude pid {claude_pid}"));
 
     let me = bus.addr.clone();
-    let mut backlog: VecDeque<Map> = VecDeque::new();
+    let saved = backlog_path(&session);
+    let backlog = std::cell::RefCell::new(restore_backlog(&saved));
     // set when the inbox refused a post, so the log can tell that from the broker being unreachable
     let undelivered = std::cell::Cell::new(false);
+    // relay wake's filters, re-read whenever the file changes
+    let mut filters: (Option<std::time::SystemTime>, Map) = (None, Map::new());
     let mut deliver = |msgs: &[Map]| -> Result<()> {
+        let changed = wake_path(&session).ok().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        if changed != filters.0 {
+            filters = (changed, wake_modes(&session).unwrap_or_default());
+        }
         // Another connection acting as this agent (the MCP server's publisher) is not covered by no-local.
         let mine: Vec<&Map> = msgs.iter().filter(|m| m["from"] != *me).collect();
-        let quiet: Vec<&Map> = mine.iter().copied().filter(|m| m.get("for_me") == Some(&Value::Bool(false))).collect();
-        let wake: Vec<&Map> = mine.iter().copied().filter(|m| m.get("for_me") != Some(&Value::Bool(false))).collect();
+        let (wake, quiet): (Vec<&Map>, Vec<&Map>) = mine.iter().copied().partition(|m| wakes(&filters.1, m));
+        let mut backlog = backlog.borrow_mut();
         if wake.is_empty() {
             // acked once this returns: from here on they live only in the backlog
             for m in quiet {
@@ -219,9 +243,27 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
     let alive = || host::stat(claude_pid).is_some_and(|p| p.start == claude_start);
     let mut down = false;
     let mut away: Option<Instant> = None;
+    let mut upgrade = Upgrade::new(execed_at);
     while !DONE.load(Ordering::SeqCst) && alive() {
         if arrived.wait(Duration::from_secs(1)) && !done_within(COALESCE, &alive) {
             arrived.clear();
+        }
+        // idle: nothing arrived meanwhile and nothing waits to be delivered again
+        if !arrived.is_set()
+            && !undelivered.get()
+            && bus.connected()
+            && let Some((exe, version)) = upgrade.ready(&me)
+        {
+            // The Bus stays open: exec closes its socket, and the broker keeps the session (no will) and resends what
+            // was not acked to the new image, so a failed exec leaves this one connected and relaying.
+            save_backlog(&saved, &backlog.borrow());
+            log(&me, &format!("binary replaced, restarting on {} ({version})", exe.display()));
+            let e = reexec(&exe, &lock, claude_pid, claude_start);
+            let _ = nix::fcntl::fcntl(&lock, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC));
+            let mut kept = restore_backlog(&saved);
+            backlog.borrow_mut().append(&mut kept);
+            upgrade.last_exec = Some(epoch());
+            log(&me, &format!("binary replaced, exec failed ({e}), still running on the old image"));
         }
         // recv would wait up to 10 s for the broker; waiting here keeps checking the claude process
         if !bus.connected() {
@@ -253,6 +295,176 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
     bus.close();
     log(&me, "stopped");
     Ok(())
+}
+
+/// The lock file descriptor a relay hands to the image it re-executes, and when it did so.
+const LOCK_FD_ENV: &str = "AGENT_BRIDGE_RELAY_LOCK_FD";
+const EXECED_ENV: &str = "AGENT_BRIDGE_RELAY_EXECED_AT";
+/// how often an idle relay looks for a replaced binary
+const UPGRADE_CHECK: Duration = Duration::from_secs(60);
+/// a new binary must be this old, so a relay never runs one an install is still writing
+const SETTLED: Duration = Duration::from_secs(30);
+/// at most one re-exec per this long, so a broken install cannot make the relay loop
+const REEXEC_EVERY_S: f64 = 600.0;
+
+fn epoch() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// Read and unset an environment variable, so nothing this relay starts inherits it.
+fn take_env(name: &str) -> Option<String> {
+    let value = std::env::var(name).ok();
+    if value.is_some() {
+        // SAFETY: called while the relay is still single-threaded, before the Bus starts its threads.
+        unsafe { std::env::remove_var(name) };
+    }
+    value
+}
+
+/// The session lock a re-executed relay inherited: the descriptor named by LOCK_FD_ENV, used only if it is this very
+/// lock file, which the previous image held and so this process holds now.
+fn inherited_lock(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let fd: i32 = take_env(LOCK_FD_ENV)?.parse().ok().filter(|fd| *fd > 2)?;
+    let named = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    if named != path.canonicalize().ok()? {
+        return None;
+    }
+    // SAFETY: fd is open (/proc names it) and is the lock file; nothing else in this process owns it.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let _ = nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC));
+    Some(file)
+}
+
+/// Replace this process with exe (relay run PID START), handing over the lock; returns only on failure.
+fn reexec(exe: &std::path::Path, lock: &std::fs::File, claude_pid: i64, claude_start: u64) -> Error {
+    use std::os::fd::AsRawFd;
+    if let Err(e) = nix::fcntl::fcntl(lock, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty())) {
+        return os_error(&e.into(), None);
+    }
+    // the tests' way to make the exec itself fail
+    let target = std::env::var_os("AGENT_BRIDGE_RELAY_EXEC_AS").map(std::path::PathBuf::from);
+    let e = Command::new(target.as_deref().unwrap_or(exe))
+        .args(["relay", "run", &claude_pid.to_string(), &claude_start.to_string()])
+        .env(LOCK_FD_ENV, lock.as_raw_fd().to_string())
+        .env(EXECED_ENV, epoch().to_string())
+        .exec();
+    os_error(&e, Some(exe))
+}
+
+/// Watches for the relay's binary being replaced (an upgrade) and says when the new one is safe to run.
+struct Upgrade {
+    every: Duration,
+    next: Instant,
+    last_exec: Option<f64>,
+    /// the last refusal logged, so each one is logged once
+    said: Option<String>,
+}
+
+impl Upgrade {
+    fn new(last_exec: Option<f64>) -> Upgrade {
+        // the tests' way to see an upgrade within seconds instead of a minute
+        let every = std::env::var("AGENT_BRIDGE_RELAY_UPGRADE_CHECK")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map_or(UPGRADE_CHECK, |s| Duration::from_secs(s.max(1)));
+        Upgrade { every, next: Instant::now() + every, last_exec, said: None }
+    }
+
+    /// Once per UPGRADE_CHECK: the installed binary and its version, if this one was replaced and the new one is
+    /// settled (30 s old), answers --version as an agent-bridge, and no re-exec happened in the last 10 minutes.
+    fn ready(&mut self, me: &str) -> Option<(std::path::PathBuf, String)> {
+        if Instant::now() < self.next {
+            return None;
+        }
+        self.next = Instant::now() + self.every;
+        let exe = std::fs::read_link("/proc/self/exe").ok()?;
+        let path = std::path::PathBuf::from(exe.to_string_lossy().strip_suffix(" (deleted)")?);
+        if self.last_exec.is_some_and(|t| epoch() - t < REEXEC_EVERY_S) {
+            return None;
+        }
+        match installed(&path) {
+            Ok(version) => Some((path, version)),
+            Err(why) => {
+                if self.said.as_deref() != Some(why.as_str()) {
+                    log(me, &format!("binary replaced, not restarting yet: {why}"));
+                    self.said = Some(why);
+                }
+                None
+            }
+        }
+    }
+}
+
+/// The version a replacement binary reports, if it is complete: present, executable, untouched for SETTLED, and
+/// answering --version with "agent-bridge X.Y.Z" within 5 s.
+fn installed(path: &std::path::Path) -> std::result::Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let p = path.display();
+    let meta = std::fs::metadata(path).map_err(|_| format!("{p} is missing"))?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return Err(format!("{p} is not an executable file"));
+    }
+    let age = meta.modified().ok().and_then(|m| m.elapsed().ok()).unwrap_or_default();
+    if age < SETTLED {
+        return Err(format!("{p} changed less than {} s ago", SETTLED.as_secs()));
+    }
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{p} does not start: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{p} --version did not answer within 5 s"));
+            }
+        }
+    };
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut out);
+    }
+    let version = out
+        .trim()
+        .strip_prefix("agent-bridge ")
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-')));
+    match (status.success(), version) {
+        (true, Some(v)) => Ok(v.to_owned()),
+        _ => Err(format!("{p} --version did not print \"agent-bridge VERSION\"")),
+    }
+}
+
+/// Where a relay leaves its quiet backlog for the image it re-executes.
+fn backlog_path(session: &str) -> Option<std::path::PathBuf> {
+    config::data_path(&["relay", &format!("{}.backlog", session.to_lowercase())]).ok()
+}
+
+fn save_backlog(path: &Option<std::path::PathBuf>, backlog: &VecDeque<Map>) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(path) = path.as_ref().filter(|_| !backlog.is_empty()) else { return };
+    let lines: String = backlog.iter().map(|m| dumps_map(m) + "\n").collect();
+    let written = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path);
+    let _ = written.and_then(|mut f| f.write_all(lines.as_bytes()));
+}
+
+/// A previous image's quiet backlog, read once and removed.
+fn restore_backlog(path: &Option<std::path::PathBuf>) -> VecDeque<Map> {
+    let Some(path) = path else { return VecDeque::new() };
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let _ = std::fs::remove_file(path);
+    let mut kept: VecDeque<Map> = text.lines().filter_map(|l| serde_json::from_str::<Map>(l).ok()).collect();
+    while kept.len() > BACKLOG {
+        kept.pop_front();
+    }
+    kept
 }
 
 /// Launch this session's relay detached and return at once. The SessionStart hook's entry, so it never fails.
@@ -302,7 +514,7 @@ fn try_start(strict: bool) -> Result<()> {
 
 /// `agent-bridge relay [start|stop|status|run PID START] [--session ID]`.
 pub fn command(action: RelayAction, run_args: &[String], session: Option<String>) -> Result<()> {
-    if action != RelayAction::Run && !run_args.is_empty() {
+    if !matches!(action, RelayAction::Run | RelayAction::Wake) && !run_args.is_empty() {
         return fail(format!("agent-bridge: unrecognized arguments: {}", run_args.join(" ")));
     }
     match action {
@@ -342,6 +554,23 @@ pub fn command(action: RelayAction, run_args: &[String], session: Option<String>
             show_all(&[status(&own)?]);
             Ok(())
         }
+        RelayAction::Wake => {
+            let session = given_session(session.as_deref())?;
+            let rooms = match run_args {
+                [] => wake_modes(&session)?,
+                [room] => {
+                    let mode = wake_modes(&session)?.get(room.as_str()).cloned().unwrap_or_else(|| "all".into());
+                    Map::from_iter([(room.clone(), mode)])
+                }
+                [room, mode] => set_wake(&session, room, mode)?,
+                _ => return fail(format!("relay wake takes [ROOM [{}]]", WAKE_MODES.join("|"))),
+            };
+            let mut row = Map::new();
+            row.insert("session".into(), session.into());
+            row.insert("rooms".into(), rooms.into());
+            show_all(&[row]);
+            Ok(())
+        }
         RelayAction::Stop | RelayAction::Status => {
             let env = std::env::var(claude::SESSION_ENV).ok().filter(|s| !s.is_empty());
             let Some(given) = session.as_deref().or(env.as_deref()) else {
@@ -355,6 +584,15 @@ pub fn command(action: RelayAction, run_args: &[String], session: Option<String>
             Ok(())
         }
     }
+}
+
+/// The session a relay command acts on: --session, else this process's CLAUDE_CODE_SESSION_ID.
+fn given_session(session: Option<&str>) -> Result<String> {
+    let env = std::env::var(claude::SESSION_ENV).ok().filter(|s| !s.is_empty());
+    let Some(given) = session.or(env.as_deref()) else {
+        return fail(NO_SESSION);
+    };
+    Ok(check_session(Some(given))?.to_owned())
 }
 
 /// relay status's row. pid, started, uptime_s, binary and version are null while no relay is live; version is also null

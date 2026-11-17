@@ -7,8 +7,9 @@ use crate::json::{Map, now};
 use crate::ledger::random_hex;
 use crate::mqtt::{Conn, Handler, Message, Options, filter};
 use crate::protocol::{parse_message, parse_presence};
-use crate::rooms::parse_room;
-use crate::validation::{ID_MAX, Result, SERVICES, is_ident, os_error};
+use crate::rooms::{parse_pin, parse_room};
+use crate::validation::{ADMIN, ID_MAX, Result, SERVICES, is_ident, os_error};
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -26,7 +27,10 @@ pub enum Event {
     Presence { addr: String, rec: Option<Map> },
     /// A room's settings record; None when it was cleared or is malformed (the room is then open).
     Room { room: String, rec: Option<Map> },
-    /// A room, DM, broadcast or raw-topic message, with the time it arrived here.
+    /// A room's pinned message; None when it was cleared or is malformed.
+    Pin { room: String, rec: Option<Map> },
+    /// A room, DM, broadcast or raw-topic message, with the time it arrived here. A room message that mentions the
+    /// admin console (@admin) carries "for_admin": true.
     Message { received: f64, msg: Map },
     /// One of the broker's own statistics.
     Sys { topic: String, text: String },
@@ -69,6 +73,10 @@ fn parse(topic: &str, payload: &[u8]) -> Option<Event> {
         let rec = (!payload.is_empty()).then(|| parse_presence(payload)).flatten();
         return Some(Event::Presence { addr: addr.to_owned(), rec });
     }
+    if let Some(room) = topic.strip_prefix("rooms/").and_then(|r| r.strip_suffix("/pin")) {
+        let rec = (!payload.is_empty()).then(|| parse_pin(payload)).flatten();
+        return is_ident(room, ID_MAX).then(|| Event::Pin { room: room.to_owned(), rec });
+    }
     if let Some(room) = topic.strip_prefix("rooms/") {
         let rec = (!payload.is_empty()).then(|| parse_room(payload)).flatten();
         return is_ident(room, ID_MAX).then(|| Event::Room { room: room.to_owned(), rec });
@@ -76,7 +84,11 @@ fn parse(topic: &str, payload: &[u8]) -> Option<Event> {
     if SERVICES.contains(&topic.split('/').next().unwrap_or("")) {
         return None;
     }
-    parse_message(topic, payload).map(|msg| Event::Message { received: now(), msg })
+    let mut msg = parse_message(topic, payload)?;
+    if msg.get("mentions").and_then(Value::as_array).is_some_and(|m| m.iter().any(|a| a == ADMIN)) {
+        msg.insert("for_admin".into(), true.into());
+    }
+    Some(Event::Message { received: now(), msg })
 }
 
 impl Handler for Shared {
@@ -156,5 +168,16 @@ mod tests {
         assert!(parse("history/req/x", b"{}").is_none());
         assert!(matches!(parse("ci/build", b"red"), Some(Event::Message { .. })));
         assert!(parse("room/r", b"not json").is_none());
+        let pin = br#"{"text": "digest", "by": "m-1", "ts": 1}"#;
+        assert!(matches!(parse("rooms/r/pin", pin), Some(Event::Pin { rec: Some(_), .. })));
+        assert!(matches!(parse("rooms/r/pin", b""), Some(Event::Pin { rec: None, .. })));
+        assert!(parse("rooms/a/b/pin", pin).is_none());
+        let event = |payload: &[u8]| match parse("room/r", payload) {
+            Some(Event::Message { msg, .. }) => msg,
+            _ => panic!("a message"),
+        };
+        let mention = event(br#"{"from": "a-1", "body": "@admin look", "ts": 1, "mentions": ["admin", "b-2"]}"#);
+        assert_eq!(mention.get("for_admin"), Some(&Value::Bool(true)));
+        assert!(!event(br#"{"from": "a-1", "body": "hi", "ts": 1}"#).contains_key("for_admin"));
     }
 }

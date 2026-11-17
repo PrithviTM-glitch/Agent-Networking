@@ -118,13 +118,20 @@ fn shown(addr: &str, f: impl FnOnce(&Bus) -> Result<Map>) -> Result<()> {
     attached(addr, true, |b| f(b).map(|m| show_all(&[m])))
 }
 
-fn register(name: &str, caps: &str, keep: bool, addr: Option<&str>, subagent: bool) -> Result<()> {
+fn register(name: &str, caps: &str, keep: bool, addr: Option<&str>, subagent: bool, json: bool) -> Result<()> {
     let _turn = addr.map(turn).transpose()?;
     let caps: Vec<String> = caps.split(',').filter(|c| !c.is_empty()).map(str::to_owned).collect();
     let bus = Bus::register(name, &caps, keep, addr, subagent, true)?;
     let addr = bus.addr.clone();
     drop(bus);
-    out(&addr);
+    if !json {
+        out(&addr);
+        return Ok(());
+    }
+    // the row agents prints, read back from presence, which the register above confirmed
+    let row =
+        presence::agents(None)?.into_iter().find(|r| r.get("addr").and_then(Value::as_str) == Some(addr.as_str()));
+    show_all(&[row.ok_or_else(|| Error(format!("{addr} registered, but its presence is not readable yet")))?]);
     Ok(())
 }
 
@@ -158,6 +165,17 @@ fn plain(e: ledger::LedgerError) -> Error {
     Error(format!("ledger: {}", e.to_string().split_whitespace().collect::<Vec<_>>().join(" ")))
 }
 
+/// An op that needs no ledger of MY_ADDR's own (claims, holders, unclaim): sent as MY_ADDR without init, so it never
+/// creates one.
+fn ledger_bare(addr: &str, op: &str, fields: &[(&str, Option<Value>)]) -> Result<()> {
+    not_admin(Some(addr), "address")?;
+    let args: Map = fields.iter().filter_map(|(k, v)| Some(((*k).to_owned(), v.clone()?))).collect();
+    let mut reply = ledger::call(op, addr, args, None).map_err(plain)?;
+    reply.shift_remove("ok");
+    show_all(&[reply]);
+    Ok(())
+}
+
 /// A ledger command: init MY_ADDR's ledger, send op with the given fields, print the reply without "ok".
 fn ledger_op(addr: &str, op: &str, fields: &[(&str, Option<Value>)]) -> Result<()> {
     not_admin(Some(addr), "address")?;
@@ -189,18 +207,26 @@ fn details(d: &Details) -> [(&'static str, Option<Value>); 3] {
 
 pub fn run(cmd: Cmd) -> Result<()> {
     match cmd {
-        Cmd::Register { name, caps, keep, addr, subagent } => register(&name, &caps, keep, addr.as_deref(), subagent),
+        Cmd::Register { name, caps, keep, addr, subagent, json } => {
+            register(&name, &caps, keep, addr.as_deref(), subagent, json)
+        }
         Cmd::Leave { addr } => leave(&addr),
         Cmd::Keep { addr, state } => attached(&addr, true, |b| b.keep(matches!(state, OnOff::On))),
         Cmd::Agents { room } => presence::agents(room.as_deref()).map(|a| show_all(&a)),
         Cmd::Rooms => rooms::listing().map(|r| show_all(&r)),
         Cmd::Join { addr, room } => attached(&addr, true, |b| b.join(&room)),
         Cmd::Part { addr, room } => attached(&addr, true, |b| b.part(&room)),
-        Cmd::Say { addr, room, text, file } => {
+        Cmd::Say { addr, room, text, file, reply_to } => {
             let text = message(text, file)?;
-            let said = posted(&addr, |b| b.say(&room, &text))?;
-            if !said.unresolved.is_empty() {
-                let words: Vec<String> = said.unresolved.iter().map(|w| format!("@{w}")).collect();
+            let said = posted(&addr, |b| b.say_replying(&room, &text, reply_to.as_deref()))?;
+            for word in &said.absent {
+                eprintln!(
+                    "agent-bridge: sent; @{word} is not in #{room} (it left or never joined), so it is not mentioned"
+                );
+            }
+            let unresolved: Vec<&String> = said.unresolved.iter().filter(|w| !said.absent.contains(w)).collect();
+            if !unresolved.is_empty() {
+                let words: Vec<String> = unresolved.iter().map(|w| format!("@{w}")).collect();
                 let (verb, pronoun) =
                     if words.len() == 1 { ("matches", "it mentions") } else { ("match", "they mention") };
                 eprintln!("agent-bridge: sent; {} {verb} no member of #{room}, so {pronoun} nobody", words.join(", "));
@@ -221,9 +247,16 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::History { room, last, before, text } => {
             history::client::room_paged(&room, last, before).map(|h| show_messages(&h, text))
         }
-        Cmd::Dm { addr, to, text, file } => {
+        Cmd::Dm { addr, to, text, file, reply_to } => {
             let text = message(text, file)?;
-            posted(&addr, |b| b.dm(&to, &text))
+            posted(&addr, |b| b.dm_replying(&to, &text, reply_to.as_deref()))
+        }
+        Cmd::Pin { addr, room, text, file, clear } => {
+            if clear {
+                return posted(&addr, |b| b.unpin(&room));
+            }
+            let text = message(text, file)?;
+            posted(&addr, |b| b.pin(&room, &text)).map(|p| show_all(&[p]))
         }
         Cmd::Dms { addr, peer, last, before, text } => {
             history::client::dms_paged(&addr, peer.as_deref(), last, before).map(|h| show_messages(&h, text))
@@ -297,6 +330,19 @@ pub fn run(cmd: Cmd) -> Result<()> {
         }
         Cmd::Release { addr, lease_id } => ledger_op(&addr, "release", &[("lease_id", Some(lease_id.into()))]),
         Cmd::Leases { addr } => ledger_op(&addr, "leases", &[]),
+        Cmd::Claim { addr, room, key, ttl, note } => ledger_op(
+            &addr,
+            "claim",
+            &[("room", Some(room.into())), ("key", Some(key.into())), ("ttl", ttl.map(number)), ("note", text(&note))],
+        ),
+        Cmd::Unclaim { addr, room, key } => {
+            ledger_bare(&addr, "unclaim", &[("room", Some(room.into())), ("key", Some(key.into()))])
+        }
+        Cmd::Claims { addr, room } => ledger_bare(&addr, "claims", &[("room", Some(room.into()))]),
+        Cmd::Holders { addr, resource } => {
+            let resource = if resource.contains('/') { resource } else { format!("{addr}/{resource}") };
+            ledger_bare(&addr, "holders", &[("resource", Some(resource.into()))])
+        }
         Cmd::LeaseHistory { addr, resource, last } => {
             // a bare NAME is one of your own, as add and remove take it
             let resource = if resource.contains('/') { resource } else { format!("{addr}/{resource}") };

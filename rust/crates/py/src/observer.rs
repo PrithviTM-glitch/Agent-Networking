@@ -19,7 +19,9 @@ impl Observer {
     }
 
     /// The next event within timeout seconds, or None: ("connected", None, None), ("presence", addr, record or
-    /// None), ("room", room, record or None), ("message", received_ts, message) or ("sys", topic, text).
+    /// None), ("room", room, record or None), ("pin", room, pin or None), ("message", received_ts, message) or
+    /// ("sys", topic, text). A message carries its "id", "reply_to" when it answers one, and "for_admin": true when
+    /// it mentions the admin console.
     #[pyo3(signature = (timeout=1.0))]
     fn next<'py>(&self, py: Python<'py>, timeout: f64) -> PyResult<Option<Bound<'py, PyAny>>> {
         let o = self.0.clone();
@@ -33,6 +35,7 @@ impl Observer {
             Event::Connected => ("connected", none(), none()),
             Event::Presence { addr, rec } => ("presence", addr.into_bound_py_any(py)?, maybe(rec)?),
             Event::Room { room, rec } => ("room", room.into_bound_py_any(py)?, maybe(rec)?),
+            Event::Pin { room, rec } => ("pin", room.into_bound_py_any(py)?, maybe(rec)?),
             Event::Message { received, msg } => {
                 ("message", received.into_bound_py_any(py)?, dict(py, &msg)?.into_any())
             }

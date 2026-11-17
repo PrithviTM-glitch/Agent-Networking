@@ -5,13 +5,16 @@
 //! "announce" only moderators. Muted agents may not post, banned ones may neither post nor join.
 //! Enforcement is advisory, like every identity on the bus: senders refuse what the record forbids and every Bus drops
 //! room messages it forbids, but anyone can claim to be a moderator, or overwrite the record with a raw client.
+//! A room may also have a pinned message, retained at rooms/<room>/pin (from 0.3.1), set and cleared by the same
+//! people and just as advisory.
 
 use crate::broker;
 use crate::json::{Map, float};
 use crate::presence;
 use crate::protocol::{PAYLOAD_MAX, parse_json};
 use crate::validation::{
-    ADMIN, Error, ID_MAX, Result, check_addrs, check_ident, check_mentions, check_rules_value, check_ts, fail, is_ident,
+    ADMIN, Error, ID_MAX, Result, check_addrs, check_body_value, check_ident, check_mentions, check_rules_value,
+    check_ts, fail, is_ident,
 };
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -22,6 +25,26 @@ pub const MODS_MAX: usize = 32;
 pub const LIST_MAX: usize = 256;
 pub const RULES_MAX: usize = 2048;
 pub const TOPICS: &str = "rooms/+";
+
+/// The retained topic of room's pinned message (one level below rooms/+, so no Bus caches it).
+pub fn pin_topic(room: &str) -> String {
+    format!("rooms/{room}/pin")
+}
+
+/// A retained pin, or None if it is malformed or cleared: {"text", "by", "ts"}, text under the message rules.
+pub fn parse_pin(payload: &[u8]) -> Option<Map> {
+    let d = parse_json(payload, PAYLOAD_MAX)?;
+    let d = d.as_object()?;
+    let text = check_body_value(d.get("text")?).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let mut pin = Map::new();
+    pin.insert("text".into(), text.into());
+    pin.insert("by".into(), check_ident(d.get("by")?.as_str()?, "address").ok()?.into());
+    pin.insert("ts".into(), float(check_ts(d.get("ts")?).ok()?));
+    Some(pin)
+}
 
 /// The settings of a room without a record.
 pub fn open() -> Map {
@@ -116,36 +139,58 @@ pub fn mention_tokens(body: &str) -> Vec<String> {
     out
 }
 
+/// What a room message's @words came to (see mentions).
+#[derive(Debug, Default, PartialEq)]
+pub struct Resolved {
+    /// the addresses mentioned, None for no mention (or @all)
+    pub mentions: Option<Vec<String>>,
+    /// @words that mention nobody and stay plain text
+    pub unresolved: Vec<String>,
+    /// those of them that name a live agent who is not in the room: it left, or never joined
+    pub absent: Vec<String>,
+}
+
+/// Every (address, record) among agents whose address or name is word, compared without case.
+fn named<'a>(agents: &'a [(String, Map)], word: &str) -> impl Iterator<Item = &'a String> {
+    agents
+        .iter()
+        .filter(move |(a, r)| {
+            a.eq_ignore_ascii_case(word)
+                || r.get("name").and_then(Value::as_str).is_some_and(|n| n.eq_ignore_ascii_case(word))
+        })
+        .map(|(a, _)| a)
+}
+
 /// What a room message mentions among members (address, presence record): @address, or @name for every member with
-/// that name, both compared without case. @all mentions nobody in particular, like no mention. Any other @word matches
-/// nobody: it stays plain text, and comes back in the second list so the sender can be told.
-pub fn mentions(body: &str, members: &[(String, Map)]) -> Result<(Option<Vec<String>>, Vec<String>)> {
+/// that name, both compared without case. @admin always mentions the admin console, which joins no room. @all
+/// mentions nobody in particular, like no mention, and @me nobody at all (your own posts never reach you). Any other
+/// @word matches nobody: it stays plain text and comes back in unresolved so the sender can be told, and in absent
+/// too when it names a live agent (among live) that is not in the room.
+pub fn mentions(body: &str, members: &[(String, Map)], live: &[(String, Map)]) -> Result<Resolved> {
     let mut tokens = mention_tokens(body);
     let mut seen = std::collections::HashSet::new();
     tokens.retain(|t| seen.insert(t.to_ascii_lowercase()));
     let all = tokens.iter().any(|t| t.eq_ignore_ascii_case("all"));
-    let (mut found, mut unresolved) = (std::collections::BTreeSet::new(), Vec::new());
-    for token in tokens.into_iter().filter(|t| !t.eq_ignore_ascii_case("all")) {
-        if let Some((addr, _)) = members.iter().find(|(a, _)| a.eq_ignore_ascii_case(&token)) {
-            found.insert(addr.clone());
+    let (mut found, mut out) = (std::collections::BTreeSet::new(), Resolved::default());
+    for token in tokens.into_iter().filter(|t| !t.eq_ignore_ascii_case("all") && !t.eq_ignore_ascii_case("me")) {
+        if token.eq_ignore_ascii_case(ADMIN) {
+            found.insert(ADMIN.to_owned());
             continue;
         }
-        let named = members
-            .iter()
-            .filter(|(_, r)| r.get("name").and_then(Value::as_str).is_some_and(|n| n.eq_ignore_ascii_case(&token)))
-            .map(|(a, _)| a.clone())
-            .collect::<Vec<_>>();
-        if named.is_empty() {
-            unresolved.push(token);
+        let matched: Vec<&String> = named(members, &token).collect();
+        if matched.is_empty() {
+            if named(live, &token).next().is_some() {
+                out.absent.push(token.clone());
+            }
+            out.unresolved.push(token);
         } else {
-            found.extend(named);
+            found.extend(matched.into_iter().cloned());
         }
     }
-    let mentions = match all || found.is_empty() {
-        true => None,
-        false => Some(check_mentions(&found.into_iter().collect::<Vec<_>>().into())?),
-    };
-    Ok((mentions, unresolved))
+    if !all && !found.is_empty() {
+        out.mentions = Some(check_mentions(&found.into_iter().collect::<Vec<_>>().into())?);
+    }
+    Ok(out)
 }
 
 /// What info shows for a room: its settings, open defaults when it has no record.
@@ -170,10 +215,16 @@ pub fn records(retained: &[(String, Bytes)]) -> Vec<(String, Map)> {
         .collect()
 }
 
+/// A room's settings (open defaults without a record) and, as "pin", its pinned message or null.
 pub fn info(room: &str) -> Result<Map> {
     let room = check_ident(room, "room")?;
-    let found = records(&broker::retained(&[&format!("rooms/{room}")])?);
-    Ok(view(room, found.iter().find(|(r, _)| r == room).map(|(_, rec)| rec)))
+    let (settings, pin) = (format!("rooms/{room}"), pin_topic(room));
+    let retained = broker::retained(&[&settings, &pin])?;
+    let found = records(&retained);
+    let mut out = view(room, found.iter().find(|(r, _)| r == room).map(|(_, rec)| rec));
+    let pinned = retained.iter().find(|(t, _)| *t == pin).and_then(|(_, p)| parse_pin(p));
+    out.insert("pin".into(), pinned.map_or(Value::Null, Value::Object));
+    Ok(out)
 }
 
 /// Every room with members or settings: members, mode and moderators.
@@ -223,23 +274,43 @@ mod tests {
     #[test]
     fn resolve() {
         let members = [member("alice-1", "alice"), member("alice-2", "alice"), member("bob-1", "bob")];
-        let none: Vec<String> = vec![];
+        let live = [member("carol-3", "carol"), member("dan-4", "dan")];
+        let m = |body: &str| mentions(body, &members, &live).unwrap();
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert_eq!(m("@alice @bob-1").mentions.unwrap(), ["alice-1", "alice-2", "bob-1"]);
+        assert_eq!(m("@bob-1 and @ALL"), Resolved::default());
+        assert_eq!(m("@ALICE and @Bob-1").mentions.unwrap(), ["alice-1", "alice-2", "bob-1"], "no case");
+        let r = m("@carol, see the @mentions field, @bob");
+        assert_eq!(r.mentions.unwrap(), ["bob-1"]);
+        assert_eq!((r.unresolved, r.absent), (words(&["carol", "mentions"]), words(&["carol"])), "carol is not here");
+        assert_eq!(m("@dan-4 @Carol").absent, words(&["dan-4", "Carol"]), "by address or name, any case");
+        assert_eq!(m("only @nobody @Nobody").unresolved, words(&["nobody"]), "once each");
+        let admin = m("@Admin please, and @admin again");
+        assert_eq!((admin.mentions.unwrap(), admin.unresolved), (vec![ADMIN.to_owned()], vec![]), "not a member");
+        assert_eq!(m("ping @me or @ME"), Resolved::default(), "never a mention, never reported");
+        assert_eq!(m("@me @bob").mentions.unwrap(), ["bob-1"]);
         assert_eq!(
-            mentions("@alice @bob-1", &members).unwrap(),
-            (Some(vec!["alice-1".into(), "alice-2".into(), "bob-1".into()]), none.clone())
+            m("@bob-1 then @bob").unresolved,
+            Vec::<String>::new(),
+            "a member mentioned twice is still a member"
         );
-        assert_eq!(mentions("@bob-1 and @ALL", &members).unwrap(), (None, none.clone()));
-        assert_eq!(
-            mentions("@ALICE and @Bob-1", &members).unwrap().0.unwrap(),
-            ["alice-1", "alice-2", "bob-1"],
-            "no case"
-        );
-        let (m, unresolved) = mentions("@carol, see the @mentions field, @bob", &members).unwrap();
-        assert_eq!(
-            (m.unwrap(), unresolved),
-            (vec!["bob-1".to_owned()], vec!["carol".to_owned(), "mentions".to_owned()])
-        );
-        assert_eq!(mentions("only @nobody @Nobody", &members).unwrap(), (None, vec!["nobody".to_owned()]), "once each");
+    }
+
+    #[test]
+    fn pins() {
+        let pin = parse_pin(br#"{"text": "digest\n- a", "by": "mod-1", "ts": 5, "x": 1}"#).unwrap();
+        assert_eq!(crate::json::dumps_map(&pin), r#"{"text": "digest\n- a", "by": "mod-1", "ts": 5.0}"#);
+        assert_eq!(pin_topic("ops"), "rooms/ops/pin");
+        for bad in [
+            &b""[..],
+            br#"{"text": "  ", "by": "m", "ts": 1}"#,
+            br#"{"text": "x", "by": "a/b", "ts": 1}"#,
+            br#"{"text": "\u001b[2J", "by": "m", "ts": 1}"#,
+            br#"{"text": "x", "ts": 1}"#,
+            b"[1]",
+        ] {
+            assert!(parse_pin(bad).is_none(), "{}", String::from_utf8_lossy(bad));
+        }
     }
 
     #[test]

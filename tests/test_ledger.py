@@ -863,6 +863,64 @@ def test_request_waits_for_the_answer():
         cli("leave", o)
 
 
+def test_claims():
+    """claim holds a key in a room until it is released, expires or its holder leaves; only the holder, a moderator
+    of the room (from its retained record) or admin releases it; claims and holders answer anyone."""
+    a, b, m = "claim-a1", "claim-b1", "claim-m1"
+    inbox = Watch(f"inbox/{a}")
+    for x in (a, b):
+        call("init", x)
+    got = call("claim", a, room="mrs", key="BX-1", note="fixing it")["claim"]
+    assert (got["holder"], got["note"], got["expires_at"]) == (a, "fixing it", None), got
+    taken = err("claim", b, room="mrs", key="BX-1")
+    assert taken["error"].startswith(f"BX-1 in #mrs is claimed by {a} since ") and taken["claim"]["holder"] == a
+    with pytest.raises(LedgerError, match=rf"claimed by {a}; only they, a moderator of #mrs or admin"):
+        call("unclaim", b, room="mrs", key="BX-1")
+    assert [c["key"] for c in call("claims", "nobody-0", room="mrs")["claims"]] == ["BX-1"], "no ledger needed"
+
+    # a moderator, as the room's retained record names it
+    record = {"mode": "open", "moderators": [m], "rules": "", "muted": [], "banned": [], "by": "admin", "ts": 1.0}
+    raw = connect()
+    raw.publish("rooms/mrs", json.dumps(record), qos=1, retain=True).wait_for_publish(5)
+    assert wait_for(lambda: "ok" in call_or_err("unclaim", m, room="mrs", key="BX-1"), 5), "the moderator releases it"
+    assert wait_for(lambda: any(f"{m} released your claim BX-1 in #mrs" in x["body"] for x in inbox.json(f"inbox/{a}")))
+    raw.publish("rooms/mrs", b"", qos=1, retain=True).wait_for_publish(5)
+    raw.disconnect()
+
+    call("claim", a, room="mrs", key="BX-2", ttl=1)
+    assert wait_for(lambda: not call("claims", a, room="mrs")["claims"], 5), "the ttl ran out"
+    assert wait_for(lambda: any("your claim BX-2 in #mrs expired" in x["body"] for x in inbox.json(f"inbox/{a}")))
+    call("claim", a, room="dev", key="H1")
+    call("claim", b, room="mrs", key="CC-1")
+    assert [(c["room"], c["key"]) for c in call("claims", "admin")["claims"]] == [("dev", "H1"), ("mrs", "CC-1")]
+    assert "only admin lists every room" in err("claims", a)["error"]
+    call("drop", a)
+    assert [c["key"] for c in call("claims", "admin")["claims"]] == ["CC-1"], "leaving releases its claims"
+    call("unclaim", "admin", room="mrs", key="CC-1")
+    owners = {x["owner"] for x in call("dump", "admin")["ledgers"]}
+    assert not owners & {m, "admin"}, "the moderator and admin released claims without a ledger, and none was made"
+
+    call("add", b, name="db", visibility="public", max_level="write")
+    call("init", m)
+    call("request", m, resource=f"{b}/db", level="write")
+    lease = call("acquire", b, resource=f"{b}/db", level="write", ttl=30)["lease"]
+    waiter = background("acquire", m, resource=f"{b}/db", level="write", ttl=5, wait=10)
+    assert queued(f"{b}/db")
+    h = call("holders", "nobody-0", resource=f"{b}/db")
+    assert [x["holder"] for x in h["holders"]] == [b] and [x["holder"] for x in h["waiting"]] == [m], h
+    call("release", b, lease_id=lease["lease_id"])
+    waiter["thread"].join()
+    assert "no such resource" in err("holders", b, resource=f"{b}/nope")["error"]
+    alive()
+
+
+def call_or_err(op, who, **kw):
+    try:
+        return call(op, who, **kw)
+    except LedgerError as e:
+        return e.reply
+
+
 def test_replay_window():
     """A stored answer lives as long as its request can be redelivered: max(300 s, the request's
     MessageExpiryInterval), capped at MAX_TTL + MAX_WAIT. Rows are purged 300 s after their ts by this ledgerd and by

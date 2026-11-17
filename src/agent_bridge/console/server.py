@@ -12,7 +12,7 @@ import agent_bridge
 
 from .. import _native, config
 from ..errors import HistoryError
-from . import actions, admin, auth, capacity, events, kill, leaks, metrics, processes, sessions, usage
+from . import actions, admin, auth, capacity, events, kill, leaks, links, metrics, processes, sessions, usage
 from .processes import ERRORS, Refused
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -21,6 +21,7 @@ STATIC = {
     "/app.js": ("app.js", "text/javascript"),
     "/app.css": ("app.css", "text/css"),
     "/markup.js": ("markup.js", "text/javascript"),
+    "/links.js": ("links.js", "text/javascript"),
 }
 CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; "
@@ -35,7 +36,7 @@ def agent_detail(query):
     out = {"agent": v, "activity": sessions.activity(v["session"]) if v["session"] else [], "dms": [], "ledger": None}
     if v["addr"]:
         try:
-            out["dms"] = _native.history_call("dms", as_=v["addr"], last=DMS_SHOWN)["messages"]
+            out["dms"] = admin.with_ids(_native.history_call("dms", as_=v["addr"], last=DMS_SHOWN)["messages"])
         except HistoryError as e:
             out["dms_error"] = str(e)
         try:
@@ -53,8 +54,10 @@ def state(_query):
         "jobs": processes.job_list(),
         "connected": admin.held["bus"] is not None,
         "rooms": admin.settings,
+        "pins": admin.pins,
         "broker": {"dropped": admin.dropped()},
         "version": {"package": agent_bridge.__version__, "native": _native.__version__},
+        "links": links.current,
     }
 
 
@@ -82,6 +85,7 @@ READS = {
     "/api/room/kill": kill_preview,
     "/api/agent/stop": lambda q: kill_preview({**q, "room": None}),
     "/api/ledger": lambda _q: admin.dump(),
+    "/api/claims": lambda _q: admin.claims(),
     "/api/capacity": lambda _q: capacity.snapshot(),
     "/api/leaks": lambda _q: leaks.report(),
     "/api/audit": audit,
@@ -200,11 +204,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    p = argparse.ArgumentParser(description="The agent bus admin console on 127.0.0.1 (MONITOR_PORT, default 10000).")
+    p = argparse.ArgumentParser(
+        description="The agent bus admin console on 127.0.0.1 (MONITOR_PORT, default 10000).",
+        epilog="Auto-links: rules read at start from $XDG_CONFIG_HOME/agent-bridge/console-links.json (or the file "
+        "AGENT_BRIDGE_LINKS names), a JSON list of {name, pattern, url}; agent-bridge-admin status shows how many "
+        "loaded, or why the file was refused.",
+    )
     p.add_argument("--headless", action="store_true", help="serve the API and /metrics only, no web page")
     p.add_argument("-V", "--version", action="version", version=f"%(prog)s {agent_bridge.__version__}")
     a = p.parse_args()
     Handler.token, Handler.headless = auth.load_token(), a.headless
+    links.load()
     server = ThreadingHTTPServer(("127.0.0.1", auth.PORT), Handler)
     admin.observe()
     for fn in (admin.hold_admin, sessions.watch):

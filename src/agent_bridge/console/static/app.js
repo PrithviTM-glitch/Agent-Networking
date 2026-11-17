@@ -84,6 +84,8 @@ function go(v) {
   if (v.type === "chan") { delete S.unread[v.id]; delete S.atme[v.id]; }
   if (v.type === "agent") { S.tab = "overview"; S.profile = null; loadProfile(); loadCapacity(); loadUsage(); }
   if (v.type === "ledger") { S.ledger = null; loadLedger(); }
+  if (v.type === "claims") { S.claims = null; loadClaims(); }
+  if (v.type === "inbox") markInboxRead();
   if (v.type === "kill" || v.type === "stop") {
     S.kill = {signal: "terminate", sessions: false, preview: null, results: null, selected: new Set()};
     loadKillPreview();
@@ -101,7 +103,9 @@ function go(v) {
 function renderNav() {
   const alive = S.agents.filter(a => a.alive).length, bus = S.agents.filter(a => a.on_bus).length;
   $("stat").textContent = bus + " on the bus · " + alive + " sessions alive · " + S.msgs.length + " messages";
-  const nav = $("nav"), top = nav.scrollTop, cur = viewKey(S.view), ch = channels();
+  const nav = $("nav"), top = nav.scrollTop, cur = viewKey(S.view), ch = channels(), inbox = inboxUnread();
+  if (inbox) S.atme.inbox = inbox; else delete S.atme.inbox;
+  document.title = (inbox ? "(" + inbox + ") " : "") + "Agent Bridge Admin";
   // Rebuilding the sidebar under a pressed mouse button loses the click, so only rebuild when something shows.
   const sig = JSON.stringify([cur, ch, S.unread, S.atme, S.agents.map(a => [a.key, a.friendly, a.alive, a.rooms, a.status])]);
   if (sig === S.navSig) return;
@@ -125,6 +129,7 @@ function renderNav() {
     if (plus) add(h, button("+", plus));
     nav.append(h);
   };
+  item("inbox", {type: "inbox"}, "✉ Inbox", "@admin and DMs to admin");
   item("broadcast", {type: "chan", id: "broadcast"}, "📣 Broadcast");
   head("Rooms", () => newChan("room"));
   for (const c of ch.rooms) {
@@ -153,6 +158,7 @@ function renderNav() {
   item("capacity", {type: "capacity"}, "Capacity");
   item("leaks", {type: "leaks"}, "Leftovers");
   item("ledger", {type: "ledger"}, "Ledger");
+  item("claims", {type: "claims"}, "Claims");
   item("audit", {type: "audit"}, "Audit log");
   nav.scrollTop = top;
 }
@@ -177,6 +183,7 @@ function setTitle(t1, t2, actions) {
 // view needs a Refresh button. A failed load backs off (liveDelay) and says why under the title; a success resets it.
 const LIVE = [
   {every: 5000, on: v => v.type === "ledger", load: () => loadLedger()},
+  {every: 5000, on: v => v.type === "claims", load: () => loadClaims()},
   {every: 3000, on: v => v.type === "capacity" || (v.type === "agent" && S.tab === "overview"), load: () => loadCapacity()},
   {every: 10000, on: v => v.type === "leaks", load: () => loadLeaks()},
   {every: 5000, on: v => v.type === "agent", load: () => loadProfile()},
@@ -210,15 +217,67 @@ function liveShow() {
     : "live, updated " + clock(l.at / 1000);
   box.classList.toggle("bad", !!l.err);
 }
-function msgNode(m, tag) {
-  const d = el("div", "msg" + (m.from === ADMIN ? " admin" : "")), h = el("div", "h");
+function msgNode(m, tag, opts) {
+  const o = opts || {}, d = el("div", "msg" + (m.from === ADMIN ? " admin" : "") + (o.nested ? " reply" : ""));
+  const h = el("div", "h");
+  if (m.id) d.dataset.id = m.id;
   const who = el("span", "who", m.from ? nameOf(m.from) : "(anonymous)");
   who.style.color = "hsl(" + hue(m.from || "") + " 55% 48%)";
   add(h, who);
   if (m.from && nameOf(m.from) !== m.from) add(h, el("span", "t mono", m.from));
   if (tag) add(h, el("span", "tag", label(chanOf(m))));
   if (m.ts) add(h, el("span", "t", clock(m.ts)));
-  return add(d, h, bodyNode(m));
+  if (o.reply && m.id) {
+    const r = button("Reply", e => { e.stopPropagation(); startReply(m); });
+    r.className = "mini";
+    add(h, r);
+  }
+  add(d, h);
+  if (m.reply_to && !o.nested) d.append(replyStub(m));
+  return add(d, bodyNode(m));
+}
+// replies: a message's reply_to names its parent's id (the core derives it from topic, sender and ts)
+
+function snippet(text) {
+  const t = String(text).split(/\s+/).join(" ").trim();
+  return t.length > 80 ? t.slice(0, 79) + "…" : t;
+}
+function replyStub(m) {
+  const parent = S.msgs.find(x => x.id === m.reply_to);
+  const stub = el("div", "re", "↳ " + (parent ? nameOf(parent.from) + ": " + snippet(parent.body) : "reply to an earlier message"));
+  if (parent) {
+    stub.title = "Show the message it answers";
+    stub.onclick = () => {
+      const t = document.querySelector('[data-id="' + CSS.escape(m.reply_to) + '"]');
+      if (t) { t.scrollIntoView({block: "center"}); t.classList.add("flash"); setTimeout(() => t.classList.remove("flash"), 1200); }
+    };
+  }
+  return stub;
+}
+// Replies right under their parent (one level of indent), when the parent is in the list; the rest in time order.
+// A forged cycle of replies has no root, so whatever the walk misses is appended as it came.
+function threaded(list) {
+  const ids = new Set(list.map(m => m.id).filter(Boolean)), kids = new Map(), out = [], seen = new Set();
+  for (const m of list) {
+    if (m.reply_to && m.reply_to !== m.id && ids.has(m.reply_to)) {
+      if (!kids.has(m.reply_to)) kids.set(m.reply_to, []);
+      kids.get(m.reply_to).push(m);
+    }
+  }
+  const walk = (m, nested) => {
+    if (seen.has(m)) return;
+    seen.add(m);
+    out.push([m, nested]);
+    for (const k of kids.get(m.id) || []) walk(k, true);
+  };
+  for (const m of list) if (!(m.reply_to && ids.has(m.reply_to) && m.reply_to !== m.id)) walk(m, false);
+  for (const m of list) if (!seen.has(m)) walk(m, false);
+  return out;
+}
+function startReply(m) {
+  S.replyTo = {id: m.id, chan: chanOf(m), who: nameOf(m.from), text: snippet(m.body)};
+  if (S.view.type === "chan") renderChannel(S.view.id);
+  $("text").focus();
 }
 function mentioned(m, word) {
   // Highlights only what the bus resolved: an address in m.mentions, the name of a mentioned agent, or @all.
@@ -229,21 +288,34 @@ function mentioned(m, word) {
 function bodyNode(m) {
   // Fenced blocks and pipe tables (markup.js) render as <pre> and <table>; the text between them keeps its mentions.
   const b = el("div", "b");
-  Markup.render(document, b, m.body, (parent, text) => mentionText(parent, m, text));
+  const inline = (parent, text) => mentionText(parent, m, text);
+  Markup.render(document, b, m.body, inline, inline);
   return b;
 }
+function linkText(b, text) {
+  // Operator-configured links (console-links.json) and click-to-copy hashes and paths; plain text otherwise.
+  Links.render(document, b, text, S.links, copyText);
+}
+function copyText(text, node) {
+  const done = ok => {
+    node.classList.toggle("done", ok);
+    toast(ok ? "Copied " + text : "Copy failed: select it instead", !ok);
+  };
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => done(true), () => done(false));
+  else done(false);
+}
 function mentionText(b, m, text) {
-  if (!m.topic.startsWith("room/") || !text.includes("@")) { b.append(document.createTextNode(text)); return; }
+  if (!m.topic.startsWith("room/") || !text.includes("@")) { linkText(b, text); return; }
   let last = 0;
   for (const x of text.matchAll(/(^|\s)@([A-Za-z0-9_-]+)/g)) {
     const at = x.index + x[1].length, word = x[2];
     if (!mentioned(m, word)) continue;
-    b.append(document.createTextNode(text.slice(last, at)));
+    linkText(b, text.slice(last, at));
     const me = word === ADMIN || ((m.mentions || []).includes(ADMIN) && agentOf(ADMIN)?.name === word);
     b.append(el("span", "mention" + (me ? " me" : ""), "@" + word));
     last = at + word.length + 1;
   }
-  b.append(document.createTextNode(text.slice(last)));
+  linkText(b, text.slice(last));
 }
 function renderChannel(id, fresh) {
   const body = $("body"), stick = fresh || body.scrollTop + body.clientHeight >= body.scrollHeight - 40;
@@ -275,15 +347,29 @@ function renderChannel(id, fresh) {
     const u = S.usage && S.usage.enabled && !S.usage.error && roomUsage(room);
     if (u && u.known) sub = money(u.cost) + " · " + count(u.tokens) + " tokens over " + u.known + " of " + u.sessions + " sessions, last 30 days · " + sub;
   }
-  const tools = room ? [filter, grafanaLink({"var-room": room}, "Grafana"), button("Settings", () => go({type: "roomset", room})),
+  const pinTool = room && button(S.pins[room] ? "Edit pin" : "Pin…", () => {
+    S.pinEdit = room; S.pinDraft = S.pins[room] ? S.pins[room].text : ""; renderChannel(id);
+    $("body").scrollTop = 0;
+    const ta = document.querySelector("#body .pin textarea");
+    if (ta) ta.focus();
+  });
+  const tools = room ? [filter, pinTool, grafanaLink({"var-room": room}, "Grafana"), button("Settings", () => go({type: "roomset", room})),
     button("Kill room…", () => go({type: "kill", room}), "danger")].filter(Boolean) : [];
   setTitle(label(id), sub, tools);
   body.replaceChildren();
+  if (room && (S.pins[room] || S.pinEdit === room)) body.append(pinNode(room, id));
   if (!list.length) body.append(el("div", "empty", atOnly ? "No messages mention admin." : "No messages yet."));
-  for (const m of list.slice(-1500)) body.append(msgNode(m));
+  const reply = can && (room || id.startsWith("dm:"));
+  for (const [m, nested] of threaded(list.slice(-1500))) body.append(msgNode(m, false, {reply, nested}));
   if (stick) body.scrollTop = body.scrollHeight;
   $("compose").hidden = false;
-  $("cnote").textContent = note;
+  if (S.replyTo && S.replyTo.chan !== id) S.replyTo = null;
+  $("cnote").replaceChildren(note);
+  if (S.replyTo) {
+    const cancel = button("✕", () => { S.replyTo = null; renderChannel(id); });
+    cancel.className = "mini";
+    $("cnote").append(" Replying to " + S.replyTo.who + ": " + S.replyTo.text + " ", cancel);
+  }
   $("text").disabled = $("send").disabled = !can;
   $("text").placeholder = id === "broadcast" ? "Broadcast to every agent" : "Message";
   $("send").textContent = id === "broadcast" ? "Broadcast" : "Send";
@@ -296,12 +382,12 @@ async function sendCompose(e) {
   if (id === "broadcast") {
     if (!confirm("Broadcast to every agent?\n\n" + text)) return;
     r = await act("/api/broadcast", {text});
-  } else if (id.startsWith("dm:")) {
-    r = await act("/api/send", {kind: "dm", target: id.slice(3).split("|").find(p => p !== ADMIN), text});
   } else {
-    r = await act("/api/send", {kind: id.startsWith("room:") ? "room" : "topic", target: id.slice(id.indexOf(":") + 1), text});
+    const reply = S.replyTo && S.replyTo.chan === id ? {reply_to: S.replyTo.id} : {};
+    const target = id.startsWith("dm:") ? id.slice(3).split("|").find(p => p !== ADMIN) : id.slice(id.indexOf(":") + 1);
+    r = await act("/api/send", {kind: id.startsWith("dm:") ? "dm" : id.startsWith("room:") ? "room" : "topic", target, text, ...reply});
   }
-  if (r) $("text").value = "";
+  if (r) { $("text").value = ""; S.replyTo = null; if (S.view.type === "chan") renderChannel(S.view.id); }
 }
 
 // @mentions in the compose box
@@ -557,6 +643,94 @@ function renderLedger() {
   if (!d.resources.length) body.append(el("div", "empty", "No resources in any ledger."));
   body.append(table("Ledgers", ["Owner", "Since", "Last request"], d.ledgers.map(x => [x.owner, clock(x.since), ago(x.last_seen)])));
   body.scrollTop = top;
+}
+
+// claims: keys agents hold in rooms (ledgerd 0.3.1); admin may release any
+
+async function loadClaims() {
+  let err = null;
+  try { S.claims = await api("/api/claims"); } catch (e) { S.claims = {error: err = e.message}; }
+  if (S.view.type === "claims") renderPane();
+  return err;
+}
+function renderClaims() {
+  const body = $("body"), top = body.scrollTop, d = S.claims;
+  $("compose").hidden = true;
+  setTitle("Claims", "Keys agents hold in rooms (issue ids, questions), until released, expired or the holder leaves");
+  body.replaceChildren();
+  if (!d) { body.append(el("div", "empty", "Loading…")); return; }
+  if (d.error) { body.append(el("div", "empty", d.error)); return; }
+  if (!d.claims.length) { body.append(el("div", "empty", "No claims in any room.")); return; }
+  body.append(table("Claims", ["Room", "Key", "Holder", "Since", "Expires", "Note", ""], d.claims.map(c => {
+    const release = button("Release", () => {
+      if (confirm("Release " + c.holder + "'s claim on " + c.key + " in #" + c.room + "? ledgerd tells them by DM."))
+        act("/api/claims/release", {room: c.room, key: c.key}, "release").then(loadClaims);
+    });
+    const room = el("span", "link", label("room:" + c.room));
+    room.onclick = () => go({type: "chan", id: "room:" + c.room});
+    return [room, el("span", "mono", c.key), nameOf(c.holder), ago(c.since), c.expires_at ? ago(c.expires_at) : "until released",
+      c.note || "", release];
+  })));
+  body.scrollTop = top;
+}
+
+// inbox: room messages that mention @admin, and DMs to admin, across every channel; read up to a time per browser
+
+function forAdmin(m) {
+  return m.from !== ADMIN && !!(m.for_admin || (m.mentions || []).includes(ADMIN) || m.topic === "inbox/" + ADMIN);
+}
+function inboxUnread() {
+  if (S.inboxRead === undefined) S.inboxRead = +storage("inboxRead") || 0;
+  return S.msgs.filter(m => forAdmin(m) && m.ts > S.inboxRead).length;
+}
+function markInboxRead() {
+  S.inboxRead = Math.max(Date.now() / 1000, ...S.msgs.map(m => m.ts || 0));
+  storage("inboxRead", String(S.inboxRead));
+}
+function renderInbox() {
+  const body = $("body"), list = S.msgs.filter(forAdmin);
+  $("compose").hidden = true;
+  setTitle("Inbox", "Messages that mention @admin, and direct messages to admin, newest first. Click one to open its channel.");
+  body.replaceChildren();
+  if (!list.length) body.append(el("div", "empty", "Nothing for admin yet."));
+  for (const m of list.slice(-500).reverse()) {
+    const d = msgNode(m, true);
+    d.classList.add("link");
+    d.onclick = e => { if (!e.target.closest("a, .copy")) go({type: "chan", id: chanOf(m)}); };
+    body.append(d);
+  }
+}
+
+// pinned message: one per room (rooms/<room>/pin), set by admin or the room's moderators
+
+function pinNode(room, id) {
+  const p = S.pins[room], card = el("div", "card pin");
+  const h = add(el("div", "h"), el("span", "who", "📌 Pinned"));
+  if (p) add(h, el("span", "t", "by " + nameOf(p.by) + " · " + clock(p.ts)));
+  card.append(h);
+  if (S.pinEdit === room) {
+    const ta = el("textarea");
+    ta.rows = 8; ta.maxLength = 65536; ta.value = S.pinDraft || "";
+    ta.oninput = () => { S.pinDraft = ta.value; };
+    const done = () => { S.pinEdit = null; renderChannel(id); };
+    const save = button("Save pin", () => act("/api/room/pin", {room, text: ta.value}, "pin").then(r => r && done()));
+    save.className = "primary";
+    const clear = p && button("Clear pin", () => {
+      if (confirm("Clear the pinned message of #" + room + "?")) act("/api/room/pin", {room, clear: true}, "unpin").then(r => r && done());
+    }, "danger");
+    card.append(ta, add(el("div", "act"), save, clear, button("Cancel", done)));
+    return card;
+  }
+  const lines = p.text.split("\n").length, open = S.pinOpen && S.pinOpen[room];
+  const b = bodyNode({body: p.text, topic: "room/" + room, mentions: []});
+  if (lines > 12 && !open) b.classList.add("collapsed");
+  card.append(b);
+  if (lines > 12) {
+    card.append(button(open ? "Show less" : "Show all " + lines + " lines", () => {
+      S.pinOpen = {...S.pinOpen, [room]: !open}; renderChannel(id);
+    }));
+  }
+  return card;
 }
 
 // audit
@@ -903,6 +1077,8 @@ function renderPane(fresh) {
   if (v.type === "chan") renderChannel(v.id, fresh);
   else if (v.type === "agent") renderAgent();
   else if (v.type === "ledger") renderLedger();
+  else if (v.type === "claims") renderClaims();
+  else if (v.type === "inbox") renderInbox();
   else if (v.type === "kill") renderKill();
   else if (v.type === "roomset") renderRoomSettings();
   else if (v.type === "stop") renderKill();
@@ -940,9 +1116,13 @@ function onEvent(ev) {
     const looking = S.view.type === "chan" && S.view.id === c && !document.hidden;
     if (!looking && m.from !== ADMIN) S.unread[c] = (S.unread[c] || 0) + 1;
     if (!looking && (m.mentions || []).includes(ADMIN)) S.atme[c] = (S.atme[c] || 0) + 1;
+    if (S.view.type === "inbox" && forAdmin(m) && !document.hidden) { markInboxRead(); renderInbox(); }
     renderNav();
     if (S.view.type === "chan" && S.view.id === c) renderChannel(c);
     if (S.view.type === "agent" && S.tab === "dms" && m.topic.startsWith("inbox/")) loadProfile();
+  } else if (ev.kind === "pin") {
+    if (ev.pin) S.pins[ev.room] = ev.pin; else delete S.pins[ev.room];
+    if (S.view.type === "chan" && S.view.id === "room:" + ev.room) renderChannel(S.view.id);
   } else if (ev.kind === "room") {
     S.rooms[ev.info.room] = ev.info;
     if (S.view.room === ev.info.room && S.view.type === "roomset") renderRoomSettings();
@@ -970,9 +1150,10 @@ function setDrops(n) {
 }
 async function loadState() {
   const st = await api("/api/state");
-  S.agents = st.agents; S.msgs = st.messages; S.audit = st.audit; S.rooms = st.rooms || {};
+  S.agents = st.agents; S.msgs = st.messages; S.audit = st.audit; S.rooms = st.rooms || {}; S.pins = st.pins || {};
   setDrops(st.broker && st.broker.dropped);
   S.version = st.version || null;
+  S.links = Links.compile(st.links && st.links.rules);
   if (st.version) { $("ver").textContent = "v" + st.version.package; $("ver").title = "native core " + st.version.native; }
   S.jobs = Object.fromEntries(st.jobs.map(j => [j.id, j]));
   render(true);

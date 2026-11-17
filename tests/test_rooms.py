@@ -45,7 +45,7 @@ def refused(fn, *args, match=""):
 
 def synced(*buses, room=ROOM):
     """Wait until every bus has the room record its moderator just published."""
-    want = _native.rooms_info(room)
+    want = {k: v for k, v in _native.rooms_info(room).items() if k != "pin"}  # pins are not cached
     assert wait_for(lambda: all(_native.rooms_view(room, b.cached_room(room)) == want for b in buses), 5), want
 
 
@@ -55,6 +55,14 @@ def heard(bus, wait=3):
     while more := bus.recv(0.5):
         msgs += more
     return [(m["from"], m["body"]) for m in msgs if m["topic"] == f"room/{ROOM}"]
+
+
+def heard_room(bus, room, wait=3):
+    """(from, body) of the messages bus receives now in room."""
+    msgs = bus.recv(wait)
+    while more := bus.recv(0.5):
+        msgs += more
+    return [(m["from"], m["body"]) for m in msgs if m["topic"] == f"room/{room}"]
 
 
 def raw_say(sender, body):
@@ -79,7 +87,7 @@ def test_a_room_without_settings_is_open():
     for b in (S.alice, S.bob, S.carol, S.watch):
         b.join(ROOM)
     heard(S.watch)
-    assert _native.rooms_info(ROOM) == {"room": ROOM, **_native.ROOM_OPEN}
+    assert _native.rooms_info(ROOM) == {"room": ROOM, **_native.ROOM_OPEN, "pin": None}
     S.bob.say(ROOM, "anyone may post")
     assert heard(S.watch) == [(S.bob.addr, "anyone may post")]
     refused(S.alice.room_set, ROOM, "announce", match="admin names the first")
@@ -230,12 +238,51 @@ def test_malformed_records_count_as_open():
     c.loop_start()
     bad = {"mode": "announce", "moderators": ["x/y"], "rules": "", "muted": [], "banned": [], "by": "a", "ts": 1}
     c.publish(f"rooms/{junk_room}", json.dumps(bad), qos=1, retain=True).wait_for_publish(5)
-    assert _native.rooms_info(junk_room) == {"room": junk_room, **_native.ROOM_OPEN}
+    assert _native.rooms_info(junk_room) == {"room": junk_room, **_native.ROOM_OPEN, "pin": None}
     S.watch.join(junk_room)
     S.watch.say(junk_room, "still open")
     c.publish(f"rooms/{junk_room}", b"", qos=1, retain=True).wait_for_publish(5)
     c.disconnect()
     c.loop_stop()
+
+
+def test_pins():
+    """A room's pinned message: set and cleared by admin or its moderators (each change noted in the room), read by
+    anyone through room info and the Observer, kept out of every Bus's cache, under the message rules."""
+    room = f"pin-{RUN}"
+    S.watch.join(room)
+    S.admin.mod(room, "add", S.alice.addr)
+    synced(S.alice, room=room)
+    heard_in = lambda: [b for f, b in heard_room(S.watch, room)]  # noqa: E731
+    heard_in()
+    observer = _native.Observer()
+    assert observer.next(5)[0] == "connected"
+    refused(S.bob.pin, room, "mine now", match="only admin or a moderator")
+    refused(S.alice.pin, room, "  ", match="text is empty")
+    refused(S.alice.pin, room, "x" * 65537, match="65537 bytes")
+    digest = "digest\n- MR !12 open\n- é ✓"
+    pin = S.alice.pin(room, digest)
+    assert (pin["text"], pin["by"]) == (digest, S.alice.addr) and isinstance(pin["ts"], float)
+    assert _native.rooms_info(room)["pin"] == pin
+    assert json.loads(cli("room", "info", room))["pin"] == pin
+    assert heard_in() == [f"pin set by {S.alice.addr}"]
+    events = []
+    while (event := observer.next(5)) and event[:2] != ("pin", room):
+        events.append(event[0])
+    assert event and event[2] == pin, (event, events)
+    assert "pin" not in (S.watch.cached_room(room) or {}), "never cached: one level below rooms/+"
+    S.admin.pin(room, "replaced by admin")
+    assert _native.rooms_info(room)["pin"]["by"] == "admin"
+    refused(S.bob.unpin, room, match="only admin or a moderator")
+    S.alice.unpin(room)
+    assert _native.rooms_info(room)["pin"] is None
+    while (event := observer.next(5)) and event != ("pin", room, None):
+        pass
+    observer.close()
+    assert event == ("pin", room, None), "a cleared pin"
+    S.alice.unpin(room)
+    assert heard_in() == ["pin set by admin", f"pin cleared by {S.alice.addr}"], "clearing nothing posts nothing"
+    S.watch.part(room)
 
 
 def test_cli():

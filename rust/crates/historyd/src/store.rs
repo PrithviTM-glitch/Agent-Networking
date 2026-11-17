@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_topic ON messages(topic, id);
 CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender, id);
 CREATE INDEX IF NOT EXISTS messages_received ON messages(received);
+CREATE TABLE IF NOT EXISTS replies(id INTEGER PRIMARY KEY, reply_to TEXT NOT NULL);
 ";
 
 /// One reply: topic, payload and CorrelationData.
@@ -46,6 +47,11 @@ pub fn log(text: &str) {
 pub fn stored(topic: &str) -> bool {
     let first = topic.split('/').next().unwrap_or_default();
     !topic.starts_with('$') && (!RESERVED.contains(&first) || STORED.contains(&first))
+}
+
+/// A message id as the core derives it (16 lowercase hex digits), the only reply_to historyd keeps.
+fn is_message_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The row's identity, as Python's sha256(json.dumps([topic, sender, ts, body])): both implementations dedupe
@@ -124,6 +130,7 @@ impl History {
             // Schema 1 is all of the above. A later migration checks this row, migrates, then raises it; the first
             // one retires the Python historyd as a rollback, which only knows schema 1.
             db.execute_batch("INSERT OR IGNORE INTO meta VALUES ('schema', 1)")?;
+            History::forget_orphans(&db)?;
             Ok(())
         };
         setup().map_err(failed)?;
@@ -156,7 +163,20 @@ impl History {
             "INSERT OR IGNORE INTO messages(topic, sender, body, ts, mentions, received, digest) VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![topic.as_str(), sender.as_str(), body.as_str(), ts, mentions, received, digest],
         )?;
+        if n == 1 {
+            // SQLite may hand out a deleted row's id again, so a reply left behind by a rollback's prune must go first
+            let id = db.last_insert_rowid();
+            db.execute("DELETE FROM replies WHERE id=?", [id])?;
+            if let Some(parent) = msg.get("reply_to").and_then(Value::as_str).filter(|r| is_message_id(r)) {
+                db.execute("INSERT INTO replies VALUES (?, ?)", params![id, parent])?;
+            }
+        }
         Ok(n == 1)
+    }
+
+    /// Replies whose message is gone: a schema-1 historyd without this table (a rollback) prunes messages only.
+    fn forget_orphans(db: &Connection) -> rusqlite::Result<usize> {
+        db.execute("DELETE FROM replies WHERE id NOT IN (SELECT id FROM messages)", [])
     }
 
     /// One message from the bus, if it is history and well formed.
@@ -204,7 +224,10 @@ impl History {
             return Ok(());
         }
         let cutoff = now - self.stale_s;
-        self.tx(|db| db.execute("DELETE FROM messages WHERE received < ?", [cutoff]))?;
+        self.tx(|db| {
+            db.execute("DELETE FROM messages WHERE received < ?", [cutoff])?;
+            History::forget_orphans(db)
+        })?;
         self.pruned = now;
         self.trim()
     }
@@ -219,7 +242,7 @@ impl History {
                         Ok((r.get(0)?, r.get(1)?))
                     })?;
                 if rows <= max_rows && size <= max_bytes {
-                    return Ok(());
+                    return History::forget_orphans(db).map(drop);
                 }
                 db.execute("DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY id LIMIT 1000)", [])?;
             }
@@ -321,6 +344,7 @@ impl History {
                 }
                 "drop" => {
                     let n = db.execute("DELETE FROM messages WHERE topic=?", [&inbox])?;
+                    History::forget_orphans(db)?;
                     Map::from_iter([("dropped".into(), n.into())])
                 }
                 _ => Map::new(),
@@ -345,8 +369,9 @@ impl Page {
 /// The last rows of a query, oldest first, as wire entries; the oldest are left out if the reply is too big. The
 /// query's last parameter is the row limit.
 fn messages<P: Params>(db: &Connection, filter: &str, args: P, seq: bool) -> rusqlite::Result<Map> {
-    let sql =
-        format!("SELECT topic, sender, body, ts, mentions, id FROM messages WHERE {filter} ORDER BY id DESC LIMIT ?");
+    let sql = format!(
+        "SELECT topic, sender, body, ts, mentions, id, (SELECT reply_to FROM replies r WHERE r.id = messages.id) FROM messages WHERE {filter} ORDER BY id DESC LIMIT ?"
+    );
     let mut stmt = db.prepare(&sql)?;
     let rows = stmt.query_map(args, |r| {
         let mut entry = Map::new();
@@ -356,6 +381,9 @@ fn messages<P: Params>(db: &Connection, filter: &str, args: P, seq: bool) -> rus
         entry.insert("ts".into(), float(r.get(3)?));
         if let Some(m) = r.get::<_, Option<String>>(4)?.filter(|m| !m.is_empty()) {
             entry.insert("mentions".into(), loads(m.as_bytes()).unwrap_or(Value::Null));
+        }
+        if let Some(parent) = r.get::<_, Option<String>>(6)? {
+            entry.insert("reply_to".into(), parent.into());
         }
         if seq {
             entry.insert("seq".into(), r.get::<_, i64>(5)?.into());
@@ -503,6 +531,48 @@ mod tests {
             ask(&mut h, r#"{"op": "ping", "version": true}"#, None),
             json!({"ok": true, "service": "historyd", "version": env!("CARGO_PKG_VERSION")})
         );
+    }
+
+    /// reply_to rides in its own table: shown only when set and well formed, and never inherited by a later message
+    /// that gets a deleted row's id (a rollback historyd prunes messages without knowing the table).
+    #[test]
+    fn keeps_reply_to_beside_the_message() {
+        let dir = temp("replies");
+        let path = dir.join("h.db");
+        let mut h = History::open(&path, 86400).ok().expect("opens");
+        let m = |body: &str, reply_to: Option<&str>| {
+            let mut msg =
+                json!({"topic": "room/r", "from": "a-1", "body": body, "ts": 1.0}).as_object().cloned().unwrap();
+            if let Some(r) = reply_to {
+                msg.insert("reply_to".into(), r.into());
+            }
+            msg
+        };
+        let parent = "0123456789abcdef";
+        for (body, reply_to) in
+            [("plain", None), ("reply", Some(parent)), ("bad", Some("XYZ")), ("long", Some("0123456789abcdef0"))]
+        {
+            History::add(&h.db, &m(body, reply_to), 1.0, now()).expect("adds");
+        }
+        let entries = ask(&mut h, r#"{"op": "room", "room": "r"}"#, None)["messages"].clone();
+        let shown: Vec<(&str, Option<&str>)> = entries
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|e| (e["body"].as_str().unwrap_or_default(), e.get("reply_to").and_then(Value::as_str)))
+            .collect();
+        assert_eq!(shown, [("plain", None), ("reply", Some(parent)), ("bad", None), ("long", None)]);
+        // a rollback deletes the newest rows without touching replies; their ids come back for the next messages
+        h.db.execute("DELETE FROM messages WHERE body IN ('reply', 'bad', 'long')", []).expect("deletes");
+        History::add(&h.db, &m("after", None), 1.0, now()).expect("adds");
+        let after = ask(&mut h, r#"{"op": "room", "room": "r"}"#, None)["messages"].clone();
+        assert!(after.as_array().is_some_and(|a| a.iter().all(|e| e.get("reply_to").is_none())), "{after}");
+        h.db.execute("INSERT INTO replies VALUES (999, ?)", [parent]).expect("an orphan");
+        drop(h);
+        let h = History::open(&path, 86400).ok().expect("reopens");
+        let orphans: i64 =
+            h.db.query_row("SELECT count(*) FROM replies WHERE id=999", [], |r| r.get(0)).expect("counts");
+        assert_eq!(orphans, 0, "open sweeps replies without a message");
     }
 
     #[test]

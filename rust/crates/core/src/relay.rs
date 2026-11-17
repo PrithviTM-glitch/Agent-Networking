@@ -2,7 +2,8 @@
 //! live relay and holding its pid, then the address it relays for, then (from 0.3.0) its version. The console, the hooks and the CLI read it here;
 //! the relay itself is the CLI's `relay run`.
 
-use crate::validation::{ID_MAX, Result, check_session, is_ident, os_error};
+use crate::json::Map;
+use crate::validation::{Error, ID_MAX, Result, check_ident, check_session, is_ident, os_error};
 use crate::{config, presence};
 use serde_json::Value;
 use std::fs::{File, TryLockError};
@@ -34,6 +35,69 @@ fn lock_lines(session: &str) -> Vec<String> {
 pub fn held(session: &str) -> Option<String> {
     let lines = lock_lines(session);
     lines.get(1).filter(|a| is_ident(a, ID_MAX) && live(session)).cloned()
+}
+
+/// When a room's messages wake the session: "all" (default), "mentions" (only those that mention it, @all included,
+/// or come from admin), "admin" (only admin's). The rest still reach the session with its next wake. "admin" is the
+/// message's self-asserted sender, fine for deciding when to wake, never for trust.
+pub const WAKE_MODES: [&str; 3] = ["all", "mentions", "admin"];
+
+pub fn wake_path(session: &str) -> Result<PathBuf> {
+    config::data_path(&["relay", &format!("{}.wake", check_session(Some(session))?.to_lowercase())])
+}
+
+/// This session's wake filters, room -> mode, rooms without one waking on everything.
+pub fn wake_modes(session: &str) -> Result<Map> {
+    let path = wake_path(session)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(e) => return Err(os_error(&e, Some(&path))),
+    };
+    let rooms =
+        serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("rooms").and_then(Value::as_object).cloned());
+    // only well-formed entries count: a hand-edited file cannot make the relay misbehave
+    Ok(rooms
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(room, mode)| is_ident(room, ID_MAX) && mode.as_str().is_some_and(|m| WAKE_MODES[1..].contains(&m)))
+        .collect())
+}
+
+/// Set room's wake mode for session ("all" removes the entry) and return the filters now in force. The file is
+/// replaced whole (a temp file renamed over it), so the relay never reads half of it.
+pub fn set_wake(session: &str, room: &str, mode: &str) -> Result<Map> {
+    let room = check_ident(room, "room")?;
+    if !WAKE_MODES.contains(&mode) {
+        return Err(Error(format!("wake mode: one of {}, got {mode:?}", WAKE_MODES.join(", "))));
+    }
+    let mut rooms = wake_modes(session)?;
+    match mode {
+        "all" => drop(rooms.shift_remove(room)),
+        _ => drop(rooms.insert(room.to_owned(), mode.into())),
+    }
+    let path = wake_path(session)?;
+    let dir = path.parent().map(PathBuf::from).unwrap_or_default();
+    std::fs::create_dir_all(&dir).map_err(|e| config::data_error(&e, &dir))?;
+    let tmp = path.with_extension(format!("wake.{}", std::process::id()));
+    let body = crate::json::dumps(&serde_json::json!({ "rooms": rooms }));
+    std::fs::write(&tmp, body + "\n").and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        config::data_error(&e, &path)
+    })?;
+    Ok(rooms)
+}
+
+/// Whether a message wakes the session under modes: a room message by its room's mode, anything else always.
+pub fn wakes(modes: &Map, msg: &Map) -> bool {
+    let room = msg.get("topic").and_then(Value::as_str).and_then(|t| t.strip_prefix("room/"));
+    let from_admin = msg.get("from").and_then(Value::as_str) == Some(crate::validation::ADMIN);
+    let mentioned = msg.get("for_me") == Some(&Value::Bool(true));
+    match room.and_then(|r| modes.get(r)).and_then(Value::as_str) {
+        Some("mentions") => mentioned || from_admin,
+        Some("admin") => from_admin,
+        _ => msg.get("for_me") != Some(&Value::Bool(false)),
+    }
 }
 
 /// The live relay's version, from its lock file; None if it is not live or predates 0.3.0.
@@ -94,4 +158,34 @@ pub fn session_agent(session: &str) -> Result<Option<String>> {
                 && a.get("kind").is_none_or(|k| k != "subagent")
         })
         .and_then(|a| a["addr"].as_str().map(str::to_owned)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn msg(v: Value) -> Map {
+        v.as_object().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn wake_modes_decide_per_room() {
+        let modes = msg(json!({"mrs": "mentions", "noisy": "admin"}));
+        let room = |r: &str, from: &str, for_me: Option<bool>| {
+            let mut m = msg(json!({"topic": format!("room/{r}"), "from": from}));
+            if let Some(f) = for_me {
+                m.insert("for_me".into(), f.into());
+            }
+            wakes(&modes, &m)
+        };
+        // no filter: as before, everything but a mention of someone else
+        assert!(room("ops", "bob-1", None) && room("ops", "bob-1", Some(true)) && !room("ops", "bob-1", Some(false)));
+        assert!(!room("mrs", "bob-1", None), "mentions: a plain post waits");
+        assert!(room("mrs", "bob-1", Some(true)) && room("mrs", "admin", None), "a mention or admin wakes");
+        assert!(!room("noisy", "bob-1", Some(true)) && room("noisy", "admin", None), "admin: only admin wakes");
+        for topic in ["inbox/me-1", "broadcast", "ci/x"] {
+            assert!(wakes(&modes, &msg(json!({"topic": topic, "from": "bob-1"}))), "{topic} always wakes");
+        }
+    }
 }

@@ -405,6 +405,80 @@ def test_push():
     anyio.run(push)
 
 
+async def threads():
+    """0.3.1: replies by id (the same id from recv, history and dms), absent mentions, pins by a moderator, claims,
+    holders, and this session's relay wake filters."""
+    room = f"thr{RUN}"
+    sa, sb = str(uuid.uuid4()), str(uuid.uuid4())
+    async with server(sa, "thra") as a, server(sb, "thrb") as b:
+        addr_a, addr_b = (await call(a, "whoami"))["addr"], (await call(b, "whoami"))["addr"]
+        await call(a, "join", room=room)
+        await call(b, "join", room=room)
+        outsider = cli("register", "outsider")
+        said = await call(a, "say", room=room, text=f"question for @{addr_b}, not @{outsider} or @me")
+        assert said["mentions"] == [addr_b] and said["absent"] == [outsider], said
+        [q] = [m for m in await call(b, "recv", wait=5) if m["body"].startswith("question")]
+        assert len(q["id"]) == 16 and int(q["id"], 16) >= 0, q
+        await call(b, "say", room=room, text="answer", reply_to=q["id"])
+        [ans] = [m for m in await call(a, "recv", wait=5) if m["body"] == "answer"]
+        assert ans["reply_to"] == q["id"], ans
+        hist = {m["body"]: m for m in await call(a, "history", room=room, last=10)}
+        assert hist[q["body"]]["id"] == q["id"] and hist["answer"]["id"] == ans["id"], "one id on every path"
+        assert hist["answer"]["reply_to"] == q["id"] and "reply_to" not in hist[q["body"]]
+        await call(a, "dm", to=addr_b, text="psst")
+        [d] = [m for m in await call(b, "recv", wait=5) if m["body"] == "psst"]
+        await call(b, "dm", to=addr_a, text="ok", reply_to=d["id"])
+        [r] = [m for m in await call(a, "recv", wait=5) if m["body"] == "ok"]
+        assert r["reply_to"] == d["id"], r
+        assert [m["id"] for m in await call(b, "dms", peer=addr_a) if m["body"] == "psst"] == [d["id"]]
+        assert "bad reply_to" in await fails(b, "say", room=room, text="x", reply_to="not-an-id")
+
+        # Pins: admin and the room's moderators only.
+        assert await fails(a, "pin", room=room, text="digest"), "not a moderator"
+        admin = _native.Bus.register_admin()
+        try:
+            admin.mod(room, "add", addr_a)
+        finally:
+            admin.close()
+        pinned = (await call(a, "pin", room=room, text="## digest\n| MR | state |\n|---|---|\n| !1 | open |"))["pin"]
+        assert pinned["by"] == addr_a and pinned["text"].startswith("## digest"), pinned
+        assert (await call(b, "room_info", room=room))["pin"]["text"] == pinned["text"]
+        await call(a, "unpin", room=room)
+        assert (await call(b, "room_info", room=room))["pin"] is None
+
+        # Claims: one holder per key; the holder (or a moderator, or admin) releases.
+        got = (await call(b, "claim", room=room, key="APP-1", note="on it"))["claim"]
+        assert (got["holder"], got["note"], got["expires_at"]) == (addr_b, "on it", None), got
+        assert addr_b in await fails(a, "claim", room=room, key="APP-1"), "the refusal names the holder"
+        assert [(c["key"], c["holder"]) for c in (await call(a, "claims", room=room))["claims"]] == [("APP-1", addr_b)]
+        await call(a, "unclaim", room=room, key="APP-1")  # a moderator may
+        assert (await call(b, "claims", room=room))["claims"] == []
+        await bodies(b)  # ledgerd's DM that a released b's claim
+
+        # holders: any agent sees who holds a resource; a bare name is the caller's own.
+        await call(a, "add", name="hres", description="shared", visibility="public", max_level="write")
+        lease = (await call(a, "acquire", resource=f"{addr_a}/hres", level="write", ttl=30))["lease"]
+        seen = await call(b, "holders", resource=f"{addr_a}/hres")
+        assert [h["holder"] for h in seen["holders"]] == [addr_a] and seen["waiting"] == [], seen
+        assert (await call(a, "holders", resource="hres"))["holders"] == seen["holders"]
+        await call(a, "release", lease_id=lease["lease_id"])
+        await call(a, "remove", name="hres")
+
+        # Wake filters for this session's relay (stored per session; no relay needs to run).
+        assert (await call(a, "wake"))["wake"] == {}
+        assert (await call(a, "wake", room=room, mode="mentions"))["wake"] == {room: "mentions"}
+        assert (await call(a, "wake", room=room))["mode"] == "mentions"
+        assert (await call(a, "wake", room=room, mode="all"))["wake"] == {}
+        assert "mode needs a room" in await fails(a, "wake", mode="admin")
+        await call(a, "leave")
+        await call(b, "leave")
+    cli("leave", outsider)
+
+
+def test_threads():
+    anyio.run(threads)
+
+
 async def adopt():
     """Under a session the MCP server posts as the session's own agent, the one its relay delivers for: an agent the
     session registered through the CLI is adopted (so replies to it reach this server), with two the same one a relay

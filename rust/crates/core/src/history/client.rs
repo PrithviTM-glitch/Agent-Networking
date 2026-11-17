@@ -99,10 +99,24 @@ pub fn call_value(op: Value, as_: Option<Value>, fields: Map, timeout: f64) -> R
     call_over(&c, &own.0, &request::reply_topic("history", ""), op, as_, fields, timeout)
 }
 
+/// The reply's entries, each with its message id added (as recv computes it), when it has a sender and a ts.
 fn messages(reply: Map) -> Vec<Map> {
-    match reply.get("messages") {
+    let mut out: Vec<Map> = match reply.get("messages") {
         Some(Value::Array(items)) => items.iter().filter_map(|m| m.as_object().cloned()).collect(),
         _ => Vec::new(),
+    };
+    for m in &mut out {
+        with_id(m);
+    }
+    out
+}
+
+/// Add "id" (protocol::message_id) to a history entry that has a topic, a sender and a ts; others stay as they are.
+pub fn with_id(m: &mut Map) {
+    let field = |k: &str| m.get(k).and_then(Value::as_str);
+    if let (Some(topic), Some(from), Some(ts)) = (field("topic"), field("from"), m.get("ts").and_then(Value::as_f64)) {
+        let id = crate::protocol::message_id(topic, from, ts);
+        m.insert("id".into(), id.into());
     }
 }
 

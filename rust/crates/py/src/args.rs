@@ -33,6 +33,11 @@ pub fn text(value: &Bound<'_, PyAny>, what: &str) -> PyResult<String> {
     }
 }
 
+/// An optional str: None and Python None are absent, anything else must be a str.
+pub fn opt_text(value: Option<&Bound<'_, PyAny>>, what: &str) -> PyResult<Option<String>> {
+    value.filter(|v| !v.is_none()).map(|v| text(v, what)).transpose()
+}
+
 /// An identifier as check_ident sees it: anything but a str is "bad <what> <repr>: use 1-64 ...".
 pub fn ident(value: &Bound<'_, PyAny>, what: &str) -> PyResult<String> {
     ident_cap(value, what, ID_MAX)

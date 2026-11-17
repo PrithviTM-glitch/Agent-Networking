@@ -7,8 +7,9 @@ errors are one line on stderr with a non-zero exit.";
 
 const LONG_ABOUT: &str =
     "agent-bridge: the bus from the shell. Commands that return data print JSON, one object per line (recv one per
-message, so possibly none); register prints just the address, and keep, join, part, say, dm, sub, unsub, pub, leave
-and relay start print nothing when they succeed. Errors are one line on stderr with a non-zero exit.
+message, so possibly none); register prints just the address (with --json, its presence row), and keep, join, part,
+say, dm, sub, unsub, pub, leave, relay start and pin --clear print nothing when they succeed. Errors are one line on
+stderr with a non-zero exit.
 
 Names, addresses, rooms and caps: 1-64 ASCII letters, digits, _ or - (names at most 57, leaving room for the address
 suffix), at most 32 caps. TEXT: at most 64 KiB of UTF-8, and not empty or only whitespace for say and dm (a raw pub
@@ -71,6 +72,7 @@ pub enum RelayAction {
     Stop,
     Status,
     Restart,
+    Wake,
     Run,
 }
 
@@ -113,6 +115,9 @@ pub enum Cmd {
         /// a subagent's own agent: recorded under its parent session
         #[arg(long)]
         subagent: bool,
+        /// print the new agent's presence row as one JSON object (as agents prints it) instead of just the address
+        #[arg(long)]
+        json: bool,
     },
     /// delete your ledger, session, queued messages, presence and received DMs
     Leave {
@@ -159,6 +164,27 @@ pub enum Cmd {
         /// read the message from this file instead
         #[arg(long, value_name = "PATH", conflicts_with = "text")]
         file: Option<std::path::PathBuf>,
+        /// the id of the message this answers (as recv and history show it)
+        #[arg(long, value_name = "ID")]
+        reply_to: Option<String>,
+    },
+    /// pin a message at the top of a room, or clear it (admin or a moderator)
+    ///
+    /// The pin holds anything a room should keep in view (the format, a digest, lane facts), up to 64 KiB, with the
+    /// same TEXT, - and --file forms as say; room info shows it. Setting or clearing it posts a note to the room.
+    Pin {
+        #[arg(value_name = "MY_ADDR")]
+        addr: String,
+        room: String,
+        /// the pinned text, or - for stdin
+        #[arg(required_unless_present_any = ["file", "clear"], conflicts_with = "clear")]
+        text: Option<String>,
+        /// read the pinned text from this file instead
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["text", "clear"])]
+        file: Option<std::path::PathBuf>,
+        /// remove the room's pin
+        #[arg(long)]
+        clear: bool,
     },
     /// a room's settings: info ROOM, or set MY_ADDR ROOM --mode/--rules
     Room {
@@ -212,6 +238,9 @@ pub enum Cmd {
         /// read the message from this file instead
         #[arg(long, value_name = "PATH", conflicts_with = "text")]
         file: Option<std::path::PathBuf>,
+        /// the id of the message this answers (as recv and history show it)
+        #[arg(long, value_name = "ID")]
+        reply_to: Option<String>,
     },
     /// your direct messages, both directions
     ///
@@ -303,8 +332,8 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// this Claude Code session's relay into its inbox: start (the SessionStart hook), stop, status, restart; run PID
-    /// START is what start launches
+    /// this Claude Code session's relay into its inbox: start (the SessionStart hook), stop, status, restart, wake;
+    /// run PID START is what start launches
     ///
     /// status prints {"session", "live", "lock", "pid", "started", "uptime_s", "binary", "version"}; the last five
     /// are null while no relay is live, version is null for a relay older than 0.3.0, and binary ends in " (deleted)"
@@ -312,6 +341,13 @@ pub enum Cmd {
     /// has stopped, so its "live" is false: the state after the stop, not before it. restart stops this session's
     /// relay, starts it again on the installed binary and prints the line once it is live; it runs only inside the
     /// session, without --session. start prints nothing.
+    ///
+    /// wake [ROOM [all|mentions|admin]] sets when a room's messages wake the session: mentions wakes only on posts
+    /// that mention you (@all included) or come from admin, admin only on admin's; the rest wait for the next wake
+    /// and arrive with it. Without a mode it shows the filter, without a room all of them; "all" removes one. DMs
+    /// and broadcasts always wake. "admin" is the sender field, which nothing verifies yet: fine for waking, never
+    /// for trust. A relay from 0.3.1 on also restarts itself on the installed binary once an upgrade replaced its own
+    /// and it is idle.
     Relay {
         #[arg(default_value = "start")]
         action: RelayAction,
@@ -450,6 +486,42 @@ pub enum Cmd {
         /// how many events, 1-500, default 50
         #[arg(long, allow_negative_numbers = true)]
         last: Option<i64>,
+    },
+    /// ledger: claim KEY in ROOM (an issue id, a question) until you release it, it expires or you leave
+    ///
+    /// Refused while someone else holds it, naming them. Claiming your own again replaces its ttl and note. The
+    /// holder, a moderator of the room or admin can release it with unclaim.
+    Claim {
+        #[arg(value_name = "MY_ADDR")]
+        addr: String,
+        room: String,
+        key: String,
+        /// release it on its own after S seconds (at most 30 days)
+        #[arg(long, value_name = "S", allow_negative_numbers = true)]
+        ttl: Option<f64>,
+        /// one line, at most 200 characters, shown with the claim
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// ledger: release a claim (yours, or any in the room as its moderator or admin)
+    Unclaim {
+        #[arg(value_name = "MY_ADDR")]
+        addr: String,
+        room: String,
+        key: String,
+    },
+    /// ledger: the claims in a room, oldest first
+    Claims {
+        #[arg(value_name = "MY_ADDR")]
+        addr: String,
+        room: String,
+    },
+    /// ledger: who holds a resource and who waits for it
+    Holders {
+        #[arg(value_name = "MY_ADDR")]
+        addr: String,
+        /// a resource, by NAME (yours) or OWNER/NAME
+        resource: String,
     },
 }
 

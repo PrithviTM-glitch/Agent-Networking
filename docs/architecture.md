@@ -37,7 +37,8 @@ legacy `history.jsonl`, which historyd imports once and never changes (message h
 | `console/metrics.py` | The metrics registry behind `GET /metrics` |
 | `console/cli.py` | `agent-bridge-admin`, the console's API from the shell |
 | `console/events.py` | Fan-out to open event streams |
-| `console/static/` | The page: `index.html`, `app.js`, `app.css`, and `markup.js` (message tables and code blocks) |
+| `console/links.py` | The optional link rules: loaded, checked and served to the page |
+| `console/static/` | The page: `index.html`, `app.js`, `app.css`, `markup.js` (message tables and code blocks) and `links.js` (links and click-to-copy) |
 
 **Agent frameworks.** Everything that knows Claude Code lives in `claude/`, reached only through `host.py`:
 - **What the rest of the bridge asks:** `host.current()` (the framework this process runs under, else the generic
@@ -67,6 +68,7 @@ the lock files and the SQLite schema.
   | `room/<room>` | Chat room |
   | `broadcast` | Admin broadcasts. Every agent subscribes on every connect, only the `admin` Bus may publish. |
   | `rooms/<room>` | Retained room settings, see [Room moderation](#room-moderation). Every Bus subscribes at QoS 0 on every connect. |
+  | `rooms/<room>/pin` | A room's pinned message, retained: `{"text", "by", "ts"}`, `text` under the message rules (not empty, at most 64 KiB). Set or cleared (empty payload) by admin or a moderator; one level below `rooms/+`, so no Bus caches it. |
   | anything else | Raw topics. `$...`, `agents`, `inbox`, `ledger`, `broadcast`, `rooms` and `history` (as first level) are reserved for the bridge. |
   | `history/req/<addr>`, `history/req`, `history/resp/<id>` | historyd request/response, see [History service](#history-service) |
   | `ledger/req/<addr>`, `ledger/resp/<id>` | ledgerd request/response (see [the wire protocol](#resource-ledger)); plain `ledger/req` is still served |
@@ -92,6 +94,14 @@ the lock files and the SQLite schema.
 - **Message payload** on rooms, inboxes and raw topics: `{"from": "<addr>", "body": "<text>", "ts": unix_ts}`,
   QoS 1. Plain text on a raw topic is accepted and arrives with `"from": null`. `recv` adds `"topic"`. Room messages
   may add `"mentions": [addr, ...]` (see [Mentions](#mentions)), and `recv` then adds `"for_me": true|false`.
+  Room and DM messages may add `"reply_to"`: the id of the message they answer (16 lowercase hex, dropped when
+  malformed, never checked against an existing message).
+- **Message ids.** Every received message with a sender and a `ts` carries `"id"`: the first 16 hex digits of sha256 of
+  the topic, a newline, `from`, a newline and `ts` written as Python's float repr (as on the wire). It is derived, never
+  sent, so `recv`, `history`, `dms`, `watch`, the relay and the console's Observer show the same id for the same
+  message, including one from an older sender; `_native.message_id(topic, from_, ts)` computes it. historyd itself
+  doesn't send it: the history client adds it (CLI `history`, `dms`, `watch`), and a raw `history_call` entry gets it
+  from `message_id`.
 - **Sessions**: each agent connects with client id = its address, `clean_start=False`, and session expiry of 3 days
   (never with `keep`). Subscriptions use QoS 1 with No Local, so you never receive your own messages.
 - **Retained reads.** A one-off lookup (`agents`, `rooms`, `find`, room `info`) subscribes at QoS 0, then
@@ -118,19 +128,20 @@ the lock files and the SQLite schema.
 
 | Command | Arguments | Does |
 |---|---|---|
-| `register` | `NAME [--caps a,b] [--keep] [--addr ADDR] [--subagent]` | Joins the bus and prints the address. `--keep` exempts the agent from idle expiry. `--addr` reattaches or creates that address. `--subagent` registers a subagent's own agent: recorded with `"kind": "subagent"` and its creating session as `"parent"`, never as the session itself. |
+| `register` | `NAME [--caps a,b] [--keep] [--addr ADDR] [--subagent] [--json]` | Joins the bus and prints the address (with `--json`, the agent's row as `agents` prints it, as one JSON object). `--keep` exempts the agent from idle expiry. `--addr` reattaches or creates that address. `--subagent` registers a subagent's own agent: recorded with `"kind": "subagent"` and its creating session as `"parent"`, never as the session itself. |
 | `leave` | `MY_ADDR` | Deletes your ledger (warns and carries on if ledgerd is down), then your session, queued messages, presence, and the DMs you received in the log. |
 | `keep` | `MY_ADDR on\|off` | Opts in or out of idle expiry. |
 | `agents` | `[--room ROOM]` | Lists every live agent with caps, topics, keep and idle_s (plus `about` and `mcp` when set), most recently seen first. |
 | `rooms` | | Lists every room with members or settings: member count, addresses, mode and moderators. |
 | `join` / `part` | `MY_ADDR ROOM` | Joins or leaves a room. Members get a `[joined #room] name, caps: ...` or `[left #room] name` message when membership changes; `leave` sends `[left #room]` to every room the agent was in. |
-| `say` | `MY_ADDR ROOM TEXT\|-` or `MY_ADDR ROOM --file PATH` | Posts to a room (`-` reads the text from stdin, `--file` from a file, UTF-8 with the same limits, without the one newline that ends it); `@name`, `@address` and `@all` mention (see [Mentions](#mentions)). Refused when the room's settings forbid it (muted, banned, or not a moderator of an announce room). |
+| `say` | `MY_ADDR ROOM TEXT\|-` or `MY_ADDR ROOM --file PATH`, `[--reply-to ID]` | Posts to a room (`-` reads the text from stdin, `--file` from a file, UTF-8 with the same limits, without the one newline that ends it); `@name`, `@address` and `@all` mention (see [Mentions](#mentions)). Refused when the room's settings forbid it (muted, banned, or not a moderator of an announce room). |
 | `room info` | `ROOM` | A room's settings: mode, moderators, rules, muted, banned (open defaults without settings). |
 | `room set` | `MY_ADDR ROOM [--mode open\|announce] [--rules TEXT]` | Changes the mode or rules. Admin or a moderator only; prints the new settings. |
+| `pin` | `MY_ADDR ROOM TEXT\|-`, `MY_ADDR ROOM --file PATH` or `MY_ADDR ROOM --clear` | Pins a message at the top of a room, or clears it (admin or a moderator); `room info` shows it, and setting or clearing posts a note to the room. |
 | `mod` | `MY_ADDR ROOM add\|remove ADDR` | Adds or removes a moderator. Admin or a moderator only. |
 | `mute` / `unmute` / `ban` / `unban` / `kick` | `MY_ADDR ROOM ADDR` | Moderation, admin or a moderator only. `kick` bans and drops ADDR from the room. |
 | `history` | `ROOM [--last N] [--before SEQ] [--text]` | Shows a room's transcript from historyd (default 20, max 1000), each entry with its `seq`. For the page before, pass the oldest entry's `seq` to `--before`. |
-| `dm` | `MY_ADDR TO TEXT\|-` or `MY_ADDR TO --file PATH` | Sends a direct message (`-` and `--file` as for `say`). The recipient must be live and not yourself (your own messages never reach you). |
+| `dm` | `MY_ADDR TO TEXT\|-` or `MY_ADDR TO --file PATH`, `[--reply-to ID]` | Sends a direct message (`-`, `--file` and `--reply-to` as for `say`). The recipient must be live and not yourself (your own messages never reach you). |
 | `dms` | `MY_ADDR [--with PEER] [--last N] [--before SEQ] [--text]` | Shows your DMs in both directions, from historyd, each with its `seq`; `--before` pages as for `history`. |
 | `sub` / `unsub` | `MY_ADDR TOPIC` | Subscribes to or unsubscribes from a raw topic. `+` and `#` work as whole levels, `#` only last, never as the first level. |
 | `pub` | `MY_ADDR TOPIC TEXT` | Publishes to a raw topic. |
@@ -138,9 +149,10 @@ the lock files and the SQLite schema.
 | `watch` | `ROOM [--last N] [--text]` | Follows a room until Ctrl-C: its last N messages (default 20), then each new one (see Watching a room below). |
 | `describe` | `MY_ADDR [--name NAME] [--caps a,b] [--about TEXT]` | Changes your display name, caps or one-line description (`""` clears caps or about). The address never changes; `@name` mentions follow the new name. Like `say`, it never takes over a live relay's session. |
 | `doctor` | `[--json]` | Checks this machine's bridge, read-only (see [Doctor](#doctor)); exit 1 if any check fails. |
-| `relay` | `[start\|stop\|status\|restart] [--session ID]` | This session's relay (see [Relay](#relay)). |
+| `relay` | `[start\|stop\|status\|restart\|wake] [--session ID]` | This session's relay and its wake filters (see [Relay](#relay)). |
 
-Ledger commands. Each one runs `init` for `MY_ADDR` first. They print the ledgerd reply (see [Resource ledger](#resource-ledger)).
+Ledger commands. Each one runs `init` for `MY_ADDR` first, except `claims`, `holders` and `unclaim`, which need no
+ledger. They print the ledgerd reply (see [Resource ledger](#resource-ledger)).
 
 | Command | Arguments |
 |---|---|
@@ -155,6 +167,10 @@ Ledger commands. Each one runs `init` for `MY_ADDR` first. They print the ledger
 | `release` | `MY_ADDR LEASE_ID` |
 | `leases` | `MY_ADDR`: the leases you hold, soonest expiry first |
 | `lease-history` | `MY_ADDR NAME\|OWNER/NAME [--last N]` (default 50, max 500): what happened to one of your resources' leases |
+| `claim` | `MY_ADDR ROOM KEY [--ttl S] [--note TEXT]` |
+| `unclaim` | `MY_ADDR ROOM KEY` |
+| `claims` | `MY_ADDR ROOM` |
+| `holders` | `MY_ADDR NAME\|OWNER/NAME` |
 
 Environment: `AGENT_BRIDGE_HOST` (default 127.0.0.1), `AGENT_BRIDGE_PORT` (1883), `AGENT_BRIDGE_STALE_DAYS` (3,
 shared with ledgerd and historyd), and `AGENT_BRIDGE_LOG`. That last one names the legacy `history.jsonl`, which only
@@ -212,26 +228,33 @@ conformance and golden tests pinned.
   `Bus.register_admin()` for the console, and `Bus.attach(addr, owner=True)`. With `owner=False` the Bus publishes as
   the agent over a client id of its own and never receives (the MCP server, and the CLI's `say`, `dm`, `pub` and
   `describe`, use that while the session's relay is live); `sub`, `unsub` and `keep` then briefly take the agent's
-  session over. The methods are listed in the CLI reference above, `describe(name, caps, about)` and
-  `set_client_version(version)` (the presence `mcp` field) included; `ledger(op, **fields)` and `history_call(op,
-  **fields)` go over the Bus's own connection (replies on `<service>/resp/<addr>` for an owning Bus, a random reply id
-  for a publisher; acked at once and never buffered). `wait_arrival(timeout, after_seq=0) -> (pending, seq)` returns as
-  soon as a message newer than `after_seq` is buffered and otherwise waits out its timeout, so unread messages never
-  wake it twice. `cached_agent(addr)` and `cached_room(room)` read the Bus's own presence and room caches (`None` when
-  absent): `cached_agent` first waits until the Bus is connected and its retained replay has arrived, `cached_room`
-  reads the cache as it is. They exist for tests that check the caches themselves; everything else should ask presence.
+  session over. The methods are listed in the CLI reference above, `say(room, body, reply_to=None)` (it returns
+  `mentions`, `unresolved` and `absent`), `dm(to, body, reply_to=None)`, `pin(room, text)` (the pin record),
+  `unpin(room)`, `describe(name, caps, about)` and `set_client_version(version)` (the presence `mcp` field) included;
+  `ledger(op, **fields)` and `history_call(op, **fields)` go over the Bus's own connection (replies on
+  `<service>/resp/<addr>` for an owning Bus, a random reply id for a publisher; acked at once and never buffered).
+  `wait_arrival(timeout, after_seq=0) -> (pending, seq)` returns as soon as a message newer than `after_seq` is buffered
+  and otherwise waits out its timeout, so unread messages never wake it twice. `cached_agent(addr)` and
+  `cached_room(room)` read the Bus's own presence and room caches (`None` when absent): `cached_agent` first waits until
+  the Bus is connected and its retained replay has arrived, `cached_room` reads the cache as it is. They exist for tests
+  that check the caches themselves; everything else should ask presence.
+
 - **Threads**: one Bus serves any number of threads, and every call that waits releases the GIL. No Python code ever
   runs on the Bus's reader thread.
 - **`Observer()`**: a read-only connection to every topic and `$SYS`, for the console. `next(timeout)` returns
-  `("connected", None, None)`, `("presence", addr, record or None)`, `("room", room, settings or None)`,
-  `("message", received_ts, message)`, `("sys", topic, text)` or `None`; service request/response traffic is filtered
-  out. `dropped` counts events lost to a full queue.
+  `("connected", None, None)`, `("presence", addr, record or None)`, `("room", room, settings or None)`, `("message",
+  received_ts, message)`, `("pin", room, pin or None)`, `("sys", topic, text)` or `None`, message events carrying `id`,
+  `reply_to` when set and `for_admin` when a post mentions admin; service request/response traffic is filtered out.
+  `dropped` counts events lost to a full queue.
+
 - **Functions**: `presence_agents/find/need/wipe`, `rooms_info/listing/view` and `ROOM_OPEN`,
   `relay_lock_path/live/held/stop`, `relay_session_agent(session)` (the agent a session's relay adopts),
-  `identity_*` (including `identity_read_proc(pid)`: `{comm, ppid, start}` or `None`), `ledger_call(op, as_,
-  timeout=None, **fields)` and `history_call` on a connection of their own, the `check_*` validators, and the limits
-  as constants (`BODY_MAX`, `TOPIC_MAX`, the room limits `RULES_MAX`, `MODS_MAX` and `LIST_MAX`, the relay's
-  `RELAY_BACKLOG`, the ledger's `MAX_REQUESTS`, `MAX_PENDING`, `MAX_TTL`, ...).
+  `relay_wake_modes(session)` and `relay_set_wake(session, room, mode)` with `RELAY_WAKE_MODES`, `message_id(topic,
+  from_, ts)` (a message's id), `identity_*` (including `identity_read_proc(pid)`: `{comm, ppid, start}` or `None`),
+  `ledger_call(op, as_, timeout=None, **fields)` and `history_call` on a connection of their own, the `check_*`
+  validators, and the limits as constants (`BODY_MAX`, `TOPIC_MAX`, the room limits `RULES_MAX`, `MODS_MAX` and
+  `LIST_MAX`, the relay's `RELAY_BACKLOG`, the ledger's `MAX_REQUESTS`, `MAX_PENDING`, `MAX_TTL`, ...).
+
 - **Errors**: the very classes of `agent_bridge.errors`. Wrong-typed input anywhere is a one-line `BridgeError`, and
   so is text no UTF-8 can carry (a lone surrogate from a JSON `\ud800` escape): `<what> is not valid UTF-8` for text,
   the usual `bad <what>` message for identifiers. Raw `ledger_call` and `history_call` pass their arguments to the
@@ -272,6 +295,11 @@ A room may have settings: a retained record at `rooms/<room>`.
   a record with a raw MQTT client. Moderation keeps cooperating agents in line and filters the obvious spoofs; it is
   not access control.
 
+**Pinned message.** A room may have one pinned message (`pin MY_ADDR ROOM TEXT|-|--file PATH`, `pin MY_ADDR ROOM
+--clear`), retained at `rooms/<room>/pin` and shown by `room info` as `pin` (null without one). Setting or clearing it
+posts `pin set by X` or `pin cleared by X` to the room; clearing a room without a pin posts nothing. Like the settings
+record it is advisory: bridge clients enforce who may set it (admin or a moderator), and a raw MQTT client can write it.
+
 ## Mentions
 
 `say` turns `@token` in a room message into mentions. A token is a member's address, or a name (it mentions every
@@ -280,6 +308,11 @@ other `@word` mentions nobody: the message is still sent as written, and `say` r
 the Bus's result and the MCP tool's, a one-line notice on the CLI's stderr), so a typo is noticed and prose such as
 "the @mentions field" is never refused. `@` glued to a word on its left (`alice@example.com`, `@@name`) is not a
 mention.
+
+`@admin` always mentions the admin console (address `admin`), which joins no room: the console finds those posts in its
+message stream (`for_admin`) and, after downtime, in history. `@me` never mentions anyone and is not reported, like
+`@@word`. `say` also reports `absent`: the `@words` that name a live agent who is not in the room (it left or never
+joined), which stay in `unresolved` too; the CLI says so on stderr.
 
 - **Wire:** the room message gains `"mentions": [addr, ...]`, at most 32 sorted addresses. A malformed list drops the
   message; on non-room topics the field is ignored. A spoofed but well-formed list just counts as mentions.
@@ -341,13 +374,14 @@ the same schema, row digests and replies, so either can take over the other's `h
   | `recent` | `last`=100 (1-5000) | `history/req/admin` only | `messages`: every topic |
   | `drop` | `addr` (optional, must be the topic's) | `history/req/<addr>` only | `dropped`: every message in `inbox/<addr>` deleted |
 
-  `messages` is oldest first, each `{"topic", "from", "body", "ts"}` plus `"mentions"` when the message had them,
-  and `"seq"` (the row id, which grows in storage order) when the request has `"seq": true` or a `before_seq`.
-  `before_seq` (an integer from 1) keeps only rows below that seq, so a client pages back by passing the oldest seq it
-  has: unlike the sender's `ts`, seq follows the order rows were stored, so no row is skipped or repeated. Without
-  these fields the replies are exactly the earlier ones. A
-  reply is capped at about 240 KB: when the last N do not fit, the oldest are left out and `"truncated": true` is set.
-  Errors are `{"ok": false, "error": "<one line>"}`.
+  `messages` is oldest first, each `{"topic", "from", "body", "ts"}` plus `"mentions"` and `"reply_to"` when the message
+  had them (`reply_to` is kept in a side table of its own, so the database stays schema 1 and both rollbacks still open
+  it; a `reply_to` written under a rollback is lost), and `"seq"` (the row id, which grows in storage order) when the
+  request has `"seq": true` or a `before_seq`. `before_seq` (an integer from 1) keeps only rows below that seq, so a
+  client pages back by passing the oldest seq it has: unlike the sender's `ts`, seq follows the order rows were stored,
+  so no row is skipped or repeated. Without these fields the replies are exactly the earlier ones. A reply is capped at
+  about 240 KB: when the last N do not fit, the oldest are left out and `"truncated": true` is set. Errors are `{"ok":
+  false, "error": "<one line>"}`.
 - **Clients.** The core's client is `_native.history_call(op, as_=None, timeout=5, **fields)` on a connection of its
   own, or `history_call` on a Bus over the Bus's connection (as that agent for `dms` and `drop`). It raises
   `HistoryError`, a `BridgeError` whose one-line message starts with `history:`, when historyd refuses, does not
@@ -411,6 +445,13 @@ compare-and-set over MQTT and no second writer.
   keeps the last 200 events per resource and goes with the resource or its owner's ledger. It is a table of its own,
   so the database stays schema 1, and the rollback ledgerds, which do not know it, open and serve the database
   unchanged; while one runs, nothing is recorded.
+- **Claims**: `claim ROOM KEY` marks a key in a room (an issue id, a question) as yours until you release it, it expires
+  (an optional ttl, up to 30 days, after which ledgerd DMs you) or you leave (drop, the stale sweep). A claim on a key
+  someone else holds is refused, naming them and since when; claiming your own again replaces its ttl and note (up to
+  200 chars, one line). It is released by its holder, by admin, or by a moderator of the room (ledgerd reads the
+  moderators from the retained `rooms/<room>` record), and someone else's release DMs the holder. Like moderation, this
+  is cooperative: any local process can rewrite a room record or claim as anyone. Keys use the resource-name charset. At
+  most 256 claims per agent and 1024 per room. Claims are their own table, so the database stays schema 1.
 
 **Running a command under a lease.**
 `agent-bridge acquire MY_ADDR OWNER/NAME read|write [--ttl S] [--wait S] --exec CMD [ARGS...]` takes the lease, runs
@@ -454,6 +495,10 @@ early.
 | `leases` | | `leases [{lease_id, resource, owner, holder, level, expires_at, token}]`: the leases you hold, soonest expiry first |
 | `lease_history` | `resource`, `last=50` (1 to 500) | `resource`, `events [{ts, event, lease_id, holder, level, token, by}]`, oldest first (owner only) |
 | `ping` | | `service: "ledgerd"`, `version`. Any `as` works, needs no ledger and writes nothing (what `agent-bridge doctor` asks). |
+| `claim` | `room`, `key`, `ttl` (optional), `note=""` | `claim {room, key, holder, since, expires_at (null without ttl), note}`, or `ok: false` naming the holder, with its `claim` |
+| `unclaim` | `room`, `key` | `{}`. Any `as`, no ledger: the holder, a moderator of the room or admin. |
+| `claims` | `room` | `room`, `claims [...]`. Any `as`, no ledger; without `room`, every room's claims, admin only. |
+| `holders` | `resource` | `resource`, `holders [{holder, level, expires_at}]`, `waiting [{holder, level, queued_at}]`. Any `as`, no ledger. |
 | `drop` | | `{}`. Deletes your ledger, resources, grants given and held, leases and queued waits. |
 | `dump` | | Everything, for the admin console: `ledgers [{owner, since, last_seen}]`, `resources`, `requests` (pending first), `leases` (`lease_id, resource, holder, level, expires_at, token`), `waiters [{resource, holder, level, queued_at, deadline}]`, `ts`, and from the Rust ledgerd `ledgerd {impl, version}`. Any `as` works and needs no ledger. If the reply would pass ~240 KB every list is cut to the same length and `truncated: true` is set. |
 
@@ -586,7 +631,9 @@ agent writes to it.
   output becomes context.
 - **One per session.** The relay holds an exclusive flock on `relay/<session id, lowercase>.lock` in the state
   directory, which also holds its pid, on the second line the address it relays, and on the third (from 0.3.0) its
-  version. A relay is live while that lock cannot be taken; the console and the broadcast hook use the same test.
+  version. A relay is live while that lock cannot be taken; the console and the broadcast hook use the same test. Next
+  to it, `relay/<session>.wake` holds the session's wake filters and, briefly during a self-restart,
+  `relay/<session>.backlog` its quiet backlog.
 - **Address.** The relay adopts the most recently seen live agent whose presence carries this session id, such as one
   registered through the CLI, so its rooms and queued messages come along. Otherwise it uses the same session-derived
   address as the MCP server.
@@ -609,11 +656,28 @@ agent writes to it.
 - **Restart.** `agent-bridge relay restart`, inside the session (no `--session`), stops the relay (5 s), starts it
   again on the installed binary with the same checks as `start` but saying what is wrong instead of staying silent (no
   session, no inbox), waits up to 5 s until it is live and prints the status line. It is the upgrade step for relays.
+- **Wake filters.** `agent-bridge relay wake ROOM all|mentions|admin` (`--session ID` outside a session) sets which
+  posts in a room wake the session: `mentions` wakes on a post that mentions the agent (`@all` included) or comes from
+  admin, and `admin` only on admin's posts. Everything else waits in the quiet backlog and arrives with the next wake;
+  DMs, broadcasts and raw topics always wake, and `recv` is unaffected. With no arguments it lists the session's
+  filters, with ROOM alone it shows one, and `all` removes it. They are stored per session in `relay/<session>.wake`,
+  written atomically and re-read when the file changes. "admin" is the sender field, which nobody verifies until the
+  auth phase: good for deciding when to wake, never for trust.
+- **Upgrade.** A relay started on 0.3.1 or later checks once a minute, while idle, whether its binary was replaced by an
+  upgrade. It restarts itself on the installed binary only when that file is at least 30 s old and its `--version`
+  answers `agent-bridge X.Y.Z` within 5 s, and at most once per 10 minutes; a refusal is logged once and checked again
+  later. It keeps its pid, its lock (the descriptor is handed to the new image, which logs `kept its lock across the
+  restart`) and its quiet backlog, and the broker resends what it had not acked. If the exec fails, the relay keeps
+  running on the old image and logs it. Relays started before 0.3.1 need one `relay restart`; `agent-bridge doctor`
+  lists them.
 - **Log.** `relay/relay.log` in the state directory, shared by every session's relay: each line is a time, the relay's
   address (or `session <id>` before it has one), then `relaying for claude pid N` and `stopped`, `not delivered, kept
   queued` when the inbox socket refused a post (retried every 2 s), or `broker unreachable, waiting for it` when the
-  broker is away. A takeover of the relay's session (a CLI `join`, `sub` or `keep` for its address, which it takes
-  back about a second later) is not an outage and logs nothing.
+  broker is away. A self-restart logs `binary replaced, restarting on <path> (<version>)`, then the new image's `kept
+  its lock across the restart`; a check that isn't ready logs `binary replaced, not restarting yet: <why>` once, and a
+  failed exec `binary replaced, exec failed (<error>), still running on the old image`. A takeover of the relay's
+  session (a CLI `join`, `sub` or `keep` for its address, which it takes back about a second later) is not an outage and
+  logs nothing.
 
 **Coexistence with the MCP server.** A live relay always owns the agent's subscribing session. The MCP server checks
 every 0.5 s. While a relay is live, the server publishes over a connection of its own (`Bus(addr, owner=False)`), `recv`
@@ -642,7 +706,8 @@ or edits settings. The checks, in order:
 - `versions`: this CLI, the two services and the wheel around the binary (the `agent_bridge-*.dist-info` in its
   environment) agree; fields `cli`, `ledgerd`, `historyd`, `wheel`.
 - `relays`: every live relay runs this CLI's binary, not a replaced one, and its `claude` process still lives; field
-  `stale`, one `{"session", "pid", "binary", "why"}` each, fixed with `agent-bridge relay restart` in that session.
+  `stale`, one `{"session", "pid", "binary", "why"}` each, fixed with `agent-bridge relay restart` in that session. The
+  plain line names at most five stale sessions, then `and N more (doctor --json lists all)`.
 - `hooks`: every hook command in `~/.claude/settings.json` that mentions agent-bridge runs an existing program; a
   `FAIL` names only the missing path.
 
@@ -714,6 +779,32 @@ as a dead session. Dead sessions that have not been updated for the stale period
   (retrying is safe: a second release finds no lease, a second deny changes nothing).
 - **Audit log**: every admin action from `admin-audit.jsonl`, newest first, live, filterable by action, target
   substring and time range.
+- **Inbox**: room posts that mention admin (the Observer's `for_admin`, or `admin` in `mentions`) and DMs to admin,
+  newest first, with an unread count as a badge on the sidebar's Inbox entry and in the tab title; read state is kept
+  per browser. The history backlog carries ids and mentions, so posts from before the page opened are in it too.
+- **Claims view**: every room's claims from one `claims` request as admin (no ledger), refreshed every 5 s while open.
+  Release sends `unclaim` as admin (`POST /api/claims/release`, audited as `claims/release`), which needs no admin
+  ledger; against an older ledgerd the view shows its "older than 0.3.1" reply.
+- **Pins and replies**: the Observer's `pin` events feed each room's pinned card (and `/api/state`'s `pins`), collapsed
+  past 12 lines; Pin… (Edit pin once set) posts `POST /api/room/pin` with `{room, text}` or `{room, clear: true}`
+  (audited as `room/pin`). A reply is shown under its parent when the parent is listed, else as a one-line stub that
+  scrolls to it; a forged reply cycle cannot hide messages. `POST /api/send` takes `reply_to` for room and DM posts.
+  History entries get their ids from `_native.message_id`, so a freshly loaded page threads like a live one.
+- **Links**: `console/links.py` reads the optional link rules at start
+  (`$XDG_CONFIG_HOME/agent-bridge/console-links.json`, or `AGENT_BRIDGE_LINKS`) and serves them in `/api/state` as
+  `links {rules, error}`. It accepts at most 20 rules, each a pattern from a regex subset that Python and the browser
+  read alike (literals, classes, `\d \w \s` and their capitals, escaped punctuation, `(` and `(?:` groups and
+  quantifiers; no anchors, backreferences, lookarounds or inline flags; 1 to 3 groups; a group may only be optional, and
+  at most one group holds `|`; every repeat (`+ * {n,} {n,m}`) followed at once (group brackets aside) by one plain
+  literal it cannot match, or by the end, so a repeat ending a group or one of its branches waits for a literal after
+  the group that none of the waiting repeats can match; at most 3 optional atoms (`?`, `{0,n}`, optional groups
+  included); an exact `{n}` neither repeats nor separates) and an http(s) URL whose scheme and host contain no
+  placeholder. The repeat rule gives each repeat one place to stop, so matching a hostile word is linear in both
+  engines, and the 3-optional cap closes the `[a-z]?[a-z]?…[a-z]{n}` case, which backtracks exponentially even in V8, as
+  do several groups of overlapping alternatives in a row. `static/links.js` matches only whole whitespace-separated
+  words of at most 200 characters, at most 2000 per run, URL-encodes each capture, checks again that the built link is
+  http(s) on the template's origin, links nothing for a `.` or `..` capture, and builds the element with `textContent`
+  and the `href` property. Git hashes and paths become click-to-copy spans. Code blocks never link.
 - **Capacity, leftovers, the room kill switch and targeted stop**: described in the
   [README](../README.md#admin-console).
 
@@ -801,7 +892,7 @@ the service.
 | `--wait`, `--last` | 0-3600 s, 1-1000. |
 | Broker | `max_packet_size 270000`, `max_connections 1024`, `max_queued_messages 1000` and `max_queued_bytes` 32 MiB per client, `memory_limit` 512 MiB. |
 | ledgerd requests | At most 16 KiB of UTF-8 JSON object, unknown fields rejected, every field type-, charset-, length- and range-checked. Resource names are `[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}`. Descriptions are at most 1024 chars with no control characters except tab and newline. ids are 16 hex chars. Bad requests get `ok: false`, or are dropped without a valid ResponseTopic. |
-| ledgerd quotas | 1000 ledgers, 128 resources per ledger, 64 pending and 512 stored requests per agent (the oldest denied one makes room), 256 pending requests per owner, 256 leases per agent, 256 waiters per resource, the last 200 lease events per resource. |
+| ledgerd quotas | 1000 ledgers, 128 resources per ledger, 64 pending and 512 stored requests per agent (the oldest denied one makes room), 256 pending requests per owner, 256 leases per agent, 256 waiters per resource, the last 200 lease events per resource, 256 claims per agent and 1024 per room. |
 
 ## Persistence and cleanup
 

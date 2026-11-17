@@ -10,7 +10,7 @@ use crate::protocol::{BROADCAST, parse_message, parse_presence};
 use crate::request::Replies;
 use crate::validation::{
     ADMIN, Error, ID_MAX, NAME_MAX, Result, TOPICS_MAX, check_about, check_body, check_caps, check_ident,
-    check_ident_cap, check_message, check_topic, check_wait, fail, is_ident, is_version, not_admin,
+    check_ident_cap, check_message, check_reply_to, check_topic, check_wait, fail, is_ident, is_version, not_admin,
 };
 use crate::{config, history, identity, ledger, presence, rooms};
 use serde_json::Value;
@@ -28,11 +28,13 @@ type Deliver<'a> = &'a mut dyn FnMut(&[Map]) -> Result<()>;
 /// Every method takes &self, so one Bus serves several threads at once, and no call holds a lock while it waits on
 /// the broker or for messages, with one exception: the calls that rewrite the agent's presence (sub, unsub, join,
 /// part, keep, touch) take turns on `writing` across their broker round trip, so concurrent ones never lose a topic.
-/// What say sent: the addresses it mentioned, and the @words that matched no member (sent as plain text).
+/// What say sent: the addresses it mentioned, the @words that matched no member (sent as plain text), and those of
+/// them that name a live agent who is not in the room.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Said {
     pub mentions: Vec<String>,
     pub unresolved: Vec<String>,
+    pub absent: Vec<String>,
 }
 
 pub struct Bus {
@@ -458,12 +460,19 @@ impl Bus {
     }
 
     fn send(&self, topic: &str, body: &str, mentions: Option<Vec<String>>) -> Result<()> {
+        self.send_reply(topic, body, mentions, None)
+    }
+
+    fn send_reply(&self, topic: &str, body: &str, mentions: Option<Vec<String>>, reply_to: Option<&str>) -> Result<()> {
         let mut entry = Map::new();
         entry.insert("from".into(), self.addr.clone().into());
         entry.insert("body".into(), check_body(body)?.into());
         entry.insert("ts".into(), float(now()));
         if let Some(m) = mentions.filter(|m| !m.is_empty()) {
             entry.insert("mentions".into(), m.into());
+        }
+        if let Some(parent) = reply_to {
+            entry.insert("reply_to".into(), parent.into());
         }
         self.ready()?;
         // historyd records it from the bus
@@ -684,28 +693,40 @@ impl Bus {
     /// relays wake for it, other relays keep it quiet. @all mentions nobody in particular, like no mention. Any other
     /// @word is sent as plain text and returned in `unresolved`, so the caller can say it mentioned nobody.
     pub fn say(&self, room: &str, body: &str) -> Result<Said> {
+        self.say_replying(room, body, None)
+    }
+
+    /// say, as a reply to the message whose id is reply_to (16 hex digits, as recv and history show it).
+    pub fn say_replying(&self, room: &str, body: &str, reply_to: Option<&str>) -> Result<Said> {
         self.ready()?;
         let room = check_ident(room, "room")?;
+        let reply_to = reply_to.map(check_reply_to).transpose()?;
         if let Some(why) = rooms::refusal(self.room_rec(room).as_ref(), &self.addr) {
             return fail(format!("you may not post in #{room}: {why}"));
         }
-        let (mut mentions, mut unresolved) = (None, Vec::new());
+        let mut resolved = rooms::Resolved::default();
         if !rooms::mention_tokens(check_message(body)?).is_empty() {
-            let members: Vec<(String, Map)> = {
-                let c = self.shared.lock();
-                c.agents
-                    .iter()
-                    .filter(|(_, r)| presence::in_room(r, room))
-                    .map(|(a, r)| (a.clone(), r.clone()))
-                    .collect()
-            };
-            (mentions, unresolved) = rooms::mentions(body, &members)?;
+            // the room's members, and every other live agent (to tell a sender who is not in the room)
+            let agents: Vec<(String, Map)> =
+                self.shared.lock().agents.iter().map(|(a, r)| (a.clone(), r.clone())).collect();
+            let (members, live): (Vec<_>, Vec<_>) = agents.into_iter().partition(|(_, r)| presence::in_room(r, room));
+            resolved = rooms::mentions(body, &members, &live)?;
         }
-        self.send(&format!("room/{room}"), body, mentions.clone())?;
-        Ok(Said { mentions: mentions.unwrap_or_default(), unresolved })
+        self.send_reply(&format!("room/{room}"), body, resolved.mentions.clone(), reply_to)?;
+        Ok(Said {
+            mentions: resolved.mentions.unwrap_or_default(),
+            unresolved: resolved.unresolved,
+            absent: resolved.absent,
+        })
     }
 
     pub fn dm(&self, to: &str, body: &str) -> Result<()> {
+        self.dm_replying(to, body, None)
+    }
+
+    /// dm, as a reply to the message whose id is reply_to.
+    pub fn dm_replying(&self, to: &str, body: &str, reply_to: Option<&str>) -> Result<()> {
+        let reply_to = reply_to.map(check_reply_to).transpose()?;
         check_message(body)?;
         let to = check_ident(to, "address")?;
         if to == self.addr {
@@ -714,7 +735,7 @@ impl Bus {
         if self.seen(to)?.is_none() {
             return fail(format!("unknown recipient: {to}"));
         }
-        self.send(&format!("inbox/{to}"), body, None)
+        self.send_reply(&format!("inbox/{to}"), body, None, reply_to)
     }
 
     pub fn publish(&self, topic: &str, body: &str) -> Result<()> {
@@ -831,6 +852,40 @@ impl Bus {
             self.send(&format!("room/{room}"), &format!("{note} by {}", self.addr), None)?;
         }
         Ok(rooms::view(room, Some(&rec)))
+    }
+
+    /// Pin text (the message rules: not empty, at most 64 KiB) as room's pinned message, replacing any; admin or a
+    /// moderator only. Posts "pin set by <this address>" to the room and returns the pin {"text", "by", "ts"}.
+    pub fn pin(&self, room: &str, text: &str) -> Result<Map> {
+        let room = self.may_pin(room)?;
+        let mut pin = Map::new();
+        pin.insert("text".into(), check_message(text)?.into());
+        pin.insert("by".into(), self.addr.clone().into());
+        pin.insert("ts".into(), float(now()));
+        broker::publish(&self.conn(), &rooms::pin_topic(room), dumps_map(&pin), true, None)?;
+        self.send(&format!("room/{room}"), &format!("pin set by {}", self.addr), None)?;
+        Ok(pin)
+    }
+
+    /// Clear room's pinned message; admin or a moderator only. Posts "pin cleared by <this address>" if there was one.
+    pub fn unpin(&self, room: &str) -> Result<()> {
+        let room = self.may_pin(room)?;
+        let topic = rooms::pin_topic(room);
+        let had = broker::retained(&[&topic])?.iter().any(|(_, p)| rooms::parse_pin(p).is_some());
+        broker::publish(&self.conn(), &topic, bytes::Bytes::new(), true, None)?;
+        if had {
+            self.send(&format!("room/{room}"), &format!("pin cleared by {}", self.addr), None)?;
+        }
+        Ok(())
+    }
+
+    fn may_pin<'a>(&self, room: &'a str) -> Result<&'a str> {
+        let room = check_ident(room, "room")?;
+        self.ready()?;
+        if !rooms::is_moderator(self.room_rec(room).as_ref(), &self.addr) {
+            return fail(format!("only admin or a moderator of #{room} may pin its message"));
+        }
+        Ok(room)
     }
 
     /// Change a room's mode ("open" or "announce") and/or its rules text; admin or a moderator only.

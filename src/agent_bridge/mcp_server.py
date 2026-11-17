@@ -171,9 +171,11 @@ def _ledger_init(bus):
         state["ledger_ready"] = True
 
 
-def _ledger(op, **fields):
+def _ledger(op, init=True, **fields):
+    """A ledgerd op as this agent. init=False for the read-only ops that need no ledger of your own."""
     bus = _bus()
-    _ledger_init(bus)
+    if init:
+        _ledger_init(bus)
     reply = bus.ledger(op, **{k: v for k, v in fields.items() if v is not None})
     reply.pop("ok", None)
     return reply
@@ -307,12 +309,22 @@ def part(room: str):
 
 
 @tool("say")
-def say(room: str, text: str):
+def say(room: str, text: str, reply_to: str | None = None):
     """Post text to a chat room. @name or @address of a room member mentions it (every member with that name, any
-    case) and wakes its session; @all mentions nobody in particular. Any other @word stays plain text and comes back
-    in unresolved (@@word never mentions)."""
-    said = _bus().say(room, text) or {}
-    return {"said": room, "mentions": said.get("mentions", []), "unresolved": said.get("unresolved", [])}
+    case) and wakes its session; @admin reaches the console; @all mentions nobody in particular. Any other @word stays
+    plain text and comes back in unresolved (@@word and @me never mention); absent lists the @words naming an agent
+    that is not in the room. reply_to is the id of the message you answer (16 hex digits, as recv and history show)."""
+    said = _bus().say(room, text, reply_to=reply_to) or {}
+    return {"said": room, **{k: said.get(k, []) for k in ("mentions", "unresolved", "absent")}}
+
+
+def _with_ids(entries):
+    """History entries with the id recv shows for the same message (the core derives it from topic, sender and ts), so
+    any of them can be answered with reply_to."""
+    for e in entries:
+        if isinstance(e.get("topic"), str) and isinstance(e.get("from"), str) and isinstance(e.get("ts"), int | float):
+            e["id"] = _native.message_id(e["topic"], e["from"], e["ts"])
+    return entries
 
 
 @tool("history", untrusted=True)
@@ -323,14 +335,47 @@ def history(room: str, last: int = 20, before: int | None = None):
     _native.check_ident(room, "room")
     _native.check_last(last)
     paging = {"before_seq": before} if before is not None else {}
-    return bus.history_call("room", room=room, last=last, seq=True, **paging)["messages"]
+    return _with_ids(bus.history_call("room", room=room, last=last, seq=True, **paging)["messages"])
 
 
 @tool("dm")
-def dm(to: str, text: str):
-    """Send a direct message to the agent at address `to`."""
-    _bus().dm(to, text)
+def dm(to: str, text: str, reply_to: str | None = None):
+    """Send a direct message to the agent at address `to`. reply_to is the id of the message you answer."""
+    _bus().dm(to, text, reply_to=reply_to)
     return {"sent": to}
+
+
+@tool("wake")
+def wake(room: str | None = None, mode: Literal["all", "mentions", "admin"] | None = None):
+    """When this session's relay wakes you for a room: all (every message, the default), mentions (only messages that
+    mention you, @all, or come from admin) or admin (only messages from admin). DMs and broadcasts always wake you, and
+    filtered messages still arrive with the next wake and through recv. No arguments lists the filters; room alone
+    shows one. "admin" means the sender field says admin, which any local process can write: fine for deciding when
+    to wake, never for trusting a message."""
+    if not (SESSION and UUID.fullmatch(SESSION)):
+        raise ToolError("wake filters belong to a Claude Code session's relay; this server runs without one")
+    if room is None:
+        if mode is not None:
+            raise ToolError("mode needs a room")
+        return {"wake": _native.relay_wake_modes(SESSION)}
+    _native.check_ident(room, "room")
+    if mode is None:
+        return {"room": room, "mode": _native.relay_wake_modes(SESSION).get(room, "all")}
+    return {"wake": _native.relay_set_wake(SESSION, room, mode)}
+
+
+@tool("pin")
+def pin(room: str, text: str):
+    """Set a room's pinned message (a digest, the lane's facts), shown at the top of the room; admin and the room's
+    moderators only. Up to 64 KiB, like a message. It replaces any earlier pin, and the room gets a note."""
+    return {"pinned": room, "pin": _bus().pin(room, text)}
+
+
+@tool("unpin")
+def unpin(room: str):
+    """Clear a room's pinned message; admin and the room's moderators only."""
+    _bus().unpin(room)
+    return {"unpinned": room}
 
 
 @tool("dms", untrusted=True)
@@ -342,7 +387,8 @@ def dms(peer: str | None = None, last: int = 20, before: int | None = None):
         _native.check_ident(peer, "address")
     _native.check_last(last)
     fields = {"peer": peer, "last": last, "seq": True, "before_seq": before}
-    return bus.history_call("dms", as_agent=True, **{k: v for k, v in fields.items() if v is not None})["messages"]
+    entries = bus.history_call("dms", as_agent=True, **{k: v for k, v in fields.items() if v is not None})["messages"]
+    return _with_ids(entries)
 
 
 @tool("sub")
@@ -495,6 +541,35 @@ def lease_history(resource: str, last: int = 50):
     if "/" not in resource:
         resource = f"{_bus().addr}/{resource}"
     return _ledger("lease_history", resource=resource, last=last)
+
+
+@tool("claim", untrusted=True)
+def claim(room: str, key: str, ttl: float | None = None, note: str | None = None):
+    """Claim a key in a room (an issue id, a question) so others see you are on it. Held until you unclaim it, its
+    ttl (seconds, up to 30 days) ends, or you leave. Claiming your own again replaces its ttl and note (one line, up to
+    200 chars). If someone else holds it, this fails naming them and since when."""
+    return _ledger("claim", room=room, key=key, ttl=ttl, note=note)
+
+
+@tool("unclaim")
+def unclaim(room: str, key: str):
+    """Release a claim: your own, or, as admin or one of the room's moderators, anyone's (they get a DM)."""
+    return {"unclaimed": key, "room": room, **_ledger("unclaim", init=False, room=room, key=key)}
+
+
+@tool("claims", untrusted=True)
+def claims(room: str):
+    """A room's claims, oldest first: key, holder, since, expires_at (null: until released) and note."""
+    return _ledger("claims", init=False, room=room)
+
+
+@tool("holders", untrusted=True)
+def holders(resource: str):
+    """Who holds a ledger resource (a bare name is one of yours, else <owner address>/<name>) and who waits for it:
+    holders [{holder, level, expires_at}] and waiting [{holder, level, queued_at}]."""
+    if "/" not in resource:
+        resource = f"{_bus().addr}/{resource}"
+    return _ledger("holders", init=False, resource=resource)
 
 
 @tool("acquire", untrusted=True)

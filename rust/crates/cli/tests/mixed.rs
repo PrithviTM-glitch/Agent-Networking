@@ -220,6 +220,11 @@ fn relayed(w: &World, session: &str) -> (Killed, i32) {
 /// relayed, with exe as the agent-bridge that starts the relay. The fake claude then runs each line written to its
 /// stdin as a shell command, so a command can run inside the session (as its child).
 fn relayed_by(w: &World, session: &str, exe: &Path) -> (Killed, i32) {
+    relayed_with(w, session, exe, &[])
+}
+
+/// relayed_by, with extra environment for the fake claude and so for its relay.
+fn relayed_with(w: &World, session: &str, exe: &Path, env: &[(&str, &str)]) -> (Killed, i32) {
     let claude = w.dir.join("claude");
     if !claude.exists() {
         std::fs::copy("/bin/sh", &claude).expect("a fake claude");
@@ -228,6 +233,7 @@ fn relayed_by(w: &World, session: &str, exe: &Path) -> (Killed, i32) {
     fake.args(["-c", &format!("{} relay start; while read -r c; do eval \"$c\"; done", exe.display())])
         .env("CLAUDE_CODE_SESSION_ID", session)
         .env("CLAUDE_CODE_MESSAGING_SOCKET", w.dir.join("inbox.sock"))
+        .envs(env.iter().copied())
         .stdin(Stdio::piped());
     let fake = Killed(fake.spawn().expect("the fake claude runs"));
     let lock = w.dir.join("relay").join(format!("{session}.lock"));
@@ -391,6 +397,224 @@ fn doctor_and_relay_restart_see_what_a_relay_runs() {
     assert_eq!(code, Some(0), "{checks:?}");
     assert_eq!(checks["relays"]["status"], "ok", "{}", checks["relays"]);
     assert_eq!(checks["relays"]["detail"], "1 current");
+}
+
+/// A relay whose binary an upgrade replaced restarts itself on the new one once idle: same pid, its lock held
+/// throughout, never on a binary that changed in the last 30 s, and its log says why it waits.
+#[test]
+#[ignore = "needs Docker"]
+fn a_relay_restarts_itself_on_an_upgraded_binary() {
+    let w = start();
+    let session = "c3d4e5f6-0718-4293-a4b5-c6d7e8f90a1b";
+    let bin = w.dir.join("tool").join("agent-bridge");
+    std::fs::create_dir_all(bin.parent().expect("a dir")).expect("a dir");
+    std::fs::copy(RUST, &bin).expect("the installed binary");
+    let (_fake, pid) = relayed_with(&w, session, &bin, &[("AGENT_BRIDGE_RELAY_UPGRADE_CHECK", "1")]);
+    let status = || json_lines(&w.run(&["relay", "status", "--session", session]).stdout).remove(0);
+    // the upgrade: a new file at the same path, as uv tool install --force leaves it
+    std::fs::remove_file(&bin).expect("the old binary goes");
+    std::fs::copy(RUST, &bin).expect("the new binary");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !relay_log(&w).contains("changed less than 30 s ago") {
+        assert!(Instant::now() < deadline, "the relay never noticed the fresh binary\n{}", relay_log(&w));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(status()["pid"], pid, "it waits while the install may still be writing");
+    let settled = Command::new("touch").args(["-d", "-1 minute"]).arg(&bin).status().expect("touch runs");
+    assert!(settled.success());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let row = status();
+        assert_eq!(row["live"], true, "the lock is held throughout\n{}", relay_log(&w));
+        if row["binary"] == bin.display().to_string() {
+            assert_eq!(row["pid"], pid, "exec keeps the process");
+            assert_eq!(row["version"], env!("CARGO_PKG_VERSION"));
+            break;
+        }
+        assert!(Instant::now() < deadline, "the relay never restarted\n{}", relay_log(&w));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let log = relay_log(&w);
+    assert!(log.contains(&format!("binary replaced, restarting on {}", bin.display())), "{log}");
+    assert_eq!(log.matches("relaying for claude pid").count(), 2, "{log}");
+    assert!(log.contains(&format!("session {session}: kept its lock across the restart")), "never unlocked\n{log}");
+}
+
+/// The session's inbox socket, as a list of what the relay posted to it.
+fn inbox(w: &World) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    let posts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = std::os::unix::net::UnixListener::bind(w.dir.join("inbox.sock")).expect("an inbox socket");
+    let kept = posts.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut &stream, &mut text);
+            kept.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+        }
+    });
+    posts
+}
+
+/// relay wake ROOM mentions: a plain post in that room waits for the next wake instead of waking the session, and
+/// comes along with the post that mentions it.
+#[test]
+#[ignore = "needs Docker"]
+fn a_wake_filter_holds_plain_posts_until_a_mention() {
+    let w = start();
+    let posts = inbox(&w);
+    let session = "4a5b6c7d-8e9f-40a1-b2c3-d4e5f6a7b8c9";
+    let (_fake, _) = relayed(&w, session);
+    let addr = std::fs::read_to_string(w.dir.join("relay").join(format!("{session}.lock")))
+        .ok()
+        .and_then(|t| t.lines().nth(1).map(str::to_owned))
+        .expect("the relay's address");
+    let peer = String::from_utf8_lossy(&w.run(&["register", "peer"]).stdout).trim().to_owned();
+    for who in [&addr, &peer] {
+        assert!(w.run(&["join", who, "lane"]).status.success());
+    }
+    assert!(w.run(&["relay", "wake", "lane", "mentions", "--session", session]).status.success());
+    // the relay takes its session back about a second after the join took it over
+    std::thread::sleep(Duration::from_secs(3));
+    posts.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    assert!(w.run(&["say", &peer, "lane", "just chatter"]).status.success());
+    std::thread::sleep(Duration::from_secs(3));
+    let seen = posts.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(seen.is_empty(), "a plain post woke the session: {seen:?}");
+    assert!(w.run(&["say", &peer, "lane", &format!("@{addr} over to you")]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = posts.lock().unwrap_or_else(|e| e.into_inner()).concat();
+        if seen.contains("over to you") {
+            assert!(seen.contains("just chatter") && seen.contains("while you were away"), "{seen}");
+            // the relay path's id is the one every other path derives (_native.message_id binds this function)
+            // each post is an auth line, then a user line whose content is the frame, one JSON line per message
+            let frames: Vec<String> = seen
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter_map(|m| m["message"]["content"].as_str().map(str::to_owned))
+                .collect();
+            let line = frames
+                .iter()
+                .flat_map(|f| f.lines())
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|m| m["body"].as_str().is_some_and(|b| b.contains("over to you")))
+                .expect("the delivered line");
+            let want = agent_bridge::protocol::message_id(
+                line["topic"].as_str().expect("topic"),
+                line["from"].as_str().expect("from"),
+                line["ts"].as_f64().expect("ts"),
+            );
+            assert_eq!(line["id"], want.as_str(), "{line}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the mention never woke the session\n{}", relay_log(&w));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The 0.3.1 commands from the shell: a pin on a room, a reply by id that history keeps, a mention of someone who left,
+/// and claims, held, refused, listed and released.
+#[test]
+#[ignore = "needs Docker"]
+fn pins_replies_and_claims_from_the_shell() {
+    let w = start();
+    let ok = |args: &[&str]| {
+        let out = w.run(args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        out
+    };
+    let a = String::from_utf8_lossy(&ok(&["register", "alpha"]).stdout).trim().to_owned();
+    let row = json_lines(&ok(&["register", "beta", "--json"]).stdout).remove(0);
+    let b = row["addr"].as_str().expect("register --json names the address").to_owned();
+    assert_eq!(row["name"], "beta");
+    for who in [&a, &b] {
+        ok(&["join", who, "lane"]);
+    }
+    // a pin needs a moderator or admin: alpha is neither, until the room's record (as the console writes it) names it
+    assert!(!w.run(&["pin", &a, "lane", "the format"]).status.success());
+    let record = format!(
+        r#"{{"mode": "open", "moderators": ["{a}"], "rules": "", "muted": [], "banned": [], "by": "admin", "ts": 1.0}}"#
+    );
+    let named = Command::new("docker")
+        .args(["exec", &w.broker, "mosquitto_pub", "-q", "1", "-r", "-t", "rooms/lane", "-m", &record])
+        .status()
+        .expect("docker exec runs");
+    assert!(named.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !w.run(&["pin", &a, "lane", "the format"]).status.success() {
+        assert!(Instant::now() < deadline, "alpha never became a moderator");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let pin = json_lines(&ok(&["pin", &a, "lane", "the format"]).stdout).remove(0);
+    assert_eq!((pin["text"].as_str(), pin["by"].as_str()), (Some("the format"), Some(a.as_str())));
+    assert_eq!(json_lines(&ok(&["room", "info", "lane"]).stdout)[0]["pin"]["text"], "the format");
+    ok(&["pin", &a, "lane", "--clear"]);
+    assert_eq!(json_lines(&ok(&["room", "info", "lane"]).stdout)[0]["pin"], serde_json::Value::Null);
+
+    ok(&["say", &a, "lane", "a question"]);
+    let asked = json_lines(&ok(&["recv", &b]).stdout);
+    let id = asked.iter().find(|m| m["body"] == "a question").and_then(|m| m["id"].as_str()).expect("an id").to_owned();
+    ok(&["say", &b, "lane", "the answer", "--reply-to", &id]);
+    let history = json_lines(&ok(&["history", "lane"]).stdout);
+    let answer = history.iter().find(|m| m["body"] == "the answer").expect("the reply in history");
+    assert_eq!(answer["reply_to"], id.as_str());
+    let refused = w.run(&["say", &b, "lane", "x", "--reply-to", "nope"]);
+    assert!(!refused.status.success() && String::from_utf8_lossy(&refused.stderr).contains("bad reply_to"));
+    ok(&["part", &a, "lane"]);
+    let said = ok(&["say", &b, "lane", &format!("@{a} still there?")]);
+    let notice = String::from_utf8_lossy(&said.stderr).into_owned();
+    assert!(notice.contains(&format!("@{a} is not in #lane (it left or never joined)")), "{notice}");
+
+    let claim = json_lines(&ok(&["claim", &b, "lane", "BUG-1", "--note", "on it"]).stdout).remove(0);
+    assert_eq!((claim["claim"]["holder"].as_str(), claim["claim"]["note"].as_str()), (Some(b.as_str()), Some("on it")));
+    let taken = w.run(&["claim", &a, "lane", "BUG-1"]);
+    assert_eq!(taken.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&taken.stderr).contains(&format!("claimed by {b}")));
+    let listed = json_lines(&ok(&["claims", &a, "lane"]).stdout).remove(0);
+    assert_eq!(listed["claims"][0]["key"], "BUG-1");
+    ok(&["unclaim", &b, "lane", "BUG-1"]);
+    assert_eq!(json_lines(&ok(&["claims", &a, "lane"]).stdout)[0]["claims"], serde_json::json!([]));
+    ok(&["add", &b, "db", "--visibility", "public", "--max-level", "write"]);
+    let held = json_lines(&ok(&["holders", &a, &format!("{b}/db")]).stdout).remove(0);
+    assert_eq!(held["holders"], serde_json::json!([]));
+}
+
+/// A failed exec (here the exec target is forced to a missing file) leaves the relay running on its old image: still
+/// live, same pid, still delivering, and it does not retry at once.
+#[test]
+#[ignore = "needs Docker"]
+fn a_relay_survives_a_failed_restart() {
+    let w = start();
+    let posts = inbox(&w);
+    let session = "d4e5f6a7-b8c9-40d1-82e3-f4a5b6c7d8e9";
+    let bin = w.dir.join("tool").join("agent-bridge");
+    std::fs::create_dir_all(bin.parent().expect("a dir")).expect("a dir");
+    std::fs::copy(RUST, &bin).expect("the installed binary");
+    let env = [("AGENT_BRIDGE_RELAY_UPGRADE_CHECK", "1"), ("AGENT_BRIDGE_RELAY_EXEC_AS", "/nowhere/agent-bridge")];
+    let (_fake, pid) = relayed_with(&w, session, &bin, &env);
+    let addr = std::fs::read_to_string(w.dir.join("relay").join(format!("{session}.lock")))
+        .ok()
+        .and_then(|t| t.lines().nth(1).map(str::to_owned))
+        .expect("the relay's address");
+    std::fs::remove_file(&bin).expect("the old binary goes");
+    std::fs::copy(RUST, &bin).expect("the new binary");
+    assert!(Command::new("touch").args(["-d", "-1 minute"]).arg(&bin).status().expect("touch").success());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !relay_log(&w).contains("still running on the old image") {
+        assert!(Instant::now() < deadline, "the exec never failed\n{}", relay_log(&w));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let row = json_lines(&w.run(&["relay", "status", "--session", session]).stdout).remove(0);
+    assert_eq!((&row["live"], &row["pid"]), (&serde_json::json!(true), &serde_json::json!(pid)));
+    let peer = String::from_utf8_lossy(&w.run(&["register", "peer"]).stdout).trim().to_owned();
+    assert!(w.run(&["dm", &peer, &addr, "still there?"]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !posts.lock().unwrap_or_else(|e| e.into_inner()).concat().contains("still there?") {
+        assert!(Instant::now() < deadline, "nothing delivered after the failed exec\n{}", relay_log(&w));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(relay_log(&w).matches("exec failed").count(), 1, "no retry within 10 minutes\n{}", relay_log(&w));
 }
 
 #[test]

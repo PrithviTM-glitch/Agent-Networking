@@ -102,16 +102,18 @@ const Markup = (() => {
     return out;
   }
 
-  function cell(doc, tag, text, align) {
+  function cell(doc, tag, text, align, inline) {
     const c = doc.createElement(tag);
-    c.textContent = text;
+    if (inline) inline(c, text);
+    else c.textContent = text;
     if (text.length <= NOWRAP_MAX) c.className = "nw";
     if (align) c.style.textAlign = align;
     return c;
   }
 
-  // Append text's segments to parent; inline(parent, text) renders a plain-text run (the page adds mentions there).
-  function render(doc, parent, text, inline) {
+  // Append text's segments to parent; inline(parent, text) renders a plain-text run (the page adds mentions and links
+  // there), and cellInline, when given, a table cell's text the same way (else the cell is plain textContent).
+  function render(doc, parent, text, inline, cellInline) {
     for (const seg of blocks(text)) {
       if (seg.kind === "text") inline(parent, seg.text);
       else if (seg.kind === "code") {
@@ -124,7 +126,7 @@ const Markup = (() => {
         // its text has pipes, and a short row just ends early.
         const row = (values, tag) => {
           const tr = doc.createElement("tr");
-          values.slice(0, seg.head.length).forEach((v, k) => tr.append(cell(doc, tag, v, seg.align[k])));
+          values.slice(0, seg.head.length).forEach((v, k) => tr.append(cell(doc, tag, v, seg.align[k], cellInline)));
           return tr;
         };
         const wrap = doc.createElement("div"), table = doc.createElement("table");

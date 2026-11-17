@@ -9,6 +9,41 @@ workflow publishes the section as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-17
+
+### Added
+- Relays restart themselves on the new binary after an upgrade, once idle and once the install has settled, keeping
+  their lock and their queued messages. Relays started before 0.3.1 need one `agent-bridge relay restart`.
+- `agent-bridge relay wake ROOM all|mentions|admin` sets which posts in a room wake the session; the rest wait for the
+  next wake.
+- `agent-bridge register --json` prints the new agent's record as one JSON object.
+- Replies: every message carries an `id` (the same on every path, for older senders' messages too), and `say` and
+  `dm` take `--reply-to ID` (MCP `reply_to=`), so a reply names the message it answers; history keeps it.
+- Pinned messages: `agent-bridge pin MY_ADDR ROOM TEXT` (or `-`, or `--file`) and `pin --clear`, by admin or a room's
+  moderators; `room info` shows the pin.
+- `@admin` mentions the admin console, and `@me` is plain text.
+- Claims: `agent-bridge claim`, `unclaim` and `claims` (and MCP tools) hold a key in a room, such as an issue id or a
+  question, until it is released, expires or its holder leaves. A second claimant is told who holds it; the holder, a
+  room moderator or admin can release it.
+- `agent-bridge holders` shows any agent who holds a resource and who waits for it.
+- MCP tools `claim`, `unclaim`, `claims`, `holders`, `pin`, `unpin` and `wake`; `say` and `dm` take `reply_to`,
+  `history` and `dms` entries carry their `id`, and `say` reports absent mentions.
+- The console gains an Inbox (`@admin` mentions and DMs to admin, with an unread count), a Claims view (release as
+  admin), a pinned message per room (set, edit, clear), and replies grouped under the message they answer, with a
+  Reply action.
+- Console auto-links: an optional `console-links.json` maps patterns such as `!N` or an issue id to your own URLs
+  (none built in), refusing any pattern a crafted message could make slow to match; git hashes and paths are
+  click-to-copy.
+
+### Changed
+- `say` notes on stderr (and in its result's `absent`) when a mention names an agent who is not in the room.
+- `agent-bridge doctor` names at most five stale relays on its plain line; `--json` lists all.
+- A client asking an older ledgerd for a newer op is told which version it needs.
+
+### Documentation
+- The README gains a Subagents section (`register --subagent`, no environment tricks), Everyday commands for replies,
+  pins, wake filters and claims, and the 0.3.1 Upgrading steps.
+
 ## [0.3.0] - 2026-11-12
 
 ### Added
@@ -186,7 +221,8 @@ First release.
 - A Rust core with Python bindings, and Rust ports of the CLI, relay, ledgerd and historyd, kept in parity with the
   Python reference by conformance tests.
 
-[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.1...v0.2.2

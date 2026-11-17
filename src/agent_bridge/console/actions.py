@@ -8,7 +8,7 @@ import re
 import time
 
 from .. import config, host
-from ..validation import check_text, is_count, is_ident
+from ..validation import ADMIN, check_text, is_count, is_ident
 from . import admin, events, kill, leaks, processes, sessions
 from .processes import Refused
 
@@ -68,8 +68,11 @@ def send(b, _peer=None):
     console, kind = admin.need_bus(), b.get("kind")
     if kind not in ("room", "dm", "topic"):
         raise Refused("kind must be room, dm or topic")
-    target = _str(b, "target")
-    said = {"room": console.say, "dm": console.dm, "topic": console.pub}[kind](target, _str(b, "text")) or {}
+    target, text, reply_to = _str(b, "target"), _str(b, "text"), _str(b, "reply_to", optional=True)
+    if reply_to and kind == "topic":
+        raise Refused("only room and dm messages can reply")
+    reply = {"reply_to": reply_to} if reply_to else {}
+    said = {"room": console.say, "dm": console.dm, "topic": console.pub}[kind](target, text, **reply) or {}
     if unresolved := said.get("unresolved"):
         words = ", ".join(f"@{w}" for w in unresolved)  # the wording of the CLI's say notice
         verb = (
@@ -79,6 +82,26 @@ def send(b, _peer=None):
         )
         return f"{kind}:{target}", f"sent; {words} {verb.format(target)} nobody"
     return f"{kind}:{target}", "sent"
+
+
+def claim_release(b, _peer=None):
+    room, key = _str(b, "room"), _str(b, "key")
+    admin.ledger_call("unclaim", ADMIN, room=room, key=key)  # needs no ledger: the console never creates one
+    return f"claim:{room}/{key}", "released as admin"
+
+
+def room_pin(b, _peer=None):
+    room, clear = _str(b, "room"), b.get("clear", False)
+    if not isinstance(clear, bool):
+        raise Refused("clear must be true or false")
+    if clear:
+        admin.need_bus().unpin(room)
+        return f"room:{room}", "pin cleared"
+    text = check_text(b.get("text"))
+    if not text.strip():
+        raise Refused("the pin is empty: clear it instead")
+    admin.need_bus().pin(room, text)
+    return f"room:{room}", f"pinned {len(text)} chars"
 
 
 def broadcast(b, _peer=None):
@@ -245,6 +268,8 @@ ROUTES = {
     "/api/room/settings": room_settings,
     "/api/room/moderator": room_moderator,
     "/api/room/member": room_member,
+    "/api/room/pin": room_pin,
+    "/api/claims/release": claim_release,
 }
 
 

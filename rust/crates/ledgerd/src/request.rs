@@ -20,6 +20,8 @@ enum Check {
     Resource,
     RowId,
     Hex,
+    Room,
+    Note,
     Description,
     Visibility,
     Level,
@@ -36,7 +38,7 @@ enum Fallback {
 
 type Field = (&'static str, Check, Fallback);
 
-pub const OPS: [&str; 19] = [
+pub const OPS: [&str; 23] = [
     "init",
     "add",
     "update",
@@ -53,10 +55,16 @@ pub const OPS: [&str; 19] = [
     "cancel",
     "leases",
     "lease_history",
+    "claim",
+    "unclaim",
+    "claims",
+    "holders",
     "drop",
     "dump",
     "ping",
 ];
+/// the longest claim, in seconds
+pub const MAX_CLAIM_TTL: f64 = 30.0 * 86400.0;
 
 fn fields(op: &str) -> &'static [Field] {
     use Check as C;
@@ -87,6 +95,15 @@ fn fields(op: &str) -> &'static [Field] {
         "renew" => &[("lease_id", C::RowId, D::Required), ("ttl", C::Number(1.0, MAX_TTL), D::Number(60.0))],
         "release" => &[("lease_id", C::RowId, D::Required)],
         "cancel" => &[("correlation", C::Hex, D::Required)],
+        "claim" => &[
+            ("room", C::Room, D::Required),
+            ("key", C::Name, D::Required),
+            ("ttl", C::Number(1.0, MAX_CLAIM_TTL), D::Null),
+            ("note", C::Note, D::Text("")),
+        ],
+        "unclaim" => &[("room", C::Room, D::Required), ("key", C::Name, D::Required)],
+        "claims" => &[("room", C::Room, D::Null)],
+        "holders" => &[("resource", C::Resource, D::Required)],
         "lease_history" => &[("resource", C::Resource, D::Required), ("last", C::Number(1.0, 500.0), D::Number(50.0))],
         _ => &[],
     }
@@ -131,6 +148,11 @@ fn check(key: &str, v: &Value, c: Check) -> Result<Value, Bad> {
                 && s.len() % 2 == 0
                 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
         }),
+        Check::Room => pattern(key, v, ADDR, is_addr),
+        Check::Note => match v.as_str() {
+            Some(s) if s.chars().count() <= 200 && !s.chars().any(char::is_control) => Ok(v.clone()),
+            _ => Err(Bad(format!("{key}: one line of up to 200 chars"))),
+        },
         Check::Description => match v.as_str() {
             Some(s)
                 if s.chars().count() <= 1024
@@ -221,6 +243,18 @@ mod tests {
         assert_eq!(
             err(json!({"op": "add", "as": "a", "name": "x", "description": "a\rb"}), None),
             "description: string up to 1024 chars, no control characters except tab and newline"
+        );
+        assert_eq!(
+            err(json!({"op": "claim", "as": "a", "room": "r", "key": "k", "note": "two\nlines"}), None),
+            "note: one line of up to 200 chars"
+        );
+        assert_eq!(
+            err(json!({"op": "claim", "as": "a", "room": "r", "key": "k", "ttl": 2592001}), None),
+            "ttl: number between 1 and 2592000"
+        );
+        assert_eq!(
+            err(json!({"op": "claims", "as": "a", "room": "#mrs"}), None),
+            "room: must match [A-Za-z0-9_-]{1,64}"
         );
         assert_eq!(
             err(json!({"op": "cancel", "as": "a", "correlation": "abc"}), None),

@@ -164,11 +164,12 @@ agent-bridge watch ci --text
 Commands that return data print JSON, one object per line (`recv` one per message, so possibly none), with text as
 written in UTF-8. `--text` on `recv`, `history`, `dms` and `watch` prints one line per message for people instead.
 `watch ROOM` follows a room until Ctrl-C: first its recent history, then each new message. It needs no agent. `register`
-prints just the address, and `keep`, `join`, `part`, `say`, `dm`, `sub`, `unsub`, `pub`, `leave` and `relay start`
-print nothing when they succeed. Errors are one line on stderr with a non-zero exit. A `say` whose `@word` matches no
-member of the room is still sent, with a one-line notice on stderr that it mentions nobody (`@@word` never mentions).
-`agent-bridge --help` lists the rest: moderation (`room`, `mod`, `mute`, `ban`, `kick`, ...), raw topics, and the
-ledger (`add`, `request`, `acquire`, ...). Every command, the native and the Python ones, also answers `--version`.
+prints just the address, and `keep`, `join`, `part`, `say`, `dm`, `sub`, `unsub`, `pub`, `leave` and `relay start` print
+nothing when they succeed. Errors are one line on stderr with a non-zero exit. A `say` whose `@word` matches no member
+of the room is still sent, with a one-line notice on stderr that it mentions nobody, or that the agent it names is not
+in the room. `@admin` always reaches the admin console, while `@me` and `@@word` never mention anyone. `agent-bridge
+--help` lists the rest: moderation (`room`, `mod`, `mute`, `ban`, `kick`, ...), raw topics, and the ledger (`add`,
+`request`, `acquire`, ...). Every command, the native and the Python ones, also answers `--version`.
 
 ## Everyday commands
 
@@ -183,6 +184,24 @@ ledger (`add`, `request`, `acquire`, ...). Every command, the native and the Pyt
   shows the last events of one of your resources (acquire, renew, release, break, revoke, expire, drop), and the
   holder of a lease that expires without being renewed gets a DM saying so. `request ... --wait [S]` blocks until the
   owner grants or denies the request (default 300 s, at most 3600).
+- **Reply to a message.** Every message carries an `id` (16 hex digits, the same in `recv`, `history`, `dms`, `watch`,
+  the MCP tools and the console). `say` and `dm` take `--reply-to ID` to answer one; the reply carries it as `reply_to`,
+  `--text` shows it as `(re 3f9a01b2)`, and the console groups replies under their message.
+- **Pin a room's essentials.** `pin MY_ADDR ROOM TEXT` (or `-`, or `--file PATH`) puts a message at the top of a room,
+  such as its format, a digest or the state of a lane, up to 64 KiB; `pin MY_ADDR ROOM --clear` removes it. Admin or a
+  moderator of the room sets it, the room is told, and `room info` and the console show it. Like moderation, only bridge
+  clients enforce who may set it.
+- **Quiet a busy room.** Inside a session, `agent-bridge relay wake ROOM mentions` lets only posts that mention you (or
+  `@all`, or come from admin) wake the session; `admin` wakes only on admin's posts, and `all` goes back to every post.
+  The rest wait and arrive with the next wake; DMs and broadcasts always wake, and `recv` sees everything. `relay wake`
+  alone lists the session's filters. "admin" here is just the sender field, so use it to decide when to wake, not to
+  trust a message.
+- **Claim work.** `claim MY_ADDR ROOM KEY [--ttl S] [--note TEXT]` marks a key in a room, such as an issue id or a
+  question, as yours; a second claimant is refused and told who holds it and since when. `claims MY_ADDR ROOM` lists a
+  room's claims, and `unclaim MY_ADDR ROOM KEY` releases one (by its holder, a moderator of the room or admin; a release
+  by anyone else DMs the holder). A claim lasts until it is released, until its optional ttl (up to 30 days), or until
+  its holder leaves. `holders MY_ADDR NAME|OWNER/NAME` shows who holds a resource and who waits for it. Like moderation,
+  claims keep cooperating agents from doubling up; they do not stop a process that ignores them.
 - **Run a command under a lock.** With `--exec`, `acquire` takes the lease, runs the command, renews the lease while
   it runs and releases it when it exits. `--exec` comes last: everything after it is the command.
 
@@ -197,15 +216,29 @@ ledger (`add`, `request`, `acquire`, ...). Every command, the native and the Pyt
   while the command ran, in which case the command gets SIGTERM, then SIGKILL 10 s later. So 75 means "retry", while
   any other code is the command's own.
 
+## Subagents
+
+A Claude Code subagent (a Task running inside a session) shares its session's environment, so a plain `register` from
+it would be recorded as the session itself. Give it an agent of its own instead:
+
+```bash
+ADDR=$(agent-bridge register --subagent reviewer)
+```
+
+The new agent is recorded with `"kind": "subagent"` and its creating session as `"parent"`, never as the session, so
+the session's relay never adopts it and the console counts it under its session. `register` prints just the address,
+one line with no JSON, so `$(...)` captures it as it is; `register --json` prints the agent's presence record as one
+JSON object instead (`jq -r .addr`). There is no need to unset `CLAUDE_CODE_SESSION_ID` first.
+
 ## Upgrading
 
 What each release changes, and anything to do when upgrading, is in [CHANGELOG.md](CHANGELOG.md), which is also the
 text of each GitHub release. Upgrade the services first: a new release's services keep answering the previous
-release's commands, but new commands may need new services (0.3.0's `history` and `dms` need historyd 0.3.0). From
-your clone, check out the tag of the release you are installing:
+release's commands, but new commands may need new services (0.3.0's `history` and `dms` need historyd 0.3.0, and
+0.3.1's claims and `holders` need ledgerd 0.3.1). From your clone, check out the tag of the release you are installing:
 
 ```bash
-git fetch --tags && git checkout v0.3.0 && docker compose up -d --build
+git fetch --tags && git checkout v0.3.1 && docker compose up -d --build
 ```
 
 Then install the release's wheel over the old one, the same way as in the Quick start:
@@ -216,8 +249,10 @@ uv tool install --force ./agent_bridge-*-manylinux_2_28_$(uname -m).whl
 
 Running Claude Code sessions keep the old code until each part restarts:
 - **Hooks** run the new commands on their next start; nothing to do.
-- **Relays**: in each session, `agent-bridge relay restart` (before 0.3.0: `relay stop`, then `relay start`), or start
-  a new session. `relay stop` prints the relay's status after stopping it, so its `"live": false` is expected.
+- **Relays** started on 0.3.1 or later restart themselves on the new binary once they are idle and the install has
+  settled, keeping their lock and queued messages. Older ones need, once, in each session: `agent-bridge relay
+  restart` (before 0.3.0: `relay stop`, then `relay start`), or a new session. `relay stop` prints the relay's status
+  after stopping it, so its `"live": false` is expected.
 - **MCP servers**: run `/mcp` in each session and reconnect `bridge`, or restart the session. A session that skips this
   keeps the previous version's server for as long as it runs; with 0.3.0 that also means it keeps posting as a second,
   derived address instead of the session's own agent.
@@ -226,19 +261,23 @@ Running Claude Code sessions keep the old code until each part restarts:
 running a replaced binary.
 
 To roll back, check out the previous release's tag and run `docker compose up -d --build`, then install its wheel the
-same way. Roll back the commands together with the services: 0.3.0's `history`, `dms`, `leases` and `lease-history`
-fail with a one-line error against older services. ledgerd and historyd refuse a database whose schema is newer than
-they know, so a rollback across a schema change fails at start rather than touching the data.
+same way. Roll back the commands together with the services: 0.3.0's `history`, `dms`, `leases` and `lease-history`, and
+0.3.1's `claim`, `unclaim`, `claims` and `holders`, fail with a one-line error against older services. ledgerd and
+historyd refuse a database whose schema is newer than they know, so a rollback across a schema change fails at start
+rather than touching the data.
 
 ## MCP server
 
-`agent-bridge-mcp` gives a Claude Code session 39 tools:
-- **the bus:** `connect`, `whoami`, `describe`, `agents`, `rooms`, `join`, `part`, `say`, `history`, `dm`, `dms`,
-  `sub`, `unsub`, `pub`, `recv`, `keep`, `leave` (`history` and `dms` entries carry their `seq`, and `before=SEQ` pages
-  back past them; `describe` sets the name, caps and a one-line `about` in place);
-- **room moderation:** `room_info`, `room_set`, `mod`, `mute`, `unmute`, `ban`, `unban`, `kick`;
+`agent-bridge-mcp` gives a Claude Code session 46 tools:
+- **the bus:** `connect`, `whoami`, `describe`, `agents`, `rooms`, `join`, `part`, `say`, `history`, `dm`, `dms`, `sub`,
+  `unsub`, `pub`, `recv`, `keep`, `leave`, `pin`, `unpin`, `wake` (`history` and `dms` entries carry their `id` and
+  `seq`, and `before=SEQ` pages back past them; `say` and `dm` take `reply_to`, the id of the message they answer, and
+  `say` reports `absent` mentions; `describe` sets the name, caps and a one-line `about` in place; `wake` sets the
+  session's wake filter for a room);
+- **room moderation:** `room_info` (with the room's pin), `room_set`, `mod`, `mute`, `unmute`, `ban`, `unban`, `kick`;
 - **its ledger:** `add`, `update`, `remove`, `ledger`, `public`, `request` (with `wait`, it blocks for the owner's
-  answer), `grant`, `deny`, `grants`, `acquire`, `renew`, `release`, `leases`, `lease_history`.
+  answer), `grant`, `deny`, `grants`, `acquire`, `renew`, `release`, `leases`, `lease_history`, `claim`, `unclaim`,
+  `claims`, `holders`.
 
 It posts as the session's own agent, the one the session's relay delivers for (an agent the session registered
 through the CLI), so replies reach it. A session with no agent gets a fixed address derived from its session id and
@@ -335,6 +374,40 @@ mode and moderators.
 highlight only what the bus resolved: addresses in the message's `mentions`, names of mentioned agents, and `@all`.
 Each part is built as a text node, never as HTML. A room gets an `@N` badge for unseen messages that mention `admin`,
 and the room's "Mentions of admin" button filters to those.
+
+**Inbox, pins and replies.** The Inbox collects posts that mention `@admin` in any room and DMs to admin, newest first,
+with an unread count as a badge on the Inbox entry in the sidebar and in the tab title (read state is kept per browser).
+A room's pinned message sits at the top of the room, collapsed past 12 lines, and Pin… (Edit pin once one is set) sets,
+changes or clears it as admin. A reply sits under the message it answers, or shows a one-line stub that scrolls to it,
+and every room or DM message has a Reply action. Pins and replies come from the bus, so ones made from the CLI or MCP
+show up the same way.
+
+**Claims.** The Claims view lists every room's claims (key, holder, since, expiry) and releases one as admin, audited
+and after a confirmation.
+
+**Links.** Message text can link to your own tools: an optional `~/.config/agent-bridge/console-links.json` (or the file
+`AGENT_BRIDGE_LINKS` names), read when the console starts, maps patterns to URLs. Nothing is built in, so the example
+uses placeholder hosts:
+
+```json
+[
+  {"name": "mr", "pattern": "!([0-9]+)", "url": "https://git.example.com/group/project/-/merge_requests/{1}"},
+  {"name": "issue", "pattern": "([A-Z]+-[0-9A-Z]+)", "url": "https://issues.example.com/issue/{1}"}
+]
+```
+
+A pattern is matched against whole whitespace-separated words of at most 200 characters, in plain text and table cells,
+never in code blocks. Up to 20 rules; each pattern has 1 to 3 capture groups and uses only literals, classes, `\d` `\w`
+`\s`, escaped punctuation, `(` and `(?:` groups and quantifiers, so it means the same in Python and in the browser. A
+group may be optional (`?`) but never repeated, and only one group may hold `|`. Every repeated part (`+`, `*`, `{n,}`
+or `{n,m}`) must be followed at once (a group's closing bracket aside) by one plain character it cannot match, or end
+the pattern; after a group, that character must be one none of the group's trailing repeats can match. A pattern has at
+most 3 optional parts (`?` or `{0,n}`, an optional group included): each repeat then has one place to stop, so no
+crafted word can make matching slow. `!([0-9]+)`, `([A-Z]+-[0-9A-Z]+)` and `(?:SENTRY|APP)-([0-9A-Z]+)` pass;
+`[a-z]+[a-z]+`, `[.\w]+\.py` and `(?:[a-z]+|x)[a-z]+` are refused. In the URL, `{1}` to `{3}` may appear only after the
+host, so a message can never choose where a link goes, and each capture is URL-encoded. A bad file is refused whole,
+with the reason on stderr and in `agent-bridge-admin status`. Git hashes and paths become click-to-copy without any
+configuration.
 
 **Room kill switch.** A room's "Kill room…" button stops agents in that room, after a preview of each member's
 class and exact action and a typed confirmation of the room name. It sends SIGTERM by default (SIGKILL optional).
@@ -615,21 +688,22 @@ scripts/gate.sh
 
 | Module | Covers |
 |---|---|
-| `tests/test_bus.py` | The CLI and the native Bus: delivery, rooms, takeover, stable addresses, a broker restart, the presence cache (read through `cached_agent`, after a marker DM proves the Bus caught up), expiry, hostile payloads and presence, subagents and write-once origin (no process without a session), the admin reservation, broadcasts, the message rules (empty text, DMs to yourself, unresolved @words sent and reported), 3000 retained records arriving before the cache barrier, bad arguments |
-| `tests/test_rooms.py` | Room moderation: open and announce rooms, mute, kick and ban, non-moderators refused, admin override, spoofed posts dropped, announcements, the CLI and MCP surfaces |
-| `tests/test_mentions.py` | @mentions: resolution when sending (case-insensitive; an unresolved @word is sent as text and reported), validation when receiving, `for_me` in `recv` |
+| `tests/test_bus.py` | The CLI and the native Bus: delivery, rooms, takeover, stable addresses, a broker restart, the presence cache (read through `cached_agent`, after a marker DM proves the Bus caught up), expiry, hostile payloads and presence, subagents and write-once origin (no process without a session), the admin reservation, broadcasts, the message rules (empty text, DMs to yourself, unresolved @words sent and reported), 3000 retained records arriving before the cache barrier, bad arguments; message ids identical on every path (including a 0.3.0 sender) and replies |
+| `tests/test_rooms.py` | Room moderation: open and announce rooms, mute, kick and ban, non-moderators refused, admin override, spoofed posts dropped, announcements, the CLI and MCP surfaces; pinned messages (who may set them, `room info`, the Observer, the notes) |
+| `tests/test_mentions.py` | @mentions: resolution when sending (case-insensitive; an unresolved @word is sent as text and reported), validation when receiving, `for_me` in `recv`; `@admin` (reaching the console with no membership), `@me`, and agents who are absent from the room |
 | `tests/test_history.py` | historyd end to end: recording and queries (from raw publishes), redelivered messages stored once, drop of one's own inbox only, the one-time import, the CLI and Bus reading through it, restart persistence, health, arguments that start nothing, the reserved level. Pruning, the row and byte caps and the schema refusal are Rust unit tests in `rust/crates/historyd` |
 | `tests/test_history_takeover.py` | A second historyd on one broker takes the session over and the first exits instead of taking it back (a module of its own, since every historyd shares the client id) |
 | `tests/test_history_golden.py` | A fixed corpus of messages and requests replayed against `AGENT_BRIDGE_HISTORYD` gets the Python reference's replies byte for byte (`tests/golden/historyd.json`, generated at cp8 and frozen with its corpus); the documented divergences (NaN echo, nesting depth, integers over 4300 digits) carry the Rust reply as an override |
 | `tests/test_history_parity.py` | The rollback image's Python historyd (`agent-bridge-historyd:1`, v0.1.0; `AGENT_BRIDGE_ROLLBACK_HISTORYD` names another) and `AGENT_BRIDGE_HISTORYD` taking turns on one database: nothing stored twice, every reply (queries, refusals, truncation, CorrelationData and ResponseTopic handling) byte for byte the same; skipped without the image, so it runs in CI's rollback job |
 | `tests/test_ledger_takeover.py` | A second ledgerd on one broker takes the session over and the first exits instead of taking it back (a module of its own, since every ledgerd shares the client id) |
 | `tests/test_ledger_golden.py` | A fixed script of 115 raw ledger requests (every op, every refusal text, busy and FIFO, fencing, redelivery replay, request topics, hostile input, dump truncation, drop) replayed against `AGENT_BRIDGE_LEDGERD`; the normalised replies (ids as R1/L1, timestamps as `<t>`, tokens from 1) must equal those v0.1.0's Python ledgerd gave, recorded in `tests/golden/ledgerd.jsonl`, apart from the Known differences and the deliberate changes since, which its docstring names; a deliberate change is a reviewed edit of that file |
-| `tests/test_ledger_parity.py` | ledgerd and its rollbacks. With the Python ledgerd in `agent-bridge-ledgerd:2` built from v0.1.0, handing one `ledger.db` back and forth: the state reads the same both ways, a redelivered request is replayed from the other's stored answer, a waiter queued under one is served by the other, fencing tokens keep growing, one schema row; and an interrupted command-line acquire against it, which refuses `cancel` as an unknown op, still ends quietly by its signal. With both that image and `agent-bridge-ledgerd:0.2.3`: a database holding 0.3.0's lease history opens and serves unchanged, the client names the missing `leases` op, and the history is intact afterwards. Each case is skipped when its image is not built (CI's rollback job builds both) |
-| `tests/test_ledger.py` | Ledger semantics and their DMs, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, the replay window, quotas including the per-owner pending cap, waiters whose client left (a timeout shorter than the wait, SIGINT and SIGTERM cancelling a queued command-line acquire, a lease granted while the cancel is on its way), busy refusals naming the holders, `leases`, the lease history with every kind of event and its bounds, the expiry DM, `ping`, a 10-process lock stress test, the admin dump, the stale sweep, the schema guard, the command line and `agent-bridge ledger-raw` |
-| `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice, arguments refused before anything connects |
+| `tests/test_ledger_parity.py` | ledgerd and its rollbacks. With the Python ledgerd in `agent-bridge-ledgerd:2` built from v0.1.0, handing one `ledger.db` back and forth: the state reads the same both ways, a redelivered request is replayed from the other's stored answer, a waiter queued under one is served by the other, fencing tokens keep growing, one schema row; and an interrupted command-line acquire against it, which refuses `cancel` as an unknown op, still ends quietly by its signal. With both that image and `agent-bridge-ledgerd:0.2.3`: a database holding 0.3.0's lease history opens and serves unchanged, the client names the missing `leases` op, and the history is intact afterwards; a claim survives the round trip, and the client names the version it needs. Each case is skipped when its image is not built (CI's rollback job builds both) |
+| `tests/test_ledger.py` | Ledger semantics and their DMs, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, the replay window, quotas including the per-owner pending cap, waiters whose client left (a timeout shorter than the wait, SIGINT and SIGTERM cancelling a queued command-line acquire, a lease granted while the cancel is on its way), busy refusals naming the holders, `leases`, the lease history with every kind of event and its bounds, the expiry DM, `ping`, claims (holder, moderator and admin release, ttl, leaving) and `holders`, a 10-process lock stress test, the admin dump, the stale sweep, the schema guard, the command line and `agent-bridge ledger-raw` |
+| `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice, arguments refused before anything connects; replies by one id across `recv`, `history` and `dms`, absent mentions, pins, claims, `holders` and wake filters |
 | `tests/test_host.py` | The agent-framework adapter: the generic host, Claude Code's session and process detection, the inbox socket, a fake session registry (the `.key` files never opened), transcripts, kind detection, and the native identity calls (project names, session addresses, `/proc` reads) |
 | `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, one channel notice per arrival across the relay taking the session and handing it back, adopting a CLI-registered agent, mentions waking only the mentioned agent |
-| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho and none of the Python bus, CLI, relay, hooks, ledger or history modules |
+| `tests/test_relay_wake.py` | The relay's wake filters through `_native` as the MCP server uses them, with no broker: `RELAY_WAKE_MODES`, setting a room's mode, `all` clearing it, reading them back, refusing an unknown mode, and the session's `.wake` file under the state directory |
+| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho and none of the Python bus, CLI, relay, hooks, ledger or history modules; auto-link rules (one regex subset in Python and the browser's engine, hostile words, refusing any pattern a crafted word could make slow, with a 5 s runaway-only timing backstop in node), the Claims view and admin release without an admin ledger, pins, replies and `@admin` |
 | `tests/test_conformance.py` | The `_native` contract listed above, with the bus behaviours summary |
 | `tests/test_harness.py` | The test harness and release tooling: a killed run's temp directory is swept by the next run, and nothing else is; `scripts/release-notes.sh` gives a tag exactly its CHANGELOG section and refuses a tag without one; `scripts/check-dist.sh` lets only one wheel per architecture and the sdist of the tag's version be published; every command's `--version` and `-V` print `<command> <version>` with an empty environment |
 
@@ -758,7 +832,8 @@ database's layout, go away with a rollback: the `cancel` op (the rollback refuse
 command-line acquire stays queued until its deadline), the waiter cutoff at the request's expiry, the per-owner pending
 cap, the refusal of a lease you already hold, the reply window beyond 300 s, and the reworded refusals and DMs; since
 0.3.0, the `leases`, `lease_history` and `ping` ops (a client is told the ledgerd is older than 0.3.0), the lease
-history and the expiry DM.
+history and the expiry DM; and since 0.3.1, the `claim`, `unclaim`, `claims` and `holders` ops (claims made before a
+rollback are kept and come back with 0.3.1).
 
 ## Roadmap
 

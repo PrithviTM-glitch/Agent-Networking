@@ -40,7 +40,7 @@ struct Service {
 
 impl Handler for Service {
     fn connected(&self, conn: &Conn, _session_present: bool) {
-        let topics = ["ledger/req", "ledger/req/+", "agents/+"];
+        let topics = ["ledger/req", "ledger/req/+", "agents/+", "rooms/+"];
         let _ = conn.subscribe(topics.iter().map(|t| filter(t, true, false)).collect());
         log(&format!("connected to {}, db {}", self.broker, self.db));
     }
@@ -171,6 +171,8 @@ fn handle(ledger: &mut Ledger, publish: &mut dyn FnMut(Outgoing), m: &Message) {
     if topic == "ledger/req" || topic.starts_with("ledger/req/") {
         let via = topic.strip_prefix("ledger/req/").filter(|v| !v.is_empty());
         ledger.handle(publish, &m.payload, m.response_topic.as_deref(), m.correlation.as_deref(), via, m.expiry);
+    } else if let Some(room) = topic.strip_prefix("rooms/").filter(|r| is_addr(r)) {
+        ledger.room(room, &m.payload);
     } else if let Some(who) = topic.strip_prefix("agents/").filter(|a| is_addr(a)) {
         let payload = m.payload.clone();
         if let Err(store::Fail::Bad(e) | store::Fail::Internal(e)) = ledger.run(publish, |l| l.presence(who, &payload))

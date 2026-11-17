@@ -170,6 +170,22 @@ pub fn not_admin(value: Option<&str>, what: &str) -> Result<()> {
     }
 }
 
+/// A message's id (protocol::message_id): 16 lowercase hex digits.
+pub fn is_message_id(value: &str) -> bool {
+    value.len() == 16 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// What a reply answers: the id of that message, as recv, history and watch show it.
+pub fn check_reply_to(value: &str) -> Result<&str> {
+    if !is_message_id(value) {
+        return fail(format!(
+            "bad reply_to {}: the id of the message you answer (16 hex digits, as recv and history show it)",
+            py_repr(value)
+        ));
+    }
+    Ok(value)
+}
+
 pub fn is_uuid(value: &str) -> bool {
     let b = value.as_bytes();
     b.len() == 36

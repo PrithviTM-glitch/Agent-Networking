@@ -13,13 +13,14 @@ from . import events, sessions
 from .processes import ERRORS, Refused
 
 BACKLOG = 2000
-MUTATING = ("release", "deny")  # the ledger ops the console's actions apply
+MUTATING = ("release", "deny", "unclaim")  # the ledger ops the console's actions apply
 SYS_MAX = 500  # $SYS topics kept: mosquitto publishes about 60, so this only bounds a hostile flood
 # Publishes mosquitto dropped since it started, at its inflight and queue limits: QoS 0 past the queue, and QoS 1 to a
 # connected agent that doesn't drain, while the sender still saw success. The page and status show it.
 DROPPED = "$SYS/broker/publish/messages/dropped"
 held = {"bus": None}
 settings = {}  # room -> its moderation record as rooms_view shows it, from the retained rooms/<room> topics
+pins = {}  # room -> its pinned message {text, by, ts}, from the retained rooms/<room>/pin topics
 broker = {}  # $SYS topic -> its latest text, the broker's own statistics (mosquitto publishes every sys_interval)
 
 
@@ -27,6 +28,7 @@ def _dispatch(kind, key, value):
     if kind == "connected":
         sessions.clear_presence()
         broker.clear()
+        pins.clear()
     elif kind == "sys":
         if key in broker or len(broker) < SYS_MAX:
             old, broker[key] = broker.get(key), value
@@ -35,6 +37,12 @@ def _dispatch(kind, key, value):
     elif kind == "presence":
         sessions.set_presence(key, value)
         sessions.push_agents()
+    elif kind == "pin":
+        if value:
+            pins[key] = value
+        else:
+            pins.pop(key, None)
+        events.push({"kind": "pin", "room": key, "pin": value})
     elif kind == "room":
         settings[key] = _native.rooms_view(key, value)
         events.push({"kind": "room", "info": settings[key]})
@@ -92,10 +100,19 @@ def need_bus():
     return bus
 
 
+def with_ids(entries):
+    """History entries with the id live messages carry (derived from topic, sender and ts), so replies thread and can
+    be answered on a freshly opened page."""
+    for e in entries:
+        if isinstance(e.get("topic"), str) and isinstance(e.get("from"), str) and isinstance(e.get("ts"), int | float):
+            e["id"] = _native.message_id(e["topic"], e["from"], e["ts"])
+    return entries
+
+
 def backlog():
     """The last messages from historyd, for a newly opened console; none while historyd is down."""
     try:
-        return _native.history_call("recent", as_=ADMIN, last=BACKLOG)["messages"]
+        return with_ids(_native.history_call("recent", as_=ADMIN, last=BACKLOG)["messages"])
     except HistoryError as e:
         print(f"admin: no backlog: {e}", file=sys.stderr, flush=True)
         return []
@@ -119,6 +136,13 @@ def ledger_call(op, as_, **fields):
 
 def dump():
     d = ledger_call("dump", ADMIN)
+    d.pop("ok", None)
+    return d
+
+
+def claims():
+    """Every room's claims, in one call (only admin may list them all)."""
+    d = ledger_call("claims", ADMIN)
     d.pop("ok", None)
     return d
 

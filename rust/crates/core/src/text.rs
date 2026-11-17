@@ -2,9 +2,10 @@
 //!
 //! "14:02:31 #ops alice-1a2b3c: hello", "14:02:31 DM alice-1a2b3c -> bob-9f8e7d: hi", "14:02:31 broadcast admin: ..."
 //! or "14:02:31 ci/build alice-1a2b3c: ..." for a raw topic ("-" when plain text has no sender). " (mentions you)"
-//! follows the sender when the message mentions this agent. A message from another day starts with its date. Later
-//! lines of a multi-line body are indented two spaces, and anything a terminal would act on rather than show (a
-//! carriage return, a bidi or zero-width mark) is written escaped, so a body can never redraw or reorder the output.
+//! follows the sender when the message mentions this agent, and " (re 3f9a01b2)" (the first 8 digits of the parent's
+//! id) when it is a reply. A message from another day starts with its date. Later lines of a multi-line body are
+//! indented two spaces, and anything a terminal would act on rather than show (a carriage return, a bidi or zero-width
+//! mark) is written escaped, so a body can never redraw or reorder the output.
 
 use crate::json::{Map, is_format_control, now};
 use crate::stamp::local;
@@ -43,9 +44,13 @@ pub fn line(msg: &Map) -> String {
         format!("{topic} {from}")
     };
     let mentions = if msg.get("for_me") == Some(&Value::Bool(true)) { " (mentions you)" } else { "" };
+    let reply = msg
+        .get("reply_to")
+        .and_then(Value::as_str)
+        .map(|p| format!(" (re {})", shown(&p.chars().take(8).collect::<String>())));
     let ts = msg.get("ts").and_then(Value::as_f64).unwrap_or_else(now);
     let body = msg.get("body").and_then(Value::as_str).unwrap_or("");
-    format!("{} {place}{mentions}: {}", when(ts), shown(body))
+    format!("{} {place}{mentions}{}: {}", when(ts), reply.unwrap_or_default(), shown(body))
 }
 
 #[cfg(test)]
@@ -67,6 +72,9 @@ mod tests {
         assert_eq!(line(&dm), format!("{time} DM al-1 -> bo-2: a\n  b"), "continuation lines indented");
         let at = msg(json!({"topic": "room/ops", "from": "al-1", "body": "@bo", "ts": t, "for_me": true}));
         assert_eq!(line(&at), format!("{time} #ops al-1 (mentions you): @bo"));
+        let re =
+            msg(json!({"topic": "room/ops", "from": "al-1", "body": "yes", "ts": t, "reply_to": "3f9a01b2c4d5e6f7"}));
+        assert_eq!(line(&re), format!("{time} #ops al-1 (re 3f9a01b2): yes"));
         let raw = msg(json!({"topic": "ci/build", "from": null, "body": "ok\r\u{202e}x\u{200b}", "ts": t}));
         assert_eq!(line(&raw), format!("{time} ci/build -: ok\\r\\u202ex\\u200b"), "nothing a terminal acts on");
         let old = msg(json!({"topic": "broadcast", "from": "admin", "body": "x", "ts": 86400.0 * 3.0}));

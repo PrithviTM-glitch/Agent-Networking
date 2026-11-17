@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// how long ledgerd and historyd get to answer
 const ANSWER_S: f64 = 3.0;
+/// stale relays named on the plain line; --json lists them all
+const SHOWN: usize = 5;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
@@ -303,8 +305,14 @@ fn relays(dir: &Path) -> Check {
     if stale.is_empty() {
         return check("relays", Status::Ok, counts).with("stale", json!([]));
     }
-    let sessions: Vec<String> =
-        stale.iter().map(|s| format!("{} (pid {})", s["session"].as_str().unwrap_or(""), s["pid"])).collect();
+    let mut sessions: Vec<String> = stale
+        .iter()
+        .take(SHOWN)
+        .map(|s| format!("{} (pid {})", s["session"].as_str().unwrap_or(""), s["pid"]))
+        .collect();
+    if stale.len() > SHOWN {
+        sessions.push(format!("and {} more (doctor --json lists all)", stale.len() - SHOWN));
+    }
     check(
         "relays",
         Status::Warn,

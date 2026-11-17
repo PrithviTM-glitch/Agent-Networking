@@ -122,7 +122,7 @@ pub fn call_over(
     timeout: Option<f64>,
 ) -> Result<Map, LedgerError> {
     let timeout = timeout_for(&fields, timeout);
-    let newer = op.as_str().filter(|o| NEWER_OPS.contains(o)).map(str::to_owned);
+    let newer = op.as_str().and_then(|o| NEWER_OPS.iter().find(|(name, _)| *name == o)).copied();
     let mut req = Map::new();
     req.insert("op".into(), op);
     req.extend(fields);
@@ -151,8 +151,10 @@ pub fn call_over(
     match crate::json::loads(&payload) {
         Some(Value::Object(reply)) if reply.get("ok") == Some(&Value::Bool(true)) => Ok(reply),
         Some(Value::Object(reply)) => match newer {
-            Some(op) if reply.get("error").and_then(Value::as_str).is_some_and(|e| e.starts_with("op: one of")) => {
-                Err(LedgerError::new(format!("ledgerd is older than 0.3.0 and has no {op} op")))
+            Some((op, since))
+                if reply.get("error").and_then(Value::as_str).is_some_and(|e| e.starts_with("op: one of")) =>
+            {
+                Err(LedgerError::new(format!("ledgerd is older than {since} and has no {op} op")))
             }
             _ => Err(LedgerError { reply }),
         },
@@ -160,8 +162,16 @@ pub fn call_over(
     }
 }
 
-/// Ops a ledgerd before 0.3.0 does not know: its refusal is turned into one that says so.
-const NEWER_OPS: [&str; 3] = ["leases", "lease_history", "ping"];
+/// Ops an older ledgerd does not know, with the version that added them: its refusal is turned into one that says so.
+const NEWER_OPS: [(&str, &str); 7] = [
+    ("leases", "0.3.0"),
+    ("lease_history", "0.3.0"),
+    ("ping", "0.3.0"),
+    ("claim", "0.3.1"),
+    ("unclaim", "0.3.1"),
+    ("claims", "0.3.1"),
+    ("holders", "0.3.1"),
+];
 /// The exit status of acquire --exec when it never got the lease or lost it while the command ran (EX_TEMPFAIL).
 pub const EXEC_NO_LEASE: i32 = 75;
 /// How long a command that lost its lease gets between SIGTERM and SIGKILL.

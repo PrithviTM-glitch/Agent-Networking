@@ -10,12 +10,12 @@ use agent_bridge::ledger::{
     MAX_WAITERS, random_hex,
 };
 use agent_bridge::stamp::stamp;
-use agent_bridge::validation::is_ident;
+use agent_bridge::validation::{ADMIN, is_ident};
 use rusqlite::types::{Value as Sql, ValueRef};
 use rusqlite::{Connection, Params, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 const MAX_PAYLOAD: usize = 16384;
 const MAX_CORR: usize = 256;
@@ -27,7 +27,11 @@ const DEDUPE_S: f64 = 300.0;
 const MAX_KEEP: f64 = MAX_TTL + MAX_WAIT;
 /// A waiter is dropped this long before its client stops listening, so its lease reply still reaches it.
 const REPLY_MARGIN: f64 = 1.0;
-const READ_ONLY: [&str; 7] = ["ledger", "public", "grants", "dump", "leases", "lease_history", "ping"];
+const READ_ONLY: [&str; 9] =
+    ["ledger", "public", "grants", "dump", "leases", "lease_history", "ping", "claims", "holders"];
+/// claims one agent may hold, and one room may have
+const MAX_CLAIMS_HELD: i64 = 256;
+const MAX_CLAIMS_ROOM: i64 = 1024;
 /// lease events kept per resource, newest
 const MAX_EVENTS: i64 = 200;
 const WAITER: &str = "SELECT seq, resource, holder, level, topic, ttl, corr FROM waiters";
@@ -59,6 +63,9 @@ CREATE INDEX IF NOT EXISTS leases_holder ON leases(holder);
 CREATE INDEX IF NOT EXISTS waiters_resource ON waiters(resource, seq);
 CREATE INDEX IF NOT EXISTS replies_ts ON replies(ts);
 CREATE INDEX IF NOT EXISTS lease_events_resource ON lease_events(resource, seq);
+CREATE TABLE IF NOT EXISTS claims(room TEXT NOT NULL, key TEXT NOT NULL, holder TEXT NOT NULL, since REAL NOT NULL,
+  expires REAL, note TEXT NOT NULL, PRIMARY KEY(room, key));
+CREATE INDEX IF NOT EXISTS claims_holder ON claims(holder);
 ";
 
 /// Why an op failed: refused (the message goes back) or broken (logged, "internal error" goes back).
@@ -124,6 +131,8 @@ pub struct Ledger {
     out: Vec<Outgoing>,
     swept: f64,
     stale_s: f64,
+    /// each room's moderators, from its retained rooms/<room> record
+    moderators: HashMap<String, Vec<String>>,
 }
 
 /// Why Ledger::open failed: a database another schema version wrote (refused before anything is written), or
@@ -183,7 +192,13 @@ impl Ledger {
             Ok(())
         };
         setup().map_err(|e| failed(&e))?;
-        Ok(Ledger { db, out: Vec::new(), swept: 0.0, stale_s: (stale_days * 86400.0).max(1.0) })
+        Ok(Ledger {
+            db,
+            out: Vec::new(),
+            swept: 0.0,
+            stale_s: (stale_days * 86400.0).max(1.0),
+            moderators: HashMap::new(),
+        })
     }
 
     fn rows<P: Params>(&self, sql: &str, args: P) -> Res<Vec<Map>> {
@@ -327,6 +342,13 @@ impl Ledger {
             "init" => self.op_init(me, now)?,
             "dump" => self.op_dump(now)?,
             "ping" => obj(json!({"service": "ledgerd", "version": env!("CARGO_PKG_VERSION")})),
+            "claims" => self.op_claims(me, args.get("room").and_then(Value::as_str))?,
+            "holders" => self.op_holders(args.get("resource").and_then(Value::as_str).unwrap_or_default())?,
+            // the holder, a moderator or admin, whether or not they have a ledger: it touches no resource
+            "unclaim" => {
+                let a = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default();
+                self.op_unclaim(me, a("room"), a("key"))?
+            }
             _ => {
                 if self.exec("UPDATE ledgers SET seen=? WHERE owner=?", params![now, me])? == 0 {
                     return bad(format!("no ledger for {me}, call init first"));
@@ -356,6 +378,11 @@ impl Ledger {
                     "release" => self.op_release(me, a("lease_id").unwrap_or_default())?,
                     "cancel" => self.op_cancel(me, req.topic, a("correlation").unwrap_or_default())?,
                     "leases" => self.op_leases(me)?,
+                    "claim" => {
+                        let ttl = args.get("ttl").and_then(Value::as_f64);
+                        let (room, key) = (a("room").unwrap_or_default(), a("key").unwrap_or_default());
+                        self.op_claim(me, now, room, key, ttl, a("note").unwrap_or_default())?
+                    }
                     "lease_history" => {
                         self.op_lease_history(me, a("resource").unwrap_or_default(), n("last") as i64)?
                     }
@@ -762,6 +789,98 @@ impl Ledger {
         Ok(obj(json!({"resource": resource, "events": events})))
     }
 
+    /// Claim key in room for me, or refresh my own claim's ttl and note; another holder's claim is refused, naming it.
+    fn op_claim(&mut self, me: &str, now: f64, room: &str, key: &str, ttl: Option<f64>, note: &str) -> Res<Map> {
+        let expires = ttl.map(|t| now + t);
+        match self.one("SELECT * FROM claims WHERE room=? AND key=?", [room, key])? {
+            Some(c) if s(&c, "holder") != me => {
+                let since = c["since"].as_f64().unwrap_or_default();
+                let mut body =
+                    error(&format!("{key} in #{room} is claimed by {} since {}", s(&c, "holder"), utc_hms(since)));
+                body.insert("claim".into(), Value::Object(claim_view(&c)));
+                return Ok(body);
+            }
+            Some(_) => {
+                self.exec(
+                    "UPDATE claims SET expires=?, note=? WHERE room=? AND key=?",
+                    params![expires, note, room, key],
+                )?;
+            }
+            None => {
+                if self.count("SELECT count(*) FROM claims WHERE holder=?", [me])? >= MAX_CLAIMS_HELD {
+                    return bad(format!("at most {MAX_CLAIMS_HELD} claims per agent"));
+                }
+                if self.count("SELECT count(*) FROM claims WHERE room=?", [room])? >= MAX_CLAIMS_ROOM {
+                    return bad(format!("at most {MAX_CLAIMS_ROOM} claims per room"));
+                }
+                self.exec("INSERT INTO claims VALUES (?, ?, ?, ?, ?, ?)", params![room, key, me, now, expires, note])?;
+            }
+        }
+        let c = self.one("SELECT * FROM claims WHERE room=? AND key=?", [room, key])?.unwrap_or_default();
+        Ok(obj(json!({"claim": claim_view(&c)})))
+    }
+
+    /// Release a claim: its holder, admin, or a moderator of its room; someone else's release DMs the holder.
+    fn op_unclaim(&mut self, me: &str, room: &str, key: &str) -> Res<Map> {
+        let Some(c) = self.one("SELECT * FROM claims WHERE room=? AND key=?", [room, key])? else {
+            return bad(format!("no claim {key} in #{room}"));
+        };
+        let holder = s(&c, "holder");
+        let moderator = me == ADMIN || self.moderators.get(room).is_some_and(|m| m.iter().any(|x| x == me));
+        if holder != me && !moderator {
+            return bad(format!(
+                "{key} in #{room} is claimed by {holder}; only they, a moderator of #{room} or admin can release it"
+            ));
+        }
+        self.exec("DELETE FROM claims WHERE room=? AND key=?", [room, key])?;
+        if holder != me {
+            self.notify(holder, format!("{me} released your claim {key} in #{room}"));
+        }
+        Ok(Map::new())
+    }
+
+    /// One room's claims, oldest first; every room's for admin alone.
+    fn op_claims(&mut self, me: &str, room: Option<&str>) -> Res<Map> {
+        let rows = match room {
+            Some(room) => self.rows("SELECT * FROM claims WHERE room=? ORDER BY since", [room])?,
+            None if me == ADMIN => self.rows("SELECT * FROM claims ORDER BY room, since", [])?,
+            None => return bad("room: required (only admin lists every room)"),
+        };
+        let claims: Vec<Value> = rows.iter().map(|c| Value::Object(claim_view(c))).collect();
+        let mut body = obj(json!({"claims": claims}));
+        if let Some(room) = room {
+            body.insert("room".into(), room.into());
+        }
+        Ok(body)
+    }
+
+    /// Who holds resource now, and who waits for it, for anyone who asks.
+    fn op_holders(&mut self, resource: &str) -> Res<Map> {
+        self.resource(resource, None)?;
+        let holders = self.holders(resource)?;
+        let waiting: Vec<Value> = self
+            .rows("SELECT holder, level, queued FROM waiters WHERE resource=? ORDER BY seq", [resource])?
+            .iter()
+            .map(|w| json!({"holder": w["holder"], "level": w["level"], "queued_at": w["queued"]}))
+            .collect();
+        Ok(obj(json!({"resource": resource, "holders": holders, "waiting": waiting})))
+    }
+
+    /// The moderators of room, from its retained record (published at QoS 1, so this ledgerd's persistent session
+    /// receives every change in order); an empty payload deletes the room.
+    pub fn room(&mut self, room: &str, payload: &[u8]) {
+        match agent_bridge::rooms::parse_room(payload) {
+            Some(rec) => {
+                let mods = rec.get("moderators").and_then(Value::as_array).cloned().unwrap_or_default();
+                let mods = mods.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+                self.moderators.insert(room.to_owned(), mods);
+            }
+            None => {
+                self.moderators.remove(room);
+            }
+        }
+    }
+
     /// The refusal for a lease me may not touch: another agent's, or one that is gone.
     fn no_lease<T>(&self, lease_id: &str) -> Res<T> {
         match self.one("SELECT holder FROM leases WHERE id=?", [lease_id])? {
@@ -912,6 +1031,7 @@ impl Ledger {
         }
         self.exec("DELETE FROM leases WHERE holder=?", [who])?;
         self.exec("DELETE FROM requests WHERE holder=? OR owner=?", [who, who])?;
+        self.exec("DELETE FROM claims WHERE holder=?", [who])?;
         self.exec("DELETE FROM ledgers WHERE owner=?", [who])?;
         for r in touched {
             self.pump(&r)?;
@@ -949,6 +1069,11 @@ impl Ledger {
                 self.pump(s(&w, "resource"))?;
             }
         }
+        for c in self.rows("SELECT * FROM claims WHERE expires<=?", [now])? {
+            let (room, key) = (s(&c, "room"), s(&c, "key"));
+            self.exec("DELETE FROM claims WHERE room=? AND key=?", [room, key])?;
+            self.notify(s(&c, "holder"), format!("your claim {key} in #{room} expired"));
+        }
         if now - self.swept >= self.sweep_every() {
             self.swept = now;
             let cutoff = now - self.stale_s;
@@ -968,7 +1093,9 @@ impl Ledger {
 
     pub fn next_deadline(&self) -> f64 {
         let mut t = self.swept + self.sweep_every();
-        for sql in ["SELECT min(expires) FROM leases", "SELECT min(deadline) FROM waiters"] {
+        for sql in
+            ["SELECT min(expires) FROM leases", "SELECT min(deadline) FROM waiters", "SELECT min(expires) FROM claims"]
+        {
             if let Ok(Some(v)) = self.db.query_row(sql, [], |r| r.get::<_, Option<f64>>(0)) {
                 t = t.min(v);
             }
@@ -995,6 +1122,17 @@ impl Ledger {
         )?;
         Ok(())
     }
+}
+
+fn claim_view(c: &Map) -> Map {
+    obj(json!({"room": c["room"], "key": c["key"], "holder": c["holder"], "since": c["since"],
+               "expires_at": c.get("expires").cloned().unwrap_or(Value::Null), "note": c["note"]}))
+}
+
+/// HH:MM:SS UTC of a timestamp, for refusals that name a moment.
+fn utc_hms(ts: f64) -> String {
+    let day = (ts.max(0.0) as u64) % 86400;
+    format!("{:02}:{:02}:{:02} UTC", day / 3600, day % 3600 / 60, day % 60)
 }
 
 fn error(text: &str) -> Map {
@@ -1096,6 +1234,76 @@ mod tests {
         assert_eq!(h["events"][0]["event"], "expire");
         ask(&mut ledger, n, "o-1", json!({"op": "remove", "name": "r"}));
         assert_eq!(ledger.count("SELECT count(*) FROM lease_events", []).ok(), Some(0), "removed with the resource");
+    }
+
+    #[test]
+    fn claims_are_held_until_released_expired_or_dropped() {
+        let dir = Dir::new("claims");
+        let mut ledger = Ledger::open(&dir.join("ledger.db"), 3.0).ok().expect("opens");
+        let n = &mut 0;
+        for who in ["a-1", "b-1"] {
+            ask(&mut ledger, n, who, json!({"op": "init"}));
+        }
+        let claim = |key: &str| json!({"op": "claim", "room": "mrs", "key": key, "note": "on it"});
+        let (mine, _) = ask(&mut ledger, n, "a-1", claim("BX-1"));
+        assert_eq!((mine["claim"]["holder"].as_str(), mine["claim"]["expires_at"].is_null()), (Some("a-1"), true));
+        let (taken, _) = ask(&mut ledger, n, "b-1", claim("BX-1"));
+        let err = taken["error"].as_str().unwrap_or_default();
+        assert!(err.starts_with("BX-1 in #mrs is claimed by a-1 since ") && err.ends_with(" UTC"), "{err}");
+        assert_eq!(taken["claim"]["holder"], "a-1", "the refusal carries the claim");
+        let (again, _) = ask(&mut ledger, n, "a-1", json!({"op": "claim", "room": "mrs", "key": "BX-1", "ttl": 60}));
+        assert!(again["claim"]["expires_at"].is_number() && again["claim"]["note"] == "", "a re-claim replaces both");
+
+        let (no, _) = ask(&mut ledger, n, "b-1", json!({"op": "unclaim", "room": "mrs", "key": "BX-1"}));
+        assert_eq!(
+            no["error"],
+            "BX-1 in #mrs is claimed by a-1; only they, a moderator of #mrs or admin can release it"
+        );
+        let record = json!({"mode": "open", "moderators": ["m-1"], "rules": "", "muted": [], "banned": [], "by": "admin",
+                            "ts": 1.0});
+        ledger.room("mrs", dumps(&record).as_bytes());
+        let (ok, out) = ask(&mut ledger, n, "m-1", json!({"op": "unclaim", "room": "mrs", "key": "BX-1"}));
+        assert_eq!(ok["ok"], true, "{ok:?}");
+        assert!(out.iter().any(|o| o.0 == "inbox/a-1" && o.1.contains("m-1 released your claim BX-1 in #mrs")));
+        ledger.room("mrs", b"");
+        ask(&mut ledger, n, "a-1", claim("BX-2"));
+        let (no, _) = ask(&mut ledger, n, "m-1", json!({"op": "unclaim", "room": "mrs", "key": "BX-2"}));
+        assert!(no["error"].as_str().is_some_and(|e| e.contains("only they")), "the room record was cleared");
+        let (ok, _) = ask(&mut ledger, n, "admin", json!({"op": "unclaim", "room": "mrs", "key": "BX-2"}));
+        assert_eq!(ok["ok"], true);
+        let ledgers = ledger.count("SELECT count(*) FROM ledgers WHERE owner IN ('admin', 'm-1')", []).ok();
+        assert_eq!(ledgers, Some(0), "a moderator and admin release claims without a ledger, and none is made");
+        let (gone, _) = ask(&mut ledger, n, "a-1", json!({"op": "unclaim", "room": "mrs", "key": "BX-2"}));
+        assert_eq!(gone["error"], "no claim BX-2 in #mrs");
+
+        ask(&mut ledger, n, "a-1", claim("CC-1"));
+        ask(&mut ledger, n, "b-1", json!({"op": "claim", "room": "dev", "key": "H1"}));
+        let (list, _) = ask(&mut ledger, n, "nobody-0", json!({"op": "claims", "room": "mrs"}));
+        assert_eq!(
+            (list["room"].as_str(), list["claims"].as_array().map(Vec::len)),
+            (Some("mrs"), Some(1)),
+            "no ledger needed"
+        );
+        let (refused, _) = ask(&mut ledger, n, "a-1", json!({"op": "claims"}));
+        assert_eq!(refused["error"], "room: required (only admin lists every room)");
+        let (all, _) = ask(&mut ledger, n, "admin", json!({"op": "claims"}));
+        let rooms: Vec<&str> =
+            all["claims"].as_array().into_iter().flatten().filter_map(|c| c["room"].as_str()).collect();
+        assert_eq!(rooms, ["dev", "mrs"]);
+
+        ask(&mut ledger, n, "a-1", json!({"op": "claim", "room": "mrs", "key": "T-1", "ttl": 30}));
+        ledger.db.execute("UPDATE claims SET expires=0 WHERE key='T-1'", []).expect("ages the claim");
+        let mut out = Vec::new();
+        ledger.run(&mut |o| out.push(o), Ledger::tick).ok().expect("ticks");
+        assert!(out.iter().any(|o| o.0 == "inbox/a-1" && o.1.contains("your claim T-1 in #mrs expired")), "{out:?}");
+        ask(&mut ledger, n, "a-1", json!({"op": "drop"}));
+        let (left, _) = ask(&mut ledger, n, "admin", json!({"op": "claims"}));
+        assert_eq!(left["claims"].as_array().map(Vec::len), Some(1), "only b-1's claim is left: {left:?}");
+
+        ask(&mut ledger, n, "b-1", json!({"op": "add", "name": "db", "visibility": "public", "max_level": "write"}));
+        ask(&mut ledger, n, "b-1", json!({"op": "acquire", "resource": "b-1/db", "level": "write"}));
+        let (h, _) = ask(&mut ledger, n, "nobody-0", json!({"op": "holders", "resource": "b-1/db"}));
+        assert_eq!((h["holders"][0]["holder"].as_str(), h["waiting"].as_array().map(Vec::len)), (Some("b-1"), Some(0)));
     }
 
     #[test]

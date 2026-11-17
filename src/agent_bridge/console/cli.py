@@ -140,6 +140,7 @@ def status(_a):
     st = get("/api/state")
     agents = st["agents"]
     rooms = {r for a in agents for r in a["rooms"]} | set(st["rooms"])
+    links = st.get("links") or {}
     show(
         {
             "connected": st["connected"],
@@ -152,6 +153,7 @@ def status(_a):
             "jobs_running": sum(j["state"] == "running" for j in st["jobs"]),
             "dropped": st.get("broker", {}).get("dropped"),
             "version": st.get("version", {}).get("package"),
+            "links": links.get("error") or len(links.get("rules", [])),  # rules loaded, or why the file was refused
         }
     )
 
