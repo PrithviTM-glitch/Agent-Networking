@@ -167,8 +167,12 @@ Two conditions on those last two rows:
   is TCP on loopback today, so loopback services stay reachable; Docker's TCP port must stay off (the default). The
   launcher or managed settings apply the sandbox; the agent never configures its own.
 - **"Enforced" is per session.** A sandboxed session can't write the tree, but it can still ask an unsandboxed one
-  to, over the bus, guarded only by the "data, not instructions" framing. The guarantee holds for a worktree only
-  when every agent session is sandboxed, which the console shows as "enforced for N of M sessions".
+  to, over the bus, guarded only by the "data, not instructions" framing. The path guard narrows that: an
+  unsandboxed session that doesn't hold the lease is refused by its own guard, so the route needs the holder or an
+  unguarded session. Hence the guard in managed settings for every session, and the guarantee holds for a worktree
+  only when every agent session is sandboxed, which the console shows as "enforced for N of M sessions". The
+  sandbox also gets its own PID namespace (`--unshare-pid --proc /proc`): writing through `/proc/<pid>/root` was
+  measured as refused already, and this keeps it from resting on the user namespace alone.
 - **On an SSH target, the next grant waits** for the target agent's acknowledgement that the previous holder's
   processes are gone, `lsof +D` is empty and files are handed back; `reconcile` reports a release with no
   acknowledgement.
