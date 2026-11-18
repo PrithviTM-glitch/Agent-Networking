@@ -151,7 +151,7 @@ SSH. `agent-bridge worktree acquire|release|status <path>` (and MCP equivalents)
 | Git's `reference-transaction` hook, installed per repo on the user's confirm ("Protect this repo", chaining any existing hook) | every ref change on the locked worktree's branch, from any worktree: commit (with `--no-verify` too), amend, reset, rebase, merge, cherry-pick, stash, `checkout -B`, `branch -D`, `update-ref`, tag, `worktree add`, fetch into local refs. Hooks are shared, so it scopes by which worktree owns the branch | `-c core.hooksPath=...`, editing `packed-refs` or the ref file directly; file edits, `git add`, `restore`, `clean` (no ref changes) |
 | The path guard (section 6): `Edit`, `Write`, `NotebookEdit` and MCP write tools by resolved path, and shell writes (`rm`, `mv`, `cp`, `tee`, `sed -i`, redirects, `git -C`, `make` inside, `find -delete`) | 7 of 7 file-tool writes and 16 of 16 shell writes in the prototype, symlinks, `../` and hard links included; it also protects the branch's ref files and refuses the `core.hooksPath` overrides while a lock is active | interpreters (`python -c`), scripts run from outside, background jobs, other harnesses |
 | The git gate remote (5.4) | pushes, deterministically | nothing short of the issuer's credential |
-| **bubblewrap per session**, every other worktree bound read-only | any write by any route ("Read-only file system", raw ref writes and Python included); the session can't remount it, and neither can the same user outside | a session picks up a newly leased worktree only on restart, or through a root helper |
+| **bubblewrap per session**, every other worktree bound read-only | any write by any route ("Read-only file system", raw ref writes and Python included); the session can't remount it, and neither can the same user outside | ref writes in the shared common dir (history); a newly leased worktree only on restart or through a root helper; void if the sandbox exposes the docker or libvirt socket |
 | SSH targets: the root target agent grants a POSIX ACL on the dir to the leased account and removes it at release | new opens after release | an open file or a working directory inside the tree keeps writing after revoke (measured), so release also runs `terminate-user` and checks `lsof +D` is empty, then hands created files back to their owner |
 
 Two conditions on those last two rows:
@@ -164,7 +164,8 @@ Two conditions on those last two rows:
   acknowledgement.
 
 Labels, shown in two parts:
-- **files:** `hook` with the path guard installed, `credential` under bubblewrap or on an SSH target, otherwise `soft`;
+- **files:** `hook` with the path guard installed, `credential` under bubblewrap (launcher-applied, docker and libvirt
+  sockets hidden) or on an SSH target, otherwise `soft`;
 - **history:** `hook` in a protected repo, also inside a sandbox (the shared ref store must stay writable for the
   session's own commits), `none` otherwise (only Claude Code's own git calls are checked), `credential` on an SSH
   target.
