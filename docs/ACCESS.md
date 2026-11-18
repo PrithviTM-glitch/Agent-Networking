@@ -138,7 +138,34 @@ The device's trusted-key list is the only gate (F10). Enforcement needs the huma
 
 Until then, adb is a soft lock. adb has no read mode, so only write leases.
 
-### 5.6 Coordination-only locks
+### 5.6 Worktrees and directories
+
+The user's ask: nobody but the holder (and admin) changes or pushes a worktree without its lease, locally or over
+SSH. `agent-bridge worktree acquire|release|status <path>` (and MCP equivalents) resolves the realpath and leases
+`admin/wt-<first 16 hex of its sha256>`, with the path in the description; nobody types that id. Measured on git
+2.43, a kernel and the user's systemd, in scratch directories only:
+
+| Layer | What it stops | What gets past it |
+|---|---|---|
+| `git worktree lock` with the lease in the reason, set at acquire | `git worktree remove` refuses even with one `--force`, quoting the lease; the janitor and stray cleanups | commits; `-f -f` overrides it |
+| Git's `reference-transaction` hook, installed per repo on the user's confirm ("Protect this repo", chaining any existing hook) | every ref change on the locked worktree's branch, from any worktree: commit (with `--no-verify` too), amend, reset, rebase, merge, cherry-pick, stash, `checkout -B`, `branch -D`, `update-ref`, tag, `worktree add`, fetch into local refs. Hooks are shared, so it scopes by which worktree owns the branch | `-c core.hooksPath=...`, editing `packed-refs` or the ref file directly; file edits, `git add`, `restore`, `clean` (no ref changes) |
+| The path guard (section 6): `Edit`, `Write`, `NotebookEdit` and MCP write tools by resolved path, and shell writes (`rm`, `mv`, `cp`, `tee`, `sed -i`, redirects, `git -C`, `make` inside, `find -delete`) | 7 of 7 file-tool writes and 16 of 16 shell writes in the prototype, symlinks, `../` and hard links included; it also protects the branch's ref files and refuses the `core.hooksPath` overrides while a lock is active | interpreters (`python -c`), scripts run from outside, background jobs, other harnesses |
+| The git gate remote (5.4) | pushes, deterministically | nothing short of the issuer's credential |
+| **bubblewrap per session**, every other worktree bound read-only | any write by any route ("Read-only file system", raw ref writes and Python included); the session can't remount it, and neither can the same user outside | a session picks up a newly leased worktree only on restart, or through a root helper |
+| SSH targets: the root target agent grants a POSIX ACL on the dir to the leased account and removes it at release | new opens after release | an open file or a working directory inside the tree keeps writing after revoke (measured), so release also runs `terminate-user` and checks `lsof +D` is empty, then hands created files back to their owner |
+
+Labels, shown in two parts:
+- **files:** `hook` with the path guard installed, `credential` under bubblewrap or on an SSH target, otherwise `soft`;
+- **history:** `hook` in a protected repo, `none` otherwise (only Claude Code's own git calls are checked), `credential`
+  on an SSH target.
+
+So `files: hook · history: none` is an unprotected local repo with the guard installed. One separate OS user for
+agents separates them from the human, not from each other; per-lane locks at the credential level locally need
+bubblewrap or a user per lane. Uncommitted work is the one thing no git gate sees: release can take a snapshot ref so
+nothing is lost. The console flags two live sessions working in the same worktree today, from cwd data it already
+has, and the janitor's candidates become worktrees with no lease, no claim, no session inside, clean and merged.
+
+### 5.7 Coordination-only locks
 
 `test-runner` and other locks with nothing to issue stay `hook (soft lock)`: only the guard enforces them, and their
 label says so.
@@ -211,6 +238,10 @@ Recommendation first. The major ones:
 | 8 | Order | Issued credentials only after AUTH.md's enforce | Earlier, accepting readable reply topics |
 | 9 | The live sshd test | Approve the `openssh-server` download in the testing session directly, so the *docs* rows get measured | Accept the docs-based rows |
 | 10 | Agents' OS user | A separate user without docker and libvirt, as the long-term fix | Document and accept the residual |
+| 11 | Local worktree locks | The path guard plus the git hook in protected repos (labelled `hook`), with the push gate as the hard line; bubblewrap per session where a hard local lock is worth a restart to pick up a new lease | The `hook` label only; or a user per lane |
+| 12 | Installing the git hook | Opt-in per repo from the console ("Protect this repo"), chaining any existing hook, audited | Into every registered repo automatically |
+| 13 | A locked worktree, without the lease | Only a read-only allowlist runs inside it (reads, `git status`, `log`, `diff`) | Refuse only the known mutating commands |
+| 14 | Your own terminal (no session id) in a locked worktree | Allowed, with a warning | Refused for everyone but the holder |
 
 The minor ones, which the team agrees on:
 - Certificates capped at 10 minutes and re-issued on renew, plus a KRL.
@@ -234,3 +265,6 @@ bind it to `127.0.0.1`.
    removes standing keys from it.
 4. MySQL, then Redis, then the git gate remote.
 5. adb after the human setup; Windows after a scratch VM.
+
+Worktree locks don't wait on any of that: `agent-bridge worktree`, `git worktree lock`, the path guard and the opt-in
+git hook need no issuer and no AUTH.md enforce, so they can ship first, labelled `hook`, alongside the guard in step 2.
