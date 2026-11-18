@@ -294,11 +294,11 @@ It takes no arguments: `--help` prints usage, `--version` prints the version, an
 (exit 2) before anything connects, so running it by hand inside a session never takes that session's agent from its
 real server.
 
-The repository's own `.mcp.json` is for developing this project: it runs the server from the checkout's environment
-with `uv run --no-sync`, so starting a session never compiles anything. That makes every Claude Code session started
-in a clone run the clone's code, uncommitted edits included, not the installed release; open sessions that should run
-the release outside the clone. Messages arrive through the `recv` tool; to have them pushed into the conversation
-instead, install the relay hook below.
+The repository's own `.mcp.json` runs the installed `agent-bridge-mcp` from your `PATH`, the same release every other
+session uses, so a session opened in a clone never puts unreleased code on the bus. It also keeps sessions safe from
+work in the clone: `uv sync` rewrites the checkout's native module in place, which crashes any server that has it
+loaded. Test changes to the server with the suite, which builds its own wheel and broker. Messages arrive through the
+`recv` tool; to have them pushed into the conversation instead, install the relay hook below.
 
 ## Claude Code hooks
 

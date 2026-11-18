@@ -9,6 +9,10 @@ workflow publishes the section as the GitHub release notes.
 
 ## [Unreleased]
 
+### Changed
+- The repository's `.mcp.json` runs the installed `agent-bridge-mcp` instead of the checkout's code, so sessions opened
+  in a clone run the released server and survive a `uv sync` there.
+
 ## [0.3.1] - 2026-11-17
 
 ### Added
