@@ -5,6 +5,10 @@ identity (see the README's security model). Everything below assumes that change
 already in: ledgerd and historyd accept per-agent request topics (`ledger/req/<addr>`, `history/req/<addr>`) and check
 the body against them, and historyd is the central history service that option B needed.
 
+Phase 1 (authentication on this machine) is designed in [AUTH.md](AUTH.md), from experiments on mosquitto 2.0.22. Two
+assumptions below don't hold there: dynamic security does not substitute `%u` in role ACLs (item 3 needs one role per
+agent), and client-id pinning does not reserve an id (item 11 is met with secret client ids instead).
+
 ## 1. Options
 
 ### A. Broker bridging (one mosquitto per device, linked)
