@@ -154,10 +154,20 @@ SSH. `agent-bridge worktree acquire|release|status <path>` (and MCP equivalents)
 | **bubblewrap per session**, every other worktree bound read-only | any write by any route ("Read-only file system", raw ref writes and Python included); the session can't remount it, and neither can the same user outside | a session picks up a newly leased worktree only on restart, or through a root helper |
 | SSH targets: the root target agent grants a POSIX ACL on the dir to the leased account and removes it at release | new opens after release | an open file or a working directory inside the tree keeps writing after revoke (measured), so release also runs `terminate-user` and checks `lsof +D` is empty, then hands created files back to their owner |
 
+Two conditions on those last two rows:
+- **The sandbox holds only if it exposes no socket that acts on files outside it.** The user is in the docker and
+  libvirt groups, so one `docker run -v <locked tree>:/x` from inside would write the read-only tree through the daemon
+  (AUTH.md R2). The launcher or managed settings apply the sandbox and leave those sockets out; the agent never
+  configures its own.
+- **On an SSH target, the next grant waits** for the target agent's acknowledgement that the previous holder's
+  processes are gone, `lsof +D` is empty and files are handed back; `reconcile` reports a release with no
+  acknowledgement.
+
 Labels, shown in two parts:
 - **files:** `hook` with the path guard installed, `credential` under bubblewrap or on an SSH target, otherwise `soft`;
-- **history:** `hook` in a protected repo, `none` otherwise (only Claude Code's own git calls are checked), `credential`
-  on an SSH target.
+- **history:** `hook` in a protected repo, also inside a sandbox (the shared ref store must stay writable for the
+  session's own commits), `none` otherwise (only Claude Code's own git calls are checked), `credential` on an SSH
+  target.
 
 So `files: hook · history: none` is an unprotected local repo with the guard installed. One separate OS user for
 agents separates them from the human, not from each other; per-lane locks at the credential level locally need
