@@ -151,21 +151,25 @@ SSH. `agent-bridge worktree acquire|release|status <path>` (and MCP equivalents)
 | Git's `reference-transaction` hook, installed per repo on the user's confirm ("Protect this repo", chaining any existing hook) | every ref change on the locked worktree's branch, from any worktree: commit (with `--no-verify` too), amend, reset, rebase, merge, cherry-pick, stash, `checkout -B`, `branch -D`, `update-ref`, tag, `worktree add`, fetch into local refs. Hooks are shared, so it scopes by which worktree owns the branch | `-c core.hooksPath=...`, editing `packed-refs` or the ref file directly; file edits, `git add`, `restore`, `clean` (no ref changes) |
 | The path guard (section 6): `Edit`, `Write`, `NotebookEdit` and MCP write tools by resolved path, and shell writes (`rm`, `mv`, `cp`, `tee`, `sed -i`, redirects, `git -C`, `make` inside, `find -delete`) | 7 of 7 file-tool writes and 16 of 16 shell writes in the prototype, symlinks, `../` and hard links included; it also protects the branch's ref files and refuses the `core.hooksPath` overrides while a lock is active | interpreters (`python -c`), scripts run from outside, background jobs, other harnesses |
 | The git gate remote (5.4) | pushes, deterministically | nothing short of the issuer's credential |
-| **bubblewrap per session**, every other worktree bound read-only | any write by any route ("Read-only file system", raw ref writes and Python included); the session can't remount it, and neither can the same user outside | ref writes in the shared common dir (history); a newly leased worktree only on restart or through a root helper; void if the sandbox exposes the docker or libvirt socket |
+| **bubblewrap per session**, every other worktree bound read-only | any write by any route ("Read-only file system", raw ref writes and Python included); the session can't remount it, and neither can the same user outside | ref writes in the shared common dir (history); a newly leased worktree only on restart or through a root helper; void if the sandbox exposes a host socket (docker, libvirt, the session bus or systemd) |
 | SSH targets: the root target agent grants a POSIX ACL on the dir to the leased account and removes it at release | new opens after release | an open file or a working directory inside the tree keeps writing after revoke (measured), so release also runs `terminate-user` and checks `lsof +D` is empty, then hands created files back to their owner |
 
 Two conditions on those last two rows:
-- **The sandbox holds only if it exposes no socket that acts on files outside it.** The user is in the docker and
-  libvirt groups, so one `docker run -v <locked tree>:/x` from inside would write the read-only tree through the daemon
-  (AUTH.md R2). The launcher or managed settings apply the sandbox and leave those sockets out; the agent never
+- **The sandbox holds only if it exposes no host socket that can act outside it.** Measured, from inside a sandbox
+  with the other tree read-only: `docker run -v <locked tree>:/x` wrote it through the daemon (the user is in the
+  docker group, AUTH.md R2), and `systemd-run --user` wrote it too, because the user's systemd manager starts the unit
+  outside the sandbox. So host sockets are denied by default: `/run` and `/run/user/<uid>` are fresh tmpfs, and only
+  the bus broker's socket is bound back. Docker (its real path is `/run/docker.sock`; `/var/run` is a symlink),
+  libvirt, the session bus and systemd, gpg-agent and ssh-agent all stay out, which also means session-bus features
+  such as the keyring don't work inside. The launcher or managed settings apply the sandbox; the agent never
   configures its own.
 - **On an SSH target, the next grant waits** for the target agent's acknowledgement that the previous holder's
   processes are gone, `lsof +D` is empty and files are handed back; `reconcile` reports a release with no
   acknowledgement.
 
 Labels, shown in two parts:
-- **files:** `hook` with the path guard installed, `credential` under bubblewrap (launcher-applied, docker and libvirt
-  sockets hidden) or on an SSH target, otherwise `soft`;
+- **files:** `hook` with the path guard installed, `credential` under bubblewrap (launcher-applied, host sockets
+  hidden) or on an SSH target, otherwise `soft`;
 - **history:** `hook` in a protected repo, also inside a sandbox (the shared ref store must stay writable for the
   session's own commits), `none` otherwise (only Claude Code's own git calls are checked), `credential` on an SSH
   target.
