@@ -16,6 +16,9 @@ workflow publishes the section as the GitHub release notes.
 ### Documentation
 - `docs/AUTH.md`: the design for broker authentication and a verified admin (a security-key signature, approvals as
   one-time ledger objects), with the threat model, the measurements behind it and the decisions it needs.
+- `docs/ACCESS.md`: the design for lease-enforced access, where a lease issues the credential that opens a resource
+  (SSH certificates, per-lease database users, a git gate remote), so access no longer depends on an agent choosing
+  to take the lease.
 
 ## [0.3.1] - 2026-11-17
 
