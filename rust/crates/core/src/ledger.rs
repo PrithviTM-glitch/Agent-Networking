@@ -150,20 +150,24 @@ pub fn call_over(
     };
     match crate::json::loads(&payload) {
         Some(Value::Object(reply)) if reply.get("ok") == Some(&Value::Bool(true)) => Ok(reply),
-        Some(Value::Object(reply)) => match newer {
-            Some((op, since))
-                if reply.get("error").and_then(Value::as_str).is_some_and(|e| e.starts_with("op: one of")) =>
-            {
-                Err(LedgerError::new(format!("ledgerd is older than {since} and has no {op} op")))
+        Some(Value::Object(reply)) => {
+            let error = reply.get("error").and_then(Value::as_str).unwrap_or_default();
+            match newer {
+                Some((op, since)) if error.starts_with("op: one of") => {
+                    Err(LedgerError::new(format!("ledgerd is older than {since} and has no {op} op")))
+                }
+                _ => match newer_field(error) {
+                    Some(text) => Err(LedgerError::new(text)),
+                    None => Err(LedgerError { reply }),
+                },
             }
-            _ => Err(LedgerError { reply }),
-        },
+        }
         _ => Err(LedgerError::new("malformed reply")),
     }
 }
 
 /// Ops an older ledgerd does not know, with the version that added them: its refusal is turned into one that says so.
-const NEWER_OPS: [(&str, &str); 7] = [
+const NEWER_OPS: [(&str, &str); 8] = [
     ("leases", "0.3.0"),
     ("lease_history", "0.3.0"),
     ("ping", "0.3.0"),
@@ -171,7 +175,21 @@ const NEWER_OPS: [(&str, &str); 7] = [
     ("unclaim", "0.3.1"),
     ("claims", "0.3.1"),
     ("holders", "0.3.1"),
+    ("worktrees", "0.3.2"),
 ];
+
+/// An older ledgerd's "unknown fields for OP: ..." naming a field added later, said as what the caller lacks.
+fn newer_field(error: &str) -> Option<String> {
+    let fields = error.strip_prefix("unknown fields for ")?.split_once(": ")?.1;
+    let has = |f: &str| fields.split(", ").any(|x| x == f);
+    if has("path") || has("git_common_dir") {
+        Some("ledgerd is older than 0.3.2 and has no worktree locks".into())
+    } else if has("on_behalf") {
+        Some("ledgerd is older than 0.3.2 and has no on_behalf".into())
+    } else {
+        None
+    }
+}
 /// The exit status of acquire --exec when it never got the lease or lost it while the command ran (EX_TEMPFAIL).
 pub const EXEC_NO_LEASE: i32 = 75;
 /// How long a command that lost its lease gets between SIGTERM and SIGKILL.
@@ -245,7 +263,39 @@ pub fn call(op: &str, as_: &str, fields: Map, timeout: Option<f64>) -> Result<Ma
 }
 
 /// call with op and as_ as the caller gave them; ledgerd refuses what is wrong with them, as it does for any client.
+/// When provision::credentials_for gives as_ credentials (made by register under auth; admin's only when
+/// AGENT_BRIDGE_CREDENTIALS names them), the call logs in as it, as call_with does, so it keeps working under enforce;
+/// without them it is anonymous, as before 0.3.2.
 pub fn call_value(op: Value, as_: Option<Value>, fields: Map, timeout: Option<f64>) -> Result<Map, LedgerError> {
+    let addr =
+        as_.as_ref().and_then(Value::as_str).filter(|a| crate::validation::is_ident(a, crate::validation::ID_MAX));
+    let creds = match addr {
+        Some(addr) => crate::provision::credentials_for(addr).map_err(|e| LedgerError::new(e.to_string()))?,
+        None => None,
+    };
+    call_login(op, as_, fields, timeout, creds.as_ref())
+}
+
+/// call, logged in with creds when given: the broker then vouches for as_ (its username), and the reply comes on
+/// ledger/resp/<as_>/<random>, which ledgerd 0.3.2 requires under auth enforce. With None it is anonymous, even when
+/// as_ has a credentials file (call looks that up itself).
+pub fn call_with(
+    op: &str,
+    as_: &str,
+    fields: Map,
+    timeout: Option<f64>,
+    creds: Option<&config::Credentials>,
+) -> Result<Map, LedgerError> {
+    call_login(op.into(), Some(as_.into()), fields, timeout, creds)
+}
+
+fn call_login(
+    op: Value,
+    as_: Option<Value>,
+    fields: Map,
+    timeout: Option<f64>,
+    creds: Option<&config::Credentials>,
+) -> Result<Map, LedgerError> {
     let cfg = config::get().map_err(|e| LedgerError::new(e.0))?;
     let own = Arc::new(Own(Replies::default()));
     let opts = Options {
@@ -256,16 +306,21 @@ pub fn call_value(op: Value, as_: Option<Value>, fields: Map, timeout: Option<f6
         manual_ack: false,
         reconnect: None,
     };
-    let c = Conn::open(&cfg.host, cfg.port, opts, own.clone()).map_err(|e| match e {
+    let login = creds.map(|c| rumqttc::v5::mqttbytes::v5::Login::new(c.username.clone(), c.password.clone()));
+    let c = Conn::open_as(&cfg.host, cfg.port, opts, login, own.clone()).map_err(|e| match e {
         DialError::Unreachable(e) => LedgerError::new(format!(
             "broker unreachable at {}:{} ({})",
             cfg.host,
             cfg.port,
             crate::broker::os_text(&e)
         )),
-        DialError::NotAccepted => LedgerError::new("broker did not accept the connection"),
+        DialError::NotAccepted => LedgerError::new(crate::broker::not_accepted(creds).to_string()),
     })?;
-    let reply = call_over(&c, &own.0, &request::reply_topic("ledger", ""), op, as_, fields, timeout);
+    let topic = match (creds, as_.as_ref().and_then(Value::as_str)) {
+        (Some(_), Some(addr)) => format!("ledger/resp/{addr}/{}", random_hex(8)),
+        _ => request::reply_topic("ledger", ""),
+    };
+    let reply = call_over(&c, &own.0, &topic, op, as_, fields, timeout);
     c.close();
     reply
 }
@@ -276,6 +331,80 @@ fn map(pairs: &[(&str, Value)]) -> Map {
 
 fn text_of<'a>(m: &'a Value, pointer: &str) -> &'a str {
     m.pointer(pointer).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// The ledger resource of the worktree at realpath: admin/wt-<first 16 hex of its sha256>. The one definition, used by
+/// ledgerd (which checks it), the worktree commands, the guard and the console.
+pub fn worktree_resource(realpath: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hex: String = Sha256::digest(realpath.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{}/wt-{hex}", crate::validation::ADMIN)
+}
+
+/// The acquire fields that make a worktree's resource on demand and file the caller's request (ledgerd 0.3.2).
+pub fn worktree_fields(realpath: &str, common_dir: Option<&str>) -> Map {
+    let mut fields = map(&[("path", realpath.into())]);
+    if let Some(dir) = common_dir {
+        fields.insert("git_common_dir".into(), dir.into());
+    }
+    fields
+}
+
+/// A write lease on the worktree at realpath for addr: init, then acquire with the worktree's fields. The reply
+/// carries "created" when this call made the resource.
+pub fn worktree_acquire(
+    addr: &str,
+    realpath: &str,
+    common_dir: Option<&str>,
+    ttl: Option<f64>,
+    wait: Option<f64>,
+) -> Result<Map, LedgerError> {
+    call("init", addr, Map::new(), None)?;
+    let mut fields = map(&[("resource", worktree_resource(realpath).into()), ("level", "write".into())]);
+    fields.extend(worktree_fields(realpath, common_dir));
+    if let Some(t) = ttl {
+        fields.insert("ttl".into(), t.into());
+    }
+    if let Some(w) = wait {
+        fields.insert("wait".into(), w.into());
+    }
+    call("acquire", addr, fields, None)
+}
+
+/// A lease on a worktree, from ledgerd's holders.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Holder {
+    pub holder: String,
+    pub level: String,
+    /// empty from a ledgerd older than 0.3.2
+    pub lease_id: String,
+    pub expires_at: f64,
+}
+
+/// Who holds the worktree at realpath, asked as addr within timeout seconds: Ok(None) when it is not registered (no
+/// lock to enforce), Ok(Some(holders)) otherwise (empty when free). Err when ledgerd can't say: unreachable, too old
+/// or broken, so a caller enforcing locks fails closed.
+pub fn worktree_holders(addr: &str, realpath: &str, timeout: f64) -> Result<Option<Vec<Holder>>, LedgerError> {
+    let resource = worktree_resource(realpath);
+    let reply = match call("holders", addr, map(&[("resource", resource.clone().into())]), Some(timeout)) {
+        Ok(reply) => reply,
+        Err(e) if e.reply.get("error").and_then(Value::as_str) == Some(&format!("no such resource: {resource}")) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let holders = reply.get("holders").and_then(Value::as_array).ok_or_else(|| LedgerError::new("malformed reply"))?;
+    Ok(Some(
+        holders
+            .iter()
+            .map(|h| Holder {
+                holder: text_of(h, "/holder").to_owned(),
+                level: text_of(h, "/level").to_owned(),
+                lease_id: text_of(h, "/lease_id").to_owned(),
+                expires_at: h.get("expires_at").and_then(Value::as_f64).unwrap_or(0.0),
+            })
+            .collect(),
+    ))
 }
 
 /// request, then wait up to wait seconds for the owner's answer by reading grants once a second. Ok is the granted
@@ -344,22 +473,55 @@ fn status_code(status: ExitStatus) -> i32 {
 /// exit status (128+n if signal n killed it), 127 if cmd could not be started, or EXEC_NO_LEASE (75) if the lease
 /// was refused or lost; losing it sends cmd SIGTERM, then SIGKILL after EXEC_GRACE. Messages go to stderr.
 pub fn exec(addr: &str, resource: &str, level: &str, ttl: Option<f64>, wait: Option<f64>, cmd: &[String]) -> i32 {
+    exec_with(addr, resource, level, ttl, wait, Map::new(), cmd)
+}
+
+/// exec with more acquire fields, such as worktree_fields for a worktree's lease.
+pub fn exec_with(
+    addr: &str,
+    resource: &str,
+    level: &str,
+    ttl: Option<f64>,
+    wait: Option<f64>,
+    extra: Map,
+    cmd: &[String],
+) -> i32 {
     let fail = |text: String| {
         eprintln!("ledger: {}", text.split_whitespace().collect::<Vec<_>>().join(" "));
         EXEC_NO_LEASE
     };
-    let Some((program, args)) = cmd.split_first() else { return fail("--exec needs a command".into()) };
+    let Some(program) = cmd.first() else { return fail("--exec needs a command".into()) };
     let ttl = ttl.unwrap_or(60.0);
     let mut fields = map(&[("resource", resource.into()), ("level", level.into()), ("ttl", ttl.into())]);
     if let Some(w) = wait {
         fields.insert("wait".into(), w.into());
     }
+    fields.extend(extra);
     // before the acquire, so a signal between the lease and the spawn is still seen
-    forward_signals();
+    exec_signals();
     let lease = match call("init", addr, Map::new(), None).and_then(|_| call("acquire", addr, fields, None)) {
-        Ok(reply) => reply.get("lease").cloned().unwrap_or_default(),
+        Ok(reply) => reply.get("lease").and_then(Value::as_object).cloned().unwrap_or_default(),
         Err(e) => return fail(format!("{e}; {program} was not run")),
     };
+    exec_held(addr, &lease, ttl, resource, level, cmd)
+}
+
+/// For a caller that takes the lease itself and then calls exec_held: from here on SIGINT, SIGTERM and SIGHUP are
+/// noted instead of killing this process, so one that arrives between the lease and the command still releases it.
+pub fn exec_signals() {
+    forward_signals();
+}
+
+/// exec's second half, for a lease the caller already holds (lease is acquire's "lease" object, taken with ttl): run
+/// cmd with it, renew it every ttl/3, pass signals on, release it when cmd exits, and return as exec does. Call
+/// exec_signals before taking the lease.
+pub fn exec_held(addr: &str, lease: &Map, ttl: f64, resource: &str, level: &str, cmd: &[String]) -> i32 {
+    let Some((program, args)) = cmd.split_first() else {
+        eprintln!("ledger: --exec needs a command");
+        return EXEC_NO_LEASE;
+    };
+    forward_signals();
+    let lease = Value::Object(lease.clone());
     let lease_id = text_of(&lease, "/lease_id").to_owned();
     let release = || {
         let _ = call("release", addr, map(&[("lease_id", lease_id.clone().into())]), Some(5.0));
@@ -451,6 +613,23 @@ mod tests {
             {"holder": "a-1", "level": "read", "expires_at": 100.2}, {"holder": "b-2", "level": "read", "expires_at": 130.0}]}));
         assert_eq!(super::busy_text(&two, 90.0), "busy, held by a-1 (read, 11 s left), b-2 (read, 40 s left)");
         assert_eq!(super::busy_text(&reply(json!({"ok": false, "error": "busy"})), 90.0), "busy");
+    }
+
+    #[test]
+    fn worktree_ids_and_old_ledgerd_texts() {
+        // printf %s /home/u/wt | sha256sum: pinned so every user of the id agrees
+        let id = super::worktree_resource("/home/u/wt");
+        assert_eq!(id, "admin/wt-8bb602a4c5b8e62f");
+        assert_ne!(id, super::worktree_resource("/home/u/wt/"));
+        assert_eq!(
+            super::newer_field("unknown fields for acquire: path, git_common_dir").as_deref(),
+            Some("ledgerd is older than 0.3.2 and has no worktree locks")
+        );
+        assert_eq!(
+            super::newer_field("unknown fields for release: on_behalf").as_deref(),
+            Some("ledgerd is older than 0.3.2 and has no on_behalf")
+        );
+        assert_eq!(super::newer_field("unknown fields for add: zz"), None);
     }
 
     #[test]

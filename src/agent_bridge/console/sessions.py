@@ -134,6 +134,14 @@ def mcp_version(rec):
     return v if isinstance(v, str) and MCP_VERSION.fullmatch(v) else None
 
 
+def worktree_root(cwd):
+    """The git worktree cwd is in (its realpath), for flagging sessions that share one; None outside git."""
+    from .worktrees import root_of  # here, not at the top: worktrees imports this module
+
+    r = cwd and root_of(cwd)
+    return r[0] if r else None
+
+
 def view(addr, rec, reg):
     """One session or agent as the page shows it. key is the address when on the bus, else the session id."""
     session = (reg and reg["session"]) or (rec and rec.get("session"))
@@ -183,6 +191,7 @@ def view(addr, rec, reg):
         "alive": (p is not None) if pid else None,
         "kind": kind,
         "cwd": cwd,
+        "worktree": worktree_root(cwd),
         "branch": branch,
         "title": named or (t and t.title),
         "prompt": t and t.prompt and t.prompt[:300],

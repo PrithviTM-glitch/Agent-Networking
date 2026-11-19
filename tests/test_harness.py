@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-from conftest import BIN, ROOT, TMP_PREFIX, _sweep_stale_dirs
+from conftest import BIN, ROOT, TMP_PREFIX, _isolate, _sweep_stale_dirs
 
 
 def test_a_killed_runs_directory_is_swept():
@@ -20,6 +20,36 @@ def test_a_killed_runs_directory_is_swept():
         os.makedirs(os.path.join(parent, name, "state"))
     _sweep_stale_dirs(parent)
     assert sorted(os.listdir(parent)) == sorted([live, f"{TMP_PREFIX}xyz", "unrelated-123-abc"])
+
+
+def test_a_users_auth_setup_never_reaches_a_test(tmp_path):
+    """A user's auth setup (the mode, a credentials file and a socket path exported in the shell, and an enforce
+    auth-mode and an admin.json in the real config dir) never reaches a test: through conftest's isolation a register
+    still goes to the disposable broker and stays anonymous. Without it, the same register fails."""
+    real = tmp_path / "home" / ".config" / "agent-bridge"
+    real.mkdir(parents=True, mode=0o700)
+    admin = real / "admin.json"
+    admin.write_text('{"username": "admin", "password": "p", "client_id": "c"}')
+    admin.chmod(0o600)
+    (real / "auth-mode").write_text("enforce\n")
+    users = {
+        **os.environ,
+        "HOME": str(tmp_path / "home"),
+        "XDG_CONFIG_HOME": str(tmp_path / "home" / ".config"),
+        "AGENT_BRIDGE_AUTH": "enforce",
+        "AGENT_BRIDGE_CREDENTIALS": str(admin),
+        "AGENT_BRIDGE_SOCKET": str(tmp_path / "live.sock"),
+    }
+    register = [str(BIN / "agent-bridge"), "register", "harness"]
+    leaked = subprocess.run(register, env=users, capture_output=True, text=True)
+    assert leaked.returncode != 0 and "live.sock" in leaked.stderr, "the control: unisolated, it reaches the socket"
+    isolated = dict(users)
+    _isolate(isolated, str(tmp_path / "run"))
+    got = subprocess.run(register, env=isolated, capture_output=True, text=True)
+    assert got.returncode == 0 and got.stdout.startswith("harness-"), got.stderr
+    assert not (real / "agents").exists(), "nothing provisioned with the real admin.json"
+    assert not (tmp_path / "run" / "config" / "agent-bridge" / "agents").exists(), "and anonymous: auth is off"
+    assert not {"AGENT_BRIDGE_AUTH", "AGENT_BRIDGE_CREDENTIALS", "AGENT_BRIDGE_SOCKET"} & isolated.keys()
 
 
 CHANGELOG = """# Changelog

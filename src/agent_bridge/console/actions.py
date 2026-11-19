@@ -9,7 +9,7 @@ import time
 
 from .. import config, host
 from ..validation import ADMIN, check_text, is_count, is_ident
-from . import admin, events, kill, leaks, processes, sessions
+from . import admin, events, kill, leaks, processes, sessions, worktrees
 from .processes import Refused
 
 AUDIT = os.path.abspath(config.data_path("admin-audit.jsonl"))
@@ -82,6 +82,16 @@ def send(b, _peer=None):
         )
         return f"{kind}:{target}", f"sent; {words} {verb.format(target)} nobody"
     return f"{kind}:{target}", "sent"
+
+
+def repo_protect(b, _peer=None):
+    common, result = worktrees.protect(_str(b, "repo"))
+    return f"repo:{common}", result
+
+
+def repo_unprotect(b, _peer=None):
+    common, result = worktrees.unprotect(_str(b, "repo"))
+    return f"repo:{common}", result
 
 
 def claim_release(b, _peer=None):
@@ -270,6 +280,8 @@ ROUTES = {
     "/api/room/member": room_member,
     "/api/room/pin": room_pin,
     "/api/claims/release": claim_release,
+    "/api/repo/protect": repo_protect,
+    "/api/repo/unprotect": repo_unprotect,
 }
 
 

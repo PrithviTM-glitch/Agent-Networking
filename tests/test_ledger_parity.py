@@ -9,6 +9,7 @@ each test is skipped when its image is not built. One writer at a time: each led
 before the other opens the database. These tests live exactly as long as the README offers those images as rollbacks.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -236,9 +237,10 @@ def test_an_interrupted_acquire_against_the_rollback(tmp_path):
 
 @pytest.mark.parametrize(("image", "command"), ROLLBACKS)
 def test_the_lease_history_survives_a_rollback(state_dir, tmp_path, image, command):
-    """lease_events and claims are additive: a rollback opens and serves a database that has them, without recording
-    into them, and this ledgerd finds its history and claims intact afterwards. The rollback has no leases or claims
-    op, and the client says which version it needs."""
+    """lease_events, claims and worktree specs are additive: a rollback opens and serves a database that has them,
+    without recording into them, and this ledgerd finds its history, claims and worktrees intact afterwards. The
+    rollback has no leases, claims or worktrees op and takes no path on acquire, and the client says which version it
+    needs."""
     data = str(tmp_path)
     db, log = os.path.join(data, "ledger.db"), os.path.join(state_dir, "ledgerd.log")
     o, h = "parh-o1", "parh-h1"
@@ -256,6 +258,11 @@ def test_the_lease_history_survives_a_rollback(state_dir, tmp_path, image, comma
         events = call("lease_history", o, resource=f"{o}/lk")["events"]
         assert [e["event"] for e in events] == ["acquire", "release", "acquire"]
         claimed = call("claim", h, room="parity", key="K-1", note="kept")["claim"]
+        path = "/home/u/parity-wt"
+        wt = "admin/wt-" + hashlib.sha256(path.encode()).hexdigest()[:16]
+        lease = call("acquire", h, resource=wt, level="write", ttl=60, path=path, git_common_dir="/home/u/p/.git")
+        call("release", h, lease_id=lease["lease"]["lease_id"])
+        tree = call("worktrees", h, all=True)["worktrees"]
         before = state()
         ledgerd.stop()
 
@@ -265,6 +272,10 @@ def test_the_lease_history_survives_a_rollback(state_dir, tmp_path, image, comma
             call("leases", h)
         with pytest.raises(LedgerError, match="ledgerd is older than 0.3.1 and has no claims op"):
             call("claims", h, room="parity")
+        with pytest.raises(LedgerError, match="ledgerd is older than 0.3.2 and has no worktrees op"):
+            call("worktrees", h)
+        with pytest.raises(LedgerError, match="ledgerd is older than 0.3.2 and has no worktree locks"):
+            call("acquire", h, resource=wt, level="write", path=path)
         call("release", h, lease_id=held["lease_id"])
         again = call("acquire", h, resource=f"{o}/lk", level="write", ttl=60)["lease"]
         assert again["token"] > held["token"]
@@ -276,6 +287,7 @@ def test_the_lease_history_survives_a_rollback(state_dir, tmp_path, image, comma
         assert state() == after
         assert call("lease_history", o, resource=f"{o}/lk")["events"] == events, "kept, and nothing recorded meanwhile"
         assert call("claims", h, room="parity")["claims"] == [claimed], "the claim survives the rollback"
+        assert call("worktrees", h, all=True)["worktrees"] == tree, "the worktree and its spec survive the rollback"
         call("release", h, lease_id=call("acquire", h, resource=f"{o}/lk", level="write", ttl=5)["lease"]["lease_id"])
         assert len(call("lease_history", o, resource=f"{o}/lk")["events"]) == 5
         ledgerd.stop()

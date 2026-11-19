@@ -10,7 +10,8 @@ use crate::protocol::{BROADCAST, parse_message, parse_presence};
 use crate::request::Replies;
 use crate::validation::{
     ADMIN, Error, ID_MAX, NAME_MAX, Result, TOPICS_MAX, check_about, check_body, check_caps, check_ident,
-    check_ident_cap, check_message, check_reply_to, check_topic, check_wait, fail, is_ident, is_version, not_admin,
+    check_ident_cap, check_message, check_reply_to, check_topic, check_wait, fail, is_ident, is_refused, is_version,
+    not_admin,
 };
 use crate::{config, history, identity, ledger, presence, rooms};
 use serde_json::Value;
@@ -46,6 +47,9 @@ pub struct Bus {
     writing: Mutex<()>,
     /// the console's reserved identity: it may broadcast, and carries no session or process
     admin: bool,
+    /// the agent's own broker login (0.3.2), when its credentials file exists: the owning connection then uses the
+    /// secret client id from it, and presence says "auth": "credentials"
+    creds: Option<config::Credentials>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -120,7 +124,8 @@ impl Handler for Shared {
         let mut wanted = vec![BROADCAST.to_owned()];
         if !session_present {
             wanted.push(format!("inbox/{}", self.addr));
-            wanted.extend(topics);
+            wanted.push(format!("inbox/{}/+", self.addr)); // sender-bound DMs (0.3.2 readers; senders switch later)
+            wanted.extend(topics.iter().flat_map(|t| filters_of(t)));
         }
         let barrier = if self.owner {
             conn.subscribe(wanted.iter().map(|t| filter(t, true, true)).collect()).ok()
@@ -205,6 +210,14 @@ impl Handler for Shared {
     }
 }
 
+/// The subscription filters behind one of the agent's topics: a room also takes its sender-bound form, room/<r>/+.
+fn filters_of(topic: &str) -> Vec<String> {
+    match topic.strip_prefix("room/") {
+        Some(room) if !room.contains('/') => vec![topic.to_owned(), format!("{topic}/+")],
+        _ => vec![topic.to_owned()],
+    }
+}
+
 fn topics_of(rec: &Map) -> Vec<String> {
     presence::topics(rec).map(str::to_owned).collect()
 }
@@ -215,10 +228,21 @@ fn str_of<'a>(rec: &'a Map, key: &str) -> Option<&'a str> {
 
 impl Bus {
     fn open(addr: &str, rec: Map, owner: bool) -> Result<Bus> {
+        // With credentials (auth warn or enforce) the owning connection uses the secret client id from them, so no other
+        // agent can take its session over by guessing; a publish-only one gets a broker-assigned id (AUTH.md 4.3).
+        let creds = crate::provision::credentials_for(addr)?;
+        // Service replies: a logged-in Bus takes them on <svc>/resp/<addr>/<conn> (the requester first, as the 0.3.2
+        // services require), "s" for the owner and random for a publisher. Never the client id: topics are visible.
+        let reply_id = match (&creds, owner) {
+            (Some(_), true) => format!("{addr}/s"),
+            (Some(_), false) => format!("{addr}/{}", ledger::random_hex(16)),
+            (None, true) => addr.to_owned(),
+            (None, false) => ledger::random_hex(16),
+        };
         let shared = Arc::new(Shared {
             addr: addr.to_owned(),
             owner,
-            reply_id: if owner { addr.to_owned() } else { ledger::random_hex(16) },
+            reply_id,
             replies: Replies::default(),
             st: Mutex::new(Cache { topics: topics_of(&rec), ..Default::default() }),
             cv: Condvar::new(),
@@ -226,9 +250,10 @@ impl Bus {
         });
         // mosquitto only writes a session to disk if its latest connect had clean_start=False, even under MQTT 5.
         let conn = if owner {
-            broker::connect(addr, false, presence::expiry(&rec)?, true, shared.clone())?
+            let id = creds.as_ref().map_or(addr, |c| c.client_id.as_str());
+            broker::connect_with(id, creds.as_ref(), false, presence::expiry(&rec)?, true, shared.clone())?
         } else {
-            broker::connect("", true, 0, true, shared.clone())?
+            broker::connect_with("", creds.as_ref(), true, 0, true, shared.clone())?
         };
         Ok(Bus {
             addr: addr.to_owned(),
@@ -238,6 +263,7 @@ impl Bus {
             touched: Mutex::new(None),
             writing: Mutex::new(()),
             admin: false,
+            creds,
         })
     }
 
@@ -260,11 +286,20 @@ impl Bus {
     /// agent's session (subscriptions, queued messages) to the process that owns it, such as its relay.
     pub fn attach_as(addr: &str, owner: bool) -> Result<Bus> {
         let addr = check_ident(addr, "address")?;
-        let rec = presence::find(addr)?
+        let rec = presence::find_as(addr)?
             .ok_or_else(|| Error(format!("{addr} is not registered (or it left): register it first")))?;
+        // An agent registered before auth was turned on gets its credentials on its next attach (create-only,
+        // register-made addresses only; anything else carries on anonymously), so live sessions migrate in warn. The
+        // file is bound to the agent's own session from its record, never to whoever attached: an agent with no session
+        // attached from inside one is left for its own register.
+        let session = str_of(&rec, "session").or_else(|| str_of(&rec, "parent"));
+        if addr != crate::validation::ADMIN && (session.is_some() || crate::host::current().session().is_none()) {
+            crate::provision::ensure(addr, session)?;
+        }
         let bus = Bus::open(addr, rec, owner)?;
         let rec = bus.rec();
-        if bus.fresh_pid(&rec).iter().any(|(k, v)| rec.get(k) != Some(v)) {
+        let unmarked = bus.creds.is_some() && rec.get("auth").is_none();
+        if unmarked || bus.fresh_pid(&rec).iter().any(|(k, v)| rec.get(k) != Some(v)) {
             bus.touch(&lock(&bus.writing), false)?;
         }
         Ok(bus)
@@ -304,16 +339,20 @@ impl Bus {
             }
         }
         rec.extend(here);
+        let given = addr.is_some();
         let addr = match addr {
-            Some(a) => {
-                match presence::find(a)? {
-                    Some(live) => rec = live,
-                    None => presence::wipe(a)?,
-                }
-                a.to_owned()
-            }
+            Some(a) => a.to_owned(),
             None => format!("{name}-{}", ledger::random_hex(3)),
         };
+        // Under auth warn or enforce (the broker's admin credentials exist), the agent gets its own broker client, role
+        // and credentials file now, so Bus::open below logs in with them; under auth off this does nothing.
+        crate::provision::ensure(&addr, None)?;
+        if given {
+            match presence::find_as(&addr)? {
+                Some(live) => rec = live,
+                None => presence::wipe(&addr)?,
+            }
+        }
         let bus = Bus::open(&addr, rec, owner)?;
         bus.touch(&lock(&bus.writing), false)?;
         Ok(bus)
@@ -370,6 +409,9 @@ impl Bus {
         for (k, v) in self.fresh_pid(&rec) {
             rec.insert(k, v);
         }
+        if self.creds.is_some() {
+            rec.insert("auth".into(), "credentials".into());
+        }
         rec.insert("seen".into(), float(now()));
         self.set_rec(rec.clone());
         self.ready()?;
@@ -415,10 +457,13 @@ impl Bus {
         }
         self.ready()?;
         let conn = self.conn();
-        let pkid =
-            if on { conn.subscribe(vec![filter(topic, true, true)]) } else { conn.unsubscribe(vec![topic.to_owned()]) };
-        if pkid.ok().and_then(|p| conn.wait_ack(p, TIMEOUT)) != Some(true) {
-            return fail(format!("broker refused or did not confirm {} {topic}", if on { "sub" } else { "unsub" }));
+        let filters = filters_of(topic);
+        if on {
+            let refs: Vec<&str> = filters.iter().map(String::as_str).collect();
+            broker::subscribe(&conn, &refs, true, true)
+                .map_err(|e| if is_refused(&e) { Error(format!("you may not read {topic}")) } else { e })?;
+        } else if conn.unsubscribe(filters).ok().and_then(|p| conn.wait_ack(p, TIMEOUT)) != Some(true) {
+            return fail(format!("broker refused or did not confirm unsub {topic}"));
         }
         if on {
             topics.insert(topic.to_owned());
@@ -476,7 +521,9 @@ impl Bus {
         }
         self.ready()?;
         // historyd records it from the bus
-        broker::publish(&self.conn(), topic, dumps_map(&entry), false, None)
+        broker::publish(&self.conn(), topic, dumps_map(&entry), false, None).map_err(|e| {
+            if is_refused(&e) { Error(format!("you may not post as {} on {topic}", self.addr)) } else { e }
+        })
     }
 
     /// Subscriptions and session expiry live in the agent's session: change them through a brief owner connection,
@@ -646,7 +693,9 @@ impl Bus {
         // The session expiry interval only changes on connect; calls meanwhile wait in ready() as on a reconnect.
         self.conn().close();
         self.shared.lock().up = false;
-        let fresh = broker::connect(&self.addr, false, presence::expiry(&self.rec())?, true, self.shared.clone())?;
+        let id = self.creds.as_ref().map_or(self.addr.as_str(), |c| c.client_id.as_str());
+        let expiry = presence::expiry(&self.rec())?;
+        let fresh = broker::connect_with(id, self.creds.as_ref(), false, expiry, true, self.shared.clone())?;
         *lock(&self.conn) = fresh;
         Ok(())
     }

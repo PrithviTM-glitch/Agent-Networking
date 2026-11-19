@@ -12,7 +12,7 @@ import agent_bridge
 
 from .. import _native, config
 from ..errors import HistoryError
-from . import actions, admin, auth, capacity, events, kill, leaks, links, metrics, processes, sessions, usage
+from . import actions, admin, auth, capacity, events, kill, leaks, links, metrics, processes, sessions, usage, worktrees
 from .processes import ERRORS, Refused
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -58,6 +58,7 @@ def state(_query):
         "broker": {"dropped": admin.dropped()},
         "version": {"package": agent_bridge.__version__, "native": _native.__version__},
         "links": links.current,
+        "auth": _native.auth_mode(),
     }
 
 
@@ -86,6 +87,7 @@ READS = {
     "/api/agent/stop": lambda q: kill_preview({**q, "room": None}),
     "/api/ledger": lambda _q: admin.dump(),
     "/api/claims": lambda _q: admin.claims(),
+    "/api/worktrees": worktrees.snapshot,
     "/api/capacity": lambda _q: capacity.snapshot(),
     "/api/leaks": lambda _q: leaks.report(),
     "/api/audit": audit,
@@ -213,6 +215,7 @@ def main():
     p.add_argument("--headless", action="store_true", help="serve the API and /metrics only, no web page")
     p.add_argument("-V", "--version", action="version", version=f"%(prog)s {agent_bridge.__version__}")
     a = p.parse_args()
+    auth.use_admin_credentials()  # before any broker connection: under auth the console reads and writes as admin
     Handler.token, Handler.headless = auth.load_token(), a.headless
     links.load()
     server = ThreadingHTTPServer(("127.0.0.1", auth.PORT), Handler)
@@ -226,5 +229,6 @@ def main():
             flush=True,
         )
     else:
-        print(f"login: http://127.0.0.1:{auth.PORT}/#token={Handler.token}", flush=True)
+        # localhost, not 127.0.0.1: a security key (WebAuthn) works only on a domain, and the page is served on both.
+        print(f"login: http://localhost:{auth.PORT}/#token={Handler.token}", flush=True)
     server.serve_forever()

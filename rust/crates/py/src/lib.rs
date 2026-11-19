@@ -7,7 +7,7 @@ mod convert;
 mod errors;
 mod observer;
 
-use agent_bridge::{host, identity, ledger, presence, relay, rooms, validation as v};
+use agent_bridge::{host, identity, ledger, presence, relay, rooms, validation as v, worktree};
 use convert::{dict, dicts, from_py};
 use errors::bridge;
 use pyo3::prelude::*;
@@ -236,6 +236,40 @@ fn ledger_call<'py>(
     dict(py, &reply)
 }
 
+/// A write lease on the git worktree path is in, git-locked, renewed by this session's relay when it runs.
+#[pyfunction]
+#[pyo3(signature = (addr, path, ttl=None, wait=0.0))]
+fn worktree_acquire<'py>(
+    py: Python<'py>,
+    addr: String,
+    path: String,
+    ttl: Option<f64>,
+    wait: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let reply = py.detach(move || worktree::acquire(&addr, &path, ttl, Some(wait))).map_err(bridge)?;
+    dict(py, &reply)
+}
+
+/// Release addr's worktree lease: uncommitted changes saved under refs/agent-bridge/released/<lease id>, git unlocked.
+#[pyfunction]
+fn worktree_release<'py>(py: Python<'py>, addr: String, path: String) -> PyResult<Bound<'py, PyDict>> {
+    let reply = py.detach(move || worktree::release(&addr, &path)).map_err(bridge)?;
+    dict(py, &reply)
+}
+
+/// Who holds the worktree path is in, and its git lock.
+#[pyfunction]
+fn worktree_status(py: Python<'_>, path: String) -> PyResult<Bound<'_, PyDict>> {
+    let reply = py.detach(move || worktree::status(&path)).map_err(bridge)?;
+    dict(py, &reply)
+}
+
+/// The broker's auth mode: "off", "warn" or "enforce".
+#[pyfunction]
+fn auth_mode() -> PyResult<&'static str> {
+    agent_bridge::config::auth_mode().map(|a| a.as_str()).map_err(bridge)
+}
+
 /// One historyd request over a connection of its own: as_ for the ops that name an agent (dms, drop, recent);
 /// raises HistoryError with .reply.
 #[pyfunction]
@@ -297,6 +331,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("RESERVED", v::RESERVED.to_vec())?;
     m.add("SERVICES", v::SERVICES.to_vec())?;
     m.add_function(wrap_pyfunction!(check_ident, m)?)?;
+    m.add_function(wrap_pyfunction!(worktree_acquire, m)?)?;
+    m.add_function(wrap_pyfunction!(worktree_release, m)?)?;
+    m.add_function(wrap_pyfunction!(worktree_status, m)?)?;
+    m.add_function(wrap_pyfunction!(auth_mode, m)?)?;
     m.add_function(wrap_pyfunction!(is_ident, m)?)?;
     m.add_function(wrap_pyfunction!(not_admin, m)?)?;
     m.add_function(wrap_pyfunction!(check_text, m)?)?;

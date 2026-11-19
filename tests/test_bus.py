@@ -932,6 +932,42 @@ def test_message_ids_and_replies(s):
     run("part", b, room)
 
 
+def test_sender_bound_topics_are_read(s):
+    """0.3.2 readers (step R): a DM on inbox/<to>/<from> or a post on room/<room>/<from> arrives on today's topic with
+    "sender": "bound" and the same id it would have had; a payload "from" that disagrees with the topic level drops
+    it; today's forms are "claimed". Senders keep today's forms in 0.3.2."""
+    a, b, lib, room = s.a, s.b, s.lib, f"bound-{RUN}"
+    lib.join(room)
+    run("join", b, room)
+    while lib.recv(0.5):
+        pass
+    lines("recv", b)
+    raw = raw_client()
+    ts = time.time()
+    raw_pub(raw, f"inbox/{lib.addr}/{a}", json.dumps({"from": a, "body": "bound DM", "ts": ts}))
+    raw_pub(raw, f"inbox/{lib.addr}/{a}", json.dumps({"from": b, "body": "level and from disagree", "ts": ts}))
+    raw_pub(raw, f"room/{room}/{a}", json.dumps({"from": a, "body": "bound post", "ts": ts}))
+    raw_pub(raw, f"room/{room}/{a}/extra", json.dumps({"from": a, "body": "too deep", "ts": ts}))
+    raw.loop_stop()
+    run("dm", a, lib.addr, "claimed DM")
+    got = {}
+    while not {"bound DM", "bound post", "claimed DM"} <= set(got) and (batch := lib.recv(5)):
+        got.update({m["body"]: m for m in batch})
+    assert "level and from disagree" not in got and "too deep" not in got, got
+    dm, post, old = got["bound DM"], got["bound post"], got["claimed DM"]
+    assert (dm["topic"], dm["sender"]) == (f"inbox/{lib.addr}", "bound"), dm
+    assert (post["topic"], post["sender"]) == (f"room/{room}", "bound"), post
+    assert old["sender"] == "claimed", old
+    assert dm["id"] == _native.message_id(f"inbox/{lib.addr}", a, ts), "the id is over today's topic"
+    cli = {m["body"]: m for m in lines("recv", b, "--wait", "5")}
+    assert cli["bound post"]["sender"] == "bound" and cli["bound post"]["topic"] == f"room/{room}", cli
+    logged = {m["body"]: m for m in lines("history", room)}
+    assert logged["bound post"]["sender"] == "bound", logged
+    assert all(m["sender"] == "claimed" for body, m in logged.items() if body != "bound post"), logged
+    lib.part(room)
+    run("part", b, room)
+
+
 def test_bad_arguments(s):
     """Every one is a one-line error with a non-zero exit, never a traceback."""
     a, b, lib = s.a, s.b, s.lib

@@ -56,8 +56,9 @@ catch (`docker run -v /etc:/x`), to impossible without the human (a touch).
 
 ### 4.1 Transport
 
-- Local agents connect over a unix socket, `$XDG_RUNTIME_DIR/agent-bridge/mqtt.sock` (`/run/user/1000/...`, 0700 by
-  default). The broker container runs as the host user so the socket is the user's. The Rust client gains a
+- Local agents connect over a unix socket, `~/.local/state/agent-bridge/broker/mqtt.sock`, in a 0700 directory. Not
+  `$XDG_RUNTIME_DIR`: that is emptied at boot, and Docker restarts the broker before the user logs in. The path must
+  stay under 108 bytes (`sun_path`). The broker container runs as the host user so the socket is the user's. The Rust client gains a
   `Stream { Tcp, Unix }` enum (only `set_nodelay` is TCP-specific); `AGENT_BRIDGE_SOCKET` takes precedence over host
   and port.
 - ledgerd and historyd reach the broker on the compose network, on a listener not published to the host.

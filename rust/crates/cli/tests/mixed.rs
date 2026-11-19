@@ -649,3 +649,133 @@ fn normalises_times_and_ids() {
     let text = r#"{"id": "1234567890abcdef", "ts": 1794957030.0274324, "seen": "1794957030"}"#;
     assert_eq!(normal(text), r#"{"id": "<id>", "ts": <t>, "seen": "<t>"}"#);
 }
+
+/// A scratch repository with a linked worktree "lane" on branch lane: (main, lane), both real paths.
+fn scratch_repo(dir: &Path) -> (PathBuf, PathBuf) {
+    let (main, lane) = (dir.join("repo"), dir.join("lane"));
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let (m, l) = (main.to_str().expect("UTF-8"), lane.to_str().expect("UTF-8"));
+    git(&["init", "-q", "-b", "main", m]);
+    git(&["-C", m, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "i"]);
+    git(&["-C", m, "worktree", "add", "-q", "-b", "lane", l]);
+    (main.canonicalize().expect("main"), lane.canonicalize().expect("lane"))
+}
+
+/// worktree acquire takes the lease and git-locks the worktree with the pinned reason; another agent is refused
+/// naming the holder; the ref-guard refuses a commit there from another session, allows the holder's and warns
+/// outside a session; release saves uncommitted work under refs/agent-bridge/released/<id> and unlocks; --exec holds
+/// the lock while its command runs; a relay renews a session's lease past its ttl and releases it when the session
+/// ends.
+#[test]
+#[ignore = "needs Docker"]
+fn worktree_locks_from_the_shell_and_the_relay() {
+    let w = start();
+    let (main, lane) = scratch_repo(&w.dir);
+    let lane_s = lane.to_str().expect("UTF-8").to_owned();
+    let locked = main.join(".git/worktrees/lane/locked");
+    let (holder, other) = ("8a0e3c11-6a1f-4c55-9d1e-2b3c4d5e6f70", "8a0e3c11-6a1f-4c55-9d1e-2b3c4d5e6f71");
+    let as_session = |session: Option<&str>, args: &[&str]| {
+        let mut c = w.cmd(Path::new(RUST));
+        if let Some(s) = session {
+            c.env("CLAUDE_CODE_SESSION_ID", s);
+        }
+        c.args(args).output().expect("the CLI")
+    };
+    let a = String::from_utf8_lossy(&as_session(Some(holder), &["register", "wt-a"]).stdout).trim().to_owned();
+    let b = String::from_utf8_lossy(&w.run(&["register", "wt-b"]).stdout).trim().to_owned();
+
+    let got = as_session(Some(holder), &["worktree", "acquire", &a, &format!("{lane_s}/."), "--ttl", "120"]);
+    assert!(got.status.success(), "{}", String::from_utf8_lossy(&got.stderr));
+    let got = &json_lines(&got.stdout)[0];
+    let id = got["lease_id"].as_str().expect("a lease id").to_owned();
+    assert_eq!((got["path"].as_str(), got["git_lock"].as_bool()), (Some(lane_s.as_str()), Some(true)), "{got}");
+    assert_eq!(got["renewed_by"], "none", "no relay in this session yet");
+    let reason = format!("agent-bridge lease {id} held by {a}");
+    assert_eq!(std::fs::read_to_string(&locked).expect("git's lock").trim(), reason);
+    let status = &json_lines(&w.run(&["worktree", "status", &lane_s]).stdout)[0];
+    assert_eq!((status["holder"].as_str(), status["stale"].as_bool()), (Some(a.as_str()), Some(false)), "{status}");
+    let busy = w.run(&["worktree", "acquire", &b, &lane_s]);
+    assert!(!busy.status.success() && String::from_utf8_lossy(&busy.stderr).contains(&a), "names the holder");
+
+    // the ref guard, as git's reference-transaction hook of this repository
+    let hook = main.join(".git/hooks/reference-transaction");
+    std::fs::write(&hook, format!("#!/bin/sh\nexec {RUST} hook ref-guard \"$@\"\n")).expect("the hook");
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
+    let commit = |session: Option<&str>, dir: &Path| {
+        let mut c = w.cmd(Path::new("git"));
+        c.args(["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "x"])
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        if let Some(s) = session {
+            c.env("CLAUDE_CODE_SESSION_ID", s);
+        }
+        c.output().expect("git runs")
+    };
+    let refused = commit(Some(other), &lane);
+    let text = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(!refused.status.success(), "another session committed in the leased worktree");
+    let want = format!("blocked: the update of refs/heads/lane is inside {lane_s}, leased by {a} until ");
+    assert!(
+        text.contains(&want)
+            && text.contains(&format!(
+                "(lease {id}). To work there: agent-bridge worktree acquire <your address> {lane_s}"
+            )),
+        "{text}"
+    );
+    assert!(commit(Some(holder), &lane).status.success(), "the holder's session commits");
+    assert!(commit(Some(other), &main).status.success(), "the main branch is not leased");
+    let outside = commit(None, &lane);
+    assert!(outside.status.success(), "outside a session it is allowed");
+    assert!(String::from_utf8_lossy(&outside.stderr).contains("allowed outside an agent session, but blocked:"));
+
+    // release saves what is uncommitted and unlocks
+    std::fs::write(lane.join("work.txt"), "unsaved\n").expect("a change");
+    let released = &json_lines(&w.run(&["worktree", "release", &a, &lane_s]).stdout)[0];
+    let saved = format!("refs/agent-bridge/released/{id}");
+    assert_eq!((released["snapshot"].as_str(), released["unlocked"].as_bool()), (Some(saved.as_str()), Some(true)));
+    assert!(!locked.exists(), "release removes the git lock");
+    let show = Command::new("git").args(["-C", main.to_str().unwrap(), "show", &format!("{saved}:work.txt")]).output();
+    assert_eq!(String::from_utf8_lossy(&show.expect("git").stdout), "unsaved\n");
+    assert!(lane.join("work.txt").exists(), "the files stay as they were");
+    let free = &json_lines(&w.run(&["worktree", "status", &lane_s]).stdout)[0];
+    assert!(free.get("holder").is_none() && free["lock"].is_null(), "{free}");
+
+    // --exec: the lock is there while the command runs, and gone after
+    let check = format!("test -f {}", locked.display());
+    let exec = w.run(&["worktree", "acquire", &b, &lane_s, "--exec", "sh", "-c", &check]);
+    assert!(exec.status.success(), "the lock was not held during --exec: {}", String::from_utf8_lossy(&exec.stderr));
+    assert!(!locked.exists(), "--exec unlocks after its command");
+
+    // a session's relay renews the lease past its ttl, and releases and unlocks it when the session ends
+    let (fake, relay) = relayed(&w, holder);
+    let got = as_session(Some(holder), &["worktree", "acquire", &a, &lane_s, "--ttl", "3"]);
+    let got = &json_lines(&got.stdout)[0];
+    assert_eq!(got["renewed_by"], "relay", "{got}");
+    let id = got["lease_id"].as_str().expect("a lease id").to_owned();
+    std::thread::sleep(Duration::from_secs(5));
+    let status = &json_lines(&w.run(&["worktree", "status", &lane_s]).stdout)[0];
+    assert_eq!(
+        status["lease_id"].as_str(),
+        Some(id.as_str()),
+        "the relay renewed it past its 3 s ttl\n{}",
+        relay_log(&w)
+    );
+    std::fs::write(lane.join("more.txt"), "at the end\n").expect("a change");
+    drop(fake);
+    let log = log_until(&w, "the session-end release", |l| l.contains(&format!("released worktree {lane_s}")));
+    assert!(log.contains(&format!("changes saved as refs/agent-bridge/released/{id}")), "{log}");
+    while Path::new(&format!("/proc/{relay}")).exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!locked.exists(), "the session's end unlocks it");
+    let free = &json_lines(&w.run(&["worktree", "status", &lane_s]).stdout)[0];
+    assert!(free.get("holder").is_none(), "{free}");
+}

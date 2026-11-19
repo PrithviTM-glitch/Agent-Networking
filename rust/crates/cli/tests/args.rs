@@ -29,8 +29,21 @@ fn hooks_print_their_help_and_nothing_else() {
     for args in [&["hook", "-h"][..], &["hook", "broadcast", "--help"]] {
         let out = run(args, b"");
         assert_eq!(out.status.code(), Some(0), "{args:?}");
-        assert!(text(&out.stdout).starts_with("a Claude Code hook"), "{args:?}: {}", text(&out.stdout));
+        assert!(text(&out.stdout).starts_with("a hook. Claude Code's broadcast"), "{args:?}: {}", text(&out.stdout));
     }
+    // the guards fail closed: bad input refuses (guard 2, ref-guard 1) with a reason, never exits 0
+    let out = run(&["hook", "guard"], b"not json");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out.stderr).starts_with("blocked: "), "{}", text(&out.stderr));
+    let out = run(&["hook", "ref-guard", "prepared"], b"one-word\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).starts_with("agent-bridge ref-guard: blocked: unreadable update line"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = run(&["hook", "ref-guard", "committed"], b"one-word\n");
+    assert_eq!((out.status.code(), out.stderr.len()), (Some(0), 0), "only prepared is checked");
     for (args, stdin) in [(&["hook"][..], &b""[..]), (&["hook", "broadcast"], b"not json"), (&["hook", "nosuch"], b"")]
     {
         let out = run(args, stdin);

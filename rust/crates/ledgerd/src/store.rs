@@ -4,10 +4,12 @@
 //! updates one at a time, in order; that serialization is the whole concurrency guarantee.
 
 use crate::request::{Bad, parse};
+/// AGENT_BRIDGE_AUTH as ledgerd applies it: off is the 0.3.1 behaviour; warn logs what enforce refuses.
+pub use agent_bridge::config::Auth;
 use agent_bridge::json::{Map, dumps, dumps_map, float, loads, now};
 use agent_bridge::ledger::{
     MAX_LEASES, MAX_LEDGERS, MAX_PENDING, MAX_PENDING_PER_OWNER, MAX_REQUESTS, MAX_RESOURCES, MAX_TTL, MAX_WAIT,
-    MAX_WAITERS, random_hex,
+    MAX_WAITERS, random_hex, worktree_resource,
 };
 use agent_bridge::stamp::stamp;
 use agent_bridge::validation::{ADMIN, is_ident};
@@ -27,8 +29,16 @@ const DEDUPE_S: f64 = 300.0;
 const MAX_KEEP: f64 = MAX_TTL + MAX_WAIT;
 /// A waiter is dropped this long before its client stops listening, so its lease reply still reaches it.
 const REPLY_MARGIN: f64 = 1.0;
-const READ_ONLY: [&str; 9] =
-    ["ledger", "public", "grants", "dump", "leases", "lease_history", "ping", "claims", "holders"];
+const READ_ONLY: [&str; 10] =
+    ["ledger", "public", "grants", "dump", "leases", "lease_history", "ping", "claims", "holders", "worktrees"];
+/// worktree resources admin's ledger may hold (admin/wt-*), apart from MAX_RESOURCES
+const MAX_WORKTREES: i64 = 1024;
+/// the per-identity request rate under auth: a token bucket of RATE_BURST refilled at RATE_PER_S
+const RATE_PER_S: f64 = 20.0;
+const RATE_BURST: f64 = 100.0;
+/// identities tracked at once, by the rate limit and by the once-an-hour auth warnings
+const MAX_TRACKED: usize = 4096;
+const WARN_EVERY_S: f64 = 3600.0;
 /// claims one agent may hold, and one room may have
 const MAX_CLAIMS_HELD: i64 = 256;
 const MAX_CLAIMS_ROOM: i64 = 1024;
@@ -66,6 +76,7 @@ CREATE INDEX IF NOT EXISTS lease_events_resource ON lease_events(resource, seq);
 CREATE TABLE IF NOT EXISTS claims(room TEXT NOT NULL, key TEXT NOT NULL, holder TEXT NOT NULL, since REAL NOT NULL,
   expires REAL, note TEXT NOT NULL, PRIMARY KEY(room, key));
 CREATE INDEX IF NOT EXISTS claims_holder ON claims(holder);
+CREATE TABLE IF NOT EXISTS specs(resource TEXT PRIMARY KEY, spec TEXT NOT NULL);
 ";
 
 /// Why an op failed: refused (the message goes back) or broken (logged, "internal error" goes back).
@@ -133,6 +144,11 @@ pub struct Ledger {
     stale_s: f64,
     /// each room's moderators, from its retained rooms/<room> record
     moderators: HashMap<String, Vec<String>>,
+    pub auth: Auth,
+    /// the rate limit's buckets by identity: tokens left and when they were counted
+    buckets: HashMap<String, (f64, f64)>,
+    /// when each auth warning was last logged
+    warned: HashMap<String, f64>,
 }
 
 /// Why Ledger::open failed: a database another schema version wrote (refused before anything is written), or
@@ -198,6 +214,9 @@ impl Ledger {
             swept: 0.0,
             stale_s: (stale_days * 86400.0).max(1.0),
             moderators: HashMap::new(),
+            auth: Auth::Off,
+            buckets: HashMap::new(),
+            warned: HashMap::new(),
         })
     }
 
@@ -266,15 +285,30 @@ impl Ledger {
         via: Option<&str>,
         expiry: Option<u32>,
     ) {
-        let Some(topic) = topic.filter(|t| t.strip_prefix("ledger/resp/").is_some_and(|id| is_ident(id, 128))) else {
+        let Some(topic) = topic else {
             return log("dropped request without a ResponseTopic under ledger/resp/");
+        };
+        // ledger/resp/<id>, or ledger/resp/<addr>/<conn>, which only the agent at addr may read under auth
+        let owner = match topic.strip_prefix("ledger/resp/").map(|rest| rest.split_once('/')) {
+            Some(None) if is_ident(&topic["ledger/resp/".len()..], 128) => {
+                if self.auth == Auth::Enforce {
+                    return log(
+                        "dropped request with a one-level ResponseTopic: under enforce it is ledger/resp/<addr>/<conn>",
+                    );
+                }
+                None
+            }
+            Some(Some((addr, conn))) if is_ident(addr, agent_bridge::validation::ID_MAX) && is_ident(conn, 128) => {
+                Some(addr)
+            }
+            _ => return log("dropped request without a ResponseTopic under ledger/resp/"),
         };
         let Some(corr) = corr.filter(|c| c.len() <= MAX_CORR) else {
             let body = json!({"ok": false, "error": format!("CorrelationData of 1 to {MAX_CORR} bytes required")});
             publish((topic.to_owned(), dumps(&body), None));
             return;
         };
-        let body = match self.answer(publish, payload, topic, corr, via, expiry.map(f64::from)) {
+        let body = match self.answer(publish, payload, topic, owner, corr, via, expiry.map(f64::from)) {
             Ok(body) => body,
             Err(Fail::Bad(e)) => Some(error(&e)),
             Err(Fail::Internal(e)) => {
@@ -290,11 +324,48 @@ impl Ledger {
         }
     }
 
+    /// Log text unless the same key was logged within WARN_EVERY_S.
+    fn warn_once(&mut self, key: &str, text: &str) {
+        let now = now();
+        if self.warned.get(key).is_some_and(|t| now - t < WARN_EVERY_S) {
+            return;
+        }
+        if self.warned.len() >= MAX_TRACKED {
+            self.warned.retain(|_, t| now - *t < WARN_EVERY_S);
+        }
+        if self.warned.len() < MAX_TRACKED {
+            self.warned.insert(key.to_owned(), now);
+        }
+        log(&format!("auth {}: {text}", self.auth.as_str()));
+    }
+
+    /// One token from who's bucket, false when it is empty.
+    fn take_token(&mut self, who: &str) -> bool {
+        let now = now();
+        let level = |(tokens, at): (f64, f64)| (tokens + (now - at) * RATE_PER_S).min(RATE_BURST);
+        if self.buckets.len() >= MAX_TRACKED && !self.buckets.contains_key(who) {
+            // a full bucket is the same as none
+            self.buckets.retain(|_, b| level(*b) < RATE_BURST);
+            // still full: the longest-idle bucket goes, so new identities are never shut out
+            if let Some(idle) = self.buckets.iter().min_by(|a, b| a.1.1.total_cmp(&b.1.1)).map(|(k, _)| k.clone()) {
+                self.buckets.remove(&idle);
+            }
+        }
+        let tokens = self.buckets.get(who).map_or(RATE_BURST, |b| level(*b));
+        if tokens < 1.0 {
+            return false;
+        }
+        self.buckets.insert(who.to_owned(), (tokens - 1.0, now));
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn answer(
         &mut self,
         publish: &mut dyn FnMut(Outgoing),
         payload: &[u8],
         topic: &str,
+        owner: Option<&str>,
         corr: &[u8],
         via: Option<&str>,
         expiry: Option<f64>,
@@ -306,6 +377,21 @@ impl Ledger {
             return bad("payload must be UTF-8 JSON");
         };
         let (op, me, args) = parse(&req, via)?;
+        // Never published into another agent's reply space.
+        if owner.is_some_and(|o| o != me) {
+            log(&format!("dropped {op} from {me} with ResponseTopic {}", &topic[..topic.len().min(120)]));
+            return Ok(None);
+        }
+        if via.is_none() {
+            match self.auth {
+                Auth::Off => {}
+                Auth::Warn => self.warn_once(&format!("plain {me}"), &format!("{me} sent {op} on plain ledger/req")),
+                Auth::Enforce => return bad("send requests on ledger/req/<your address>"),
+            }
+        }
+        if self.auth != Auth::Off && me != ADMIN && !self.take_token(&me) {
+            return bad(format!("rate limited: at most {RATE_PER_S} requests a second"));
+        }
         let req = Req { topic, corr, expiry };
         self.run(publish, |l| l.serve(op, &me, &args, &req, payload))
     }
@@ -340,8 +426,22 @@ impl Ledger {
         let now = now();
         let body = match op {
             "init" => self.op_init(me, now)?,
-            "dump" => self.op_dump(now)?,
-            "ping" => obj(json!({"service": "ledgerd", "version": env!("CARGO_PKG_VERSION")})),
+            // Under auth, identities are real, so everything at once is for admin (the console) alone.
+            "dump" if me != ADMIN && self.auth == Auth::Enforce => return bad("dump: admin only"),
+            "dump" => {
+                if me != ADMIN && self.auth == Auth::Warn {
+                    self.warn_once(&format!("dump {me}"), &format!("{me} read the whole ledger with dump"));
+                }
+                self.op_dump(now)?
+            }
+            "ping" => {
+                let mut body = obj(json!({"service": "ledgerd", "version": env!("CARGO_PKG_VERSION")}));
+                if self.auth != Auth::Off {
+                    body.insert("auth".into(), self.auth.as_str().into());
+                }
+                body
+            }
+            "worktrees" => self.op_worktrees(args.get("all") == Some(&Value::Bool(true)))?,
             "claims" => self.op_claims(me, args.get("room").and_then(Value::as_str))?,
             "holders" => self.op_holders(args.get("resource").and_then(Value::as_str).unwrap_or_default())?,
             // the holder, a moderator or admin, whether or not they have a ledger: it touches no resource
@@ -350,32 +450,48 @@ impl Ledger {
                 self.op_unclaim(me, a("room"), a("key"))?
             }
             _ => {
-                if self.exec("UPDATE ledgers SET seen=? WHERE owner=?", params![now, me])? == 0 {
-                    return bad(format!("no ledger for {me}, call init first"));
-                }
+                // admin acting on another agent's ledger: as that owner, recorded and announced as admin
+                let by = args.get("on_behalf").and_then(Value::as_str);
+                let me = match by {
+                    Some(_) if me != ADMIN => return bad("on_behalf: only admin acts for another ledger"),
+                    Some(owner) => {
+                        if self.one("SELECT 1 FROM ledgers WHERE owner=?", [owner])?.is_none() {
+                            return bad(format!("no ledger for {owner}"));
+                        }
+                        owner
+                    }
+                    None => {
+                        if self.exec("UPDATE ledgers SET seen=? WHERE owner=?", params![now, me])? == 0 {
+                            return bad(format!("no ledger for {me}, call init first"));
+                        }
+                        me
+                    }
+                };
+                let by = by.map(|_| ADMIN);
                 let a = |k: &str| args.get(k).and_then(Value::as_str);
                 let n = |k: &str| args.get(k).and_then(Value::as_f64).unwrap_or(0.0);
                 let body = match op {
                     "add" => self.op_add(me, now, a("name").unwrap_or_default(), args)?,
                     "update" => self.op_update(me, now, a("name").unwrap_or_default(), args)?,
-                    "remove" => self.op_remove(me, a("name").unwrap_or_default())?,
+                    "remove" => self.op_remove(me, a("name").unwrap_or_default(), by)?,
                     "ledger" => self.op_ledger(me, a("owner"))?,
                     "public" => self.op_public()?,
                     "request" => {
                         self.op_request(me, now, a("resource").unwrap_or_default(), a("level").unwrap_or_default())?
                     }
                     "grant" => self.op_grant(me, a("request_id").unwrap_or_default())?,
-                    "deny" => self.op_deny(me, a("request_id").unwrap_or_default())?,
+                    "deny" => self.op_deny(me, a("request_id").unwrap_or_default(), by)?,
                     "grants" => self.op_grants(me)?,
                     "acquire" => {
                         let (res, lvl) = (a("resource").unwrap_or_default(), a("level").unwrap_or_default());
-                        match self.op_acquire(me, now, res, lvl, n("ttl"), n("wait"), req)? {
+                        let place = a("path").map(|p| (p, a("git_common_dir")));
+                        match self.op_acquire(me, now, res, lvl, n("ttl"), n("wait"), place, req)? {
                             Some(body) => body,
                             None => return Ok(None),
                         }
                     }
                     "renew" => self.op_renew(me, now, a("lease_id").unwrap_or_default(), n("ttl"))?,
-                    "release" => self.op_release(me, a("lease_id").unwrap_or_default())?,
+                    "release" => self.op_release(me, a("lease_id").unwrap_or_default(), by)?,
                     "cancel" => self.op_cancel(me, req.topic, a("correlation").unwrap_or_default())?,
                     "leases" => self.op_leases(me)?,
                     "claim" => {
@@ -429,10 +545,14 @@ impl Ledger {
 
     fn op_add(&mut self, me: &str, now: f64, name: &str, args: &Map) -> Res<Map> {
         let rid = format!("{me}/{name}");
+        if me == ADMIN && name.starts_with("wt-") {
+            return bad("wt- names in admin's ledger are worktrees, made by acquire with a path");
+        }
         if self.one("SELECT 1 FROM resources WHERE id=?", [&rid])?.is_some() {
             return bad(format!("{rid} exists, use update"));
         }
-        if self.count("SELECT count(*) FROM resources WHERE owner=?", [me])? >= MAX_RESOURCES {
+        let mine = "SELECT count(*) FROM resources WHERE owner=? AND NOT (owner='admin' AND name LIKE 'wt-%')";
+        if self.count(mine, [me])? >= MAX_RESOURCES {
             return bad(format!("at most {MAX_RESOURCES} resources per ledger"));
         }
         let a = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -459,10 +579,14 @@ impl Ledger {
         self.resource_body(&rid)
     }
 
-    fn op_remove(&mut self, me: &str, name: &str) -> Res<Map> {
+    fn op_remove(&mut self, me: &str, name: &str, by: Option<&str>) -> Res<Map> {
         let rid = format!("{me}/{name}");
         self.resource(&rid, Some(me))?;
-        self.forget(std::slice::from_ref(&rid), &format!("{rid} was removed"))?;
+        let why = match by {
+            Some(by) => format!("{rid} was removed by {by}"),
+            None => format!("{rid} was removed"),
+        };
+        self.forget(std::slice::from_ref(&rid), &why)?;
         Ok(Map::new())
     }
 
@@ -565,8 +689,9 @@ impl Ledger {
         self.request_body(rq)
     }
 
-    fn op_deny(&mut self, me: &str, rq: &str) -> Res<Map> {
-        let Some(row) = self.decide(me, rq, "denied")? else { return self.request_body(rq) };
+    fn op_deny(&mut self, owner: &str, rq: &str, by: Option<&str>) -> Res<Map> {
+        let Some(row) = self.decide(owner, rq, "denied")? else { return self.request_body(rq) };
+        let me = by.unwrap_or(owner);
         let (holder, resource, lvl) = (s(&row, "holder"), s(&row, "resource"), s(&row, "level"));
         let left = self.held(holder, resource)?;
         let mut ended = Vec::new();
@@ -682,8 +807,16 @@ impl Ledger {
         lvl: &str,
         ttl: f64,
         wait: f64,
+        place: Option<(&str, Option<&str>)>,
         req: &Req,
     ) -> Res<Option<Map>> {
+        let mut created = None;
+        if let Some((path, common)) = place {
+            match self.worktree(me, now, resource, lvl, path, common)? {
+                Ok(c) => created = Some(c),
+                Err(refusal) => return Ok(Some(refusal)),
+            }
+        }
         self.resource(resource, None)?;
         if self.held(me, resource)? < level(lvl) {
             return bad(format!("no {lvl} grant on {resource}, request it first"));
@@ -692,7 +825,11 @@ impl Ledger {
             return bad(format!("at most {MAX_LEASES} leases per agent"));
         }
         if self.one("SELECT 1 FROM waiters WHERE resource=?", [resource])?.is_none() && self.free(resource, lvl)? {
-            return Ok(Some(obj(json!({"lease": self.lease(resource, me, lvl, ttl)?}))));
+            let mut body = obj(json!({"lease": self.lease(resource, me, lvl, ttl)?}));
+            if let Some(c) = created {
+                body.insert("created".into(), c.into());
+            }
+            return Ok(Some(body));
         }
         let busy = if lvl == "write" { "" } else { " AND level='write'" };
         let blocking =
@@ -720,6 +857,74 @@ impl Ledger {
         Ok(None)
     }
 
+    /// acquire with a path: the worktree's resource admin/wt-<hash> is made on demand (public, max write, the path as
+    /// its description, an access spec) and me's request for lvl filed as any request is. Ok(Ok(created)) to go on
+    /// with the acquire, Ok(Err(reply)) when the request is left pending; that reply commits, so the request stays.
+    fn worktree(
+        &mut self,
+        me: &str,
+        now: f64,
+        resource: &str,
+        lvl: &str,
+        path: &str,
+        common: Option<&str>,
+    ) -> Res<Result<bool, Map>> {
+        if resource != worktree_resource(path) {
+            return bad(format!("path: does not match {resource} (its id is the sha256 of the realpath)"));
+        }
+        let name = &resource[ADMIN.len() + 1..];
+        let created = self.one("SELECT 1 FROM resources WHERE id=?", [resource])?.is_none();
+        if created {
+            let wt = "SELECT count(*) FROM resources WHERE owner=? AND name LIKE 'wt-%'";
+            if self.count(wt, [ADMIN])? >= MAX_WORKTREES {
+                return bad(format!("at most {MAX_WORKTREES} worktrees"));
+            }
+            self.exec("INSERT OR IGNORE INTO ledgers VALUES (?, ?, ?)", params![ADMIN, now, now])?;
+            self.exec(
+                "INSERT INTO resources VALUES (?, ?, ?, ?, 'public', 'write', ?, ?)",
+                params![resource, ADMIN, name, path, now, now],
+            )?;
+        }
+        let spec = json!({"kind": "worktree", "path": path, "git_common_dir": common, "enforcement": "hook"});
+        self.exec("INSERT OR IGNORE INTO specs VALUES (?, ?)", params![resource, dumps(&spec)])?;
+        if me == ADMIN {
+            return Ok(Ok(created));
+        }
+        let request = self.op_request(me, now, resource, lvl)?;
+        let row = request.get("request").cloned().unwrap_or_default();
+        if row.get("status").and_then(Value::as_str) == Some("pending") {
+            let id = row.get("id").and_then(Value::as_str).unwrap_or_default();
+            let mut body = error(&format!("your {lvl} request for {resource} is pending with admin (request_id {id})"));
+            body.insert("request".into(), row);
+            return Ok(Err(body));
+        }
+        Ok(Ok(created))
+    }
+
+    /// The worktrees with a live lease, or every one with all, for the guard and the console. Anyone may ask.
+    fn op_worktrees(&mut self, all: bool) -> Res<Map> {
+        let join = if all { "LEFT JOIN" } else { "JOIN" };
+        let rows = self.rows(
+            &format!(
+                "SELECT r.id, r.description, s.spec, l.holder, l.level, l.id AS lease_id, l.expires \
+                 FROM resources r LEFT JOIN specs s ON s.resource=r.id {join} leases l ON l.resource=r.id \
+                 WHERE r.owner=? AND r.name LIKE 'wt-%' ORDER BY r.id, l.expires"
+            ),
+            [ADMIN],
+        )?;
+        let worktrees: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let spec = r.get("spec").and_then(Value::as_str).and_then(|t| loads(t.as_bytes())).unwrap_or_default();
+                let path = spec.get("path").cloned().unwrap_or_else(|| r["description"].clone());
+                json!({"resource": r["id"], "path": path,
+                       "git_common_dir": spec.get("git_common_dir").cloned().unwrap_or(Value::Null),
+                       "holder": r["holder"], "level": r["level"], "lease_id": r["lease_id"], "expires_at": r["expires"]})
+            })
+            .collect();
+        Ok(obj(json!({"worktrees": worktrees})))
+    }
+
     fn op_renew(&mut self, me: &str, now: f64, lease_id: &str, ttl: f64) -> Res<Map> {
         if self.exec("UPDATE leases SET expires=? WHERE id=? AND holder=?", params![now + ttl, lease_id, me])? == 0 {
             return self.no_lease(lease_id);
@@ -729,16 +934,17 @@ impl Ledger {
         Ok(obj(json!({"lease": lease_view(&row)})))
     }
 
-    fn op_release(&mut self, me: &str, lease_id: &str) -> Res<Map> {
+    fn op_release(&mut self, owner: &str, lease_id: &str, by: Option<&str>) -> Res<Map> {
         let Some(row) = self.one(
             "SELECT l.* FROM leases l JOIN resources r ON r.id=l.resource WHERE l.id=? AND (l.holder=? OR r.owner=?)",
-            [lease_id, me, me],
+            [lease_id, owner, owner],
         )?
         else {
             return self.no_lease(lease_id);
         };
         self.exec("DELETE FROM leases WHERE id=?", [lease_id])?;
         let (resource, holder) = (s(&row, "resource"), s(&row, "holder"));
+        let me = by.unwrap_or(owner);
         if holder == me {
             self.event("release", &row, None)?;
         } else {
@@ -857,7 +1063,11 @@ impl Ledger {
     /// Who holds resource now, and who waits for it, for anyone who asks.
     fn op_holders(&mut self, resource: &str) -> Res<Map> {
         self.resource(resource, None)?;
-        let holders = self.holders(resource)?;
+        let holders: Vec<Value> = self
+            .rows("SELECT id, holder, level, expires FROM leases WHERE resource=? ORDER BY expires", [resource])?
+            .iter()
+            .map(|r| json!({"holder": r["holder"], "level": r["level"], "expires_at": r["expires"], "lease_id": r["id"]}))
+            .collect();
         let waiting: Vec<Value> = self
             .rows("SELECT holder, level, queued FROM waiters WHERE resource=? ORDER BY seq", [resource])?
             .iter()
@@ -1000,6 +1210,7 @@ impl Ledger {
                 ("waiters", "resource"),
                 ("leases", "resource"),
                 ("lease_events", "resource"),
+                ("specs", "resource"),
                 ("requests", "resource"),
                 ("resources", "id"),
             ] {
@@ -1082,8 +1293,14 @@ impl Ledger {
             self.exec("DELETE FROM requests WHERE status IN ('pending', 'denied') AND ts<?", [cutoff])?;
             // events of resources a rollback ledgerd removed, which knows nothing of this table
             self.exec("DELETE FROM lease_events WHERE resource NOT IN (SELECT id FROM resources)", [])?;
+            self.exec("DELETE FROM specs WHERE resource NOT IN (SELECT id FROM resources)", [])?;
             for r in self
-                .rows("SELECT owner FROM ledgers WHERE seen<? AND owner NOT IN (SELECT addr FROM presence)", [cutoff])?
+                // admin's ledger holds the worktrees, which outlive any session
+                .rows(
+                    "SELECT owner FROM ledgers WHERE seen<? AND owner NOT IN (SELECT addr FROM presence) \
+                     AND owner<>'admin'",
+                    [cutoff],
+                )?
             {
                 self.drop_ledger(s(&r, "owner"))?;
             }
@@ -1304,6 +1521,171 @@ mod tests {
         ask(&mut ledger, n, "b-1", json!({"op": "acquire", "resource": "b-1/db", "level": "write"}));
         let (h, _) = ask(&mut ledger, n, "nobody-0", json!({"op": "holders", "resource": "b-1/db"}));
         assert_eq!((h["holders"][0]["holder"].as_str(), h["waiting"].as_array().map(Vec::len)), (Some("b-1"), Some(0)));
+    }
+
+    /// One request on any topic form: via None is plain ledger/req, reply the ResponseTopic. The reply, if any.
+    fn ask_on(ledger: &mut Ledger, n: &mut u32, via: Option<&str>, reply: &str, body: Value) -> Option<Map> {
+        let mut out = Vec::new();
+        *n += 1;
+        let corr = n.to_be_bytes();
+        ledger.handle(&mut |o| out.push(o), dumps(&body).as_bytes(), Some(reply), Some(&corr), via, None);
+        let found = out.iter().find(|o| o.2.as_deref() == Some(&corr[..]))?;
+        assert_eq!(found.0, reply, "a reply goes only to the request's ResponseTopic");
+        loads(found.1.as_bytes()).and_then(|v| v.as_object().cloned())
+    }
+
+    #[test]
+    fn worktrees_are_made_on_demand_and_listed() {
+        let dir = Dir::new("worktrees");
+        let mut ledger = Ledger::open(&dir.join("ledger.db"), 3.0).ok().expect("opens");
+        let n = &mut 0;
+        for who in ["a-1", "b-1"] {
+            ask(&mut ledger, n, who, json!({"op": "init"}));
+        }
+        let path = "/home/u/wt";
+        let wt = worktree_resource(path);
+        let take = |who_ttl: f64, wait: f64| {
+            json!({"op": "acquire", "resource": wt, "level": "write", "ttl": who_ttl, "wait": wait, "path": path,
+                   "git_common_dir": "/home/u/repo/.git"})
+        };
+        let (bad, _) = ask(
+            &mut ledger,
+            n,
+            "a-1",
+            json!({"op": "acquire", "resource": "admin/wt-0000000000000000",
+                                                         "level": "write", "path": path}),
+        );
+        assert_eq!(
+            bad["error"],
+            "path: does not match admin/wt-0000000000000000 (its id is the sha256 of the realpath)"
+        );
+        let (got, _) = ask(&mut ledger, n, "a-1", take(60.0, 0.0));
+        assert_eq!((got["ok"].as_bool(), got["created"].as_bool()), (Some(true), Some(true)), "{got:?}");
+        let lease_id = got["lease"]["lease_id"].as_str().unwrap_or_default().to_owned();
+        let (busy, _) = ask(&mut ledger, n, "b-1", take(60.0, 0.0));
+        assert_eq!(busy["error"], "busy", "{busy:?}");
+        let (h, _) = ask(&mut ledger, n, "c-1", json!({"op": "holders", "resource": wt}));
+        assert_eq!(
+            (h["holders"][0]["holder"].as_str(), h["holders"][0]["lease_id"].as_str()),
+            (Some("a-1"), Some(lease_id.as_str()))
+        );
+
+        let (held, _) = ask(&mut ledger, n, "c-1", json!({"op": "worktrees"}));
+        assert_eq!(
+            held["worktrees"],
+            json!([{"resource": wt, "path": path, "git_common_dir": "/home/u/repo/.git",
+            "holder": "a-1", "level": "write", "lease_id": lease_id, "expires_at": got["lease"]["expires_at"]}])
+        );
+        let (res, _) = ask(&mut ledger, n, "a-1", json!({"op": "ledger", "owner": "admin"}));
+        assert_eq!(
+            (res["resources"][0]["description"].as_str(), res["resources"][0]["visibility"].as_str()),
+            (Some(path), Some("public"))
+        );
+
+        ask(&mut ledger, n, "a-1", json!({"op": "release", "lease_id": lease_id}));
+        let (none, _) = ask(&mut ledger, n, "c-1", json!({"op": "worktrees"}));
+        assert_eq!(none["worktrees"], json!([]));
+        let (all, _) = ask(&mut ledger, n, "c-1", json!({"op": "worktrees", "all": true}));
+        assert_eq!((all["worktrees"][0]["path"].as_str(), all["worktrees"][0]["holder"].is_null()), (Some(path), true));
+        let (again, _) = ask(&mut ledger, n, "b-1", take(60.0, 0.0));
+        assert_eq!((again["ok"].as_bool(), again["created"].as_bool()), (Some(true), Some(false)), "{again:?}");
+
+        // admin makes it private: a newcomer's request waits for admin and stays filed
+        ask(&mut ledger, n, "admin", json!({"op": "update", "name": &wt[6..], "visibility": "private"}));
+        ask(&mut ledger, n, "d-1", json!({"op": "init"}));
+        let (pending, out) = ask(&mut ledger, n, "d-1", take(60.0, 0.0));
+        let err = pending["error"].as_str().unwrap_or_default();
+        assert!(err.starts_with(&format!("your write request for {wt} is pending with admin (request_id ")), "{err}");
+        assert!(out.iter().any(|o| o.0 == "inbox/admin"), "admin is asked: {out:?}");
+        let (grants, _) = ask(&mut ledger, n, "d-1", json!({"op": "grants"}));
+        assert_eq!(grants["held"][0]["status"], "pending", "the request was kept");
+
+        let (named, _) = ask(&mut ledger, n, "admin", json!({"op": "add", "name": "wt-x"}));
+        assert_eq!(named["error"], "wt- names in admin's ledger are worktrees, made by acquire with a path");
+        // admin's ledger outlives the stale sweep
+        ledger.exec("UPDATE ledgers SET seen=0", []).ok();
+        ledger.swept = 0.0;
+        ledger.run(&mut |_| {}, Ledger::tick).ok();
+        assert_eq!(ledger.count("SELECT count(*) FROM resources WHERE owner='admin'", []).ok(), Some(1));
+        assert_eq!(ledger.count("SELECT count(*) FROM specs", []).ok(), Some(1));
+    }
+
+    #[test]
+    fn admin_acts_on_behalf_and_is_named() {
+        let dir = Dir::new("behalf");
+        let mut ledger = Ledger::open(&dir.join("ledger.db"), 3.0).ok().expect("opens");
+        let n = &mut 0;
+        for who in ["o-1", "h-1"] {
+            ask(&mut ledger, n, who, json!({"op": "init"}));
+        }
+        ask(&mut ledger, n, "o-1", json!({"op": "add", "name": "db", "visibility": "public", "max_level": "write"}));
+        ask(&mut ledger, n, "h-1", json!({"op": "request", "resource": "o-1/db", "level": "write"}));
+        let (got, _) = ask(&mut ledger, n, "h-1", json!({"op": "acquire", "resource": "o-1/db", "level": "write"}));
+        let lease_id = got["lease"]["lease_id"].as_str().unwrap_or_default().to_owned();
+        let release = json!({"op": "release", "lease_id": lease_id, "on_behalf": "o-1"});
+        let (no, _) = ask(&mut ledger, n, "h-1", release.clone());
+        assert_eq!(no["error"], "on_behalf: only admin acts for another ledger");
+        let (gone, _) =
+            ask(&mut ledger, n, "admin", json!({"op": "release", "lease_id": lease_id, "on_behalf": "x-9"}));
+        assert_eq!(gone["error"], "no ledger for x-9");
+        let (ok, out) = ask(&mut ledger, n, "admin", release);
+        assert_eq!(ok["ok"], true, "{ok:?}");
+        assert!(
+            out.iter().any(|o| o.0 == "inbox/h-1" && o.1.contains(&format!("admin ended your write lease {lease_id}")))
+        );
+        let (hist, _) = ask(&mut ledger, n, "o-1", json!({"op": "lease_history", "resource": "o-1/db"}));
+        assert_eq!(
+            (hist["events"][1]["event"].as_str(), hist["events"][1]["by"].as_str()),
+            (Some("break"), Some("admin"))
+        );
+
+        let (grants, _) = ask(&mut ledger, n, "o-1", json!({"op": "grants"}));
+        let rq = grants["asked"][0]["id"].as_str().unwrap_or_default().to_owned();
+        let (_, out) = ask(&mut ledger, n, "admin", json!({"op": "deny", "request_id": rq, "on_behalf": "o-1"}));
+        assert!(out.iter().any(|o| o.0 == "inbox/h-1" && o.1.contains("admin revoked your write grant on o-1/db")));
+        let (_, _) = ask(&mut ledger, n, "admin", json!({"op": "remove", "name": "db", "on_behalf": "o-1"}));
+        assert_eq!(ledger.count("SELECT count(*) FROM resources", []).ok(), Some(0));
+    }
+
+    #[test]
+    fn auth_modes_check_topics_rate_and_dump() {
+        let dir = Dir::new("auth");
+        let mut ledger = Ledger::open(&dir.join("ledger.db"), 3.0).ok().expect("opens");
+        let n = &mut 0;
+        let ping = json!({"op": "ping", "as": "a-1"});
+        // off: today's behaviour, plus two-level reply topics that name the requester
+        let off = ask_on(&mut ledger, n, None, "ledger/resp/c1", ping.clone()).expect("plain works when off");
+        assert!(off.get("auth").is_none(), "{off:?}");
+        assert!(ask_on(&mut ledger, n, Some("a-1"), "ledger/resp/a-1/s", ping.clone()).is_some());
+        assert!(ask_on(&mut ledger, n, Some("a-1"), "ledger/resp/b-1/s", ping.clone()).is_none(), "not into b-1's");
+        assert!(ask_on(&mut ledger, n, Some("a-1"), "ledger/resp/a-1/s/x", ping.clone()).is_none());
+
+        ledger.auth = Auth::Warn;
+        let warn = ask_on(&mut ledger, n, None, "ledger/resp/c1", ping.clone()).expect("plain is logged, not refused");
+        assert_eq!(warn["auth"], "warn");
+        let dump = ask_on(&mut ledger, n, Some("a-1"), "ledger/resp/a-1/s", json!({"op": "dump"})).expect("dump");
+        assert_eq!(dump["ok"], true, "logged in warn");
+        let mut limited = 0;
+        for _ in 0..150 {
+            let r = ask_on(&mut ledger, n, Some("r-1"), "ledger/resp/r-1/s", json!({"op": "ping"})).expect("reply");
+            if r.get("error") == Some(&json!("rate limited: at most 20 requests a second")) {
+                limited += 1;
+            }
+        }
+        assert!((40..=55).contains(&limited), "a burst of 100, then about 20 a second: {limited} limited");
+        for _ in 0..150 {
+            let r = ask_on(&mut ledger, n, Some("admin"), "ledger/resp/admin/s", json!({"op": "ping"})).expect("reply");
+            assert_eq!(r["ok"], true, "admin is exempt");
+        }
+
+        ledger.auth = Auth::Enforce;
+        let plain = ask_on(&mut ledger, n, None, "ledger/resp/a-1/s", ping.clone()).expect("refused with a reply");
+        assert_eq!(plain["error"], "send requests on ledger/req/<your address>");
+        assert!(ask_on(&mut ledger, n, Some("a-1"), "ledger/resp/c1", ping.clone()).is_none(), "one level is dropped");
+        let dump = ask_on(&mut ledger, n, Some("a-1"), "ledger/resp/a-1/s", json!({"op": "dump"})).expect("reply");
+        assert_eq!(dump["error"], "dump: admin only");
+        let dump = ask_on(&mut ledger, n, Some("admin"), "ledger/resp/admin/s", json!({"op": "dump"})).expect("reply");
+        assert_eq!(dump["ok"], true);
     }
 
     #[test]

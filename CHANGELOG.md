@@ -9,7 +9,50 @@ workflow publishes the section as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-18
+
+### Added
+- `agent-bridge worktree acquire | release | status` locks a git worktree for one agent: a write lease, made on demand,
+  that also git-locks the worktree with the reason `agent-bridge lease <id> held by <addr>`. The session's relay renews
+  it and releases it when the session ends, and `release` first saves uncommitted work under
+  `refs/agent-bridge/released/<lease id>`.
+- Two hooks enforce worktree locks, and unlike the other hooks both fail closed. `agent-bridge hook guard`, for Claude
+  Code's `PreToolUse`: inside a worktree another agent leases, a session's edits, shell writes and git writes are
+  refused with the exact `agent-bridge worktree acquire` command to run, while reads still work; commands it can't
+  resolve, and `core.hooksPath` overrides, are refused only in a repository with a locked worktree, and globs are
+  judged by the paths they name. `agent-bridge hook ref-guard`, git's `reference-transaction` hook: refuses moving a
+  leased worktree's branch from any worktree. Both are hooks, not gates: interpreters and scripts get past the guard.
+- Readers accept sender-bound topics, `inbox/<to>/<from>` and `room/<room>/<from>`, and every room and DM message shows
+  `"sender": "bound"` or `"claimed"`. Senders switch in a later release.
+- Authentication groundwork, off by default. `compose.auth.yaml` runs the broker as you with a unix socket, and
+  `AGENT_BRIDGE_AUTH=warn|enforce` turns on per-agent credentials and literal-topic roles. Agents get their
+  credentials when they register, and existing ones on their next attach or relay restart, so running sessions migrate
+  without registering again. The CLI refuses an agent bound to another session.
+- `agent-bridge doctor` checks the auth mode (agents still anonymous under `warn`, and an `auth-mode` file the broker
+  doesn't match), relays and MCP servers older than 0.3.2, root-equivalent groups and the Claude Code version, with a
+  new `INFO` status.
+- Worktree locks in the ledger: an `acquire` that carries a worktree's `path` creates its lock resource on demand
+  (admin-owned, public, `admin/wt-<hash of the path>`), and the new `worktrees` op lists the held ones. `holders`
+  entries carry `lease_id`.
+- ledgerd under `AGENT_BRIDGE_AUTH` `warn` or `enforce` (`off`, the default, behaves as 0.3.1): identity from the
+  request topic, two-level reply topics that must name the requester, admin acting for an owner with `on_behalf`
+  (named in the holder's DM), 20 requests a second per identity, `dump` admin only under `enforce`, and its own login.
+  `ping` reports the mode.
+- MCP tools `worktree_acquire`, `worktree_release` and `worktree_status`.
+- Console: a Worktrees view (leased worktrees, the two-part enforcement label, drift, sessions sharing a worktree) and
+  Protect this repo, which installs agent-bridge's ref guard into a repository's hooks, chaining any existing hook;
+  Unprotect removes only its own.
+
 ### Changed
+- A publish or subscribe the broker refuses is now an error (`you may not post as <address> on <topic>`, `you may not
+  read <topic>`) where it used to be silently confirmed. `room/` and `inbox/` topics of any other depth are dropped.
+- With credentials, a Bus logs in with its own secret client id and takes service replies on
+  `<service>/resp/<address>/<connection>`. Without credentials (auth `off`, the default) nothing changes.
+- historyd accepts reply topics `history/resp/<address>/<connection>` under the requester's own address, and keeps
+  sender-bound messages marked `"sender": "bound"`.
+- `ledgerd --health` asks for `worktrees` instead of `dump`, so it keeps working under `enforce`.
+- The console prints its login link as `http://localhost:PORT`, shows the auth mode and marks unverified ("claimed")
+  senders when auth is on, and logs in as admin by setting `AGENT_BRIDGE_CREDENTIALS` to `admin.json` when it exists.
 - The repository's `.mcp.json` runs the installed `agent-bridge-mcp` instead of the checkout's code, so sessions opened
   in a clone run the released server and survive a `uv sync` there.
 
@@ -19,6 +62,9 @@ workflow publishes the section as the GitHub release notes.
 - `docs/ACCESS.md`: the design for lease-enforced access, where a lease issues the credential that opens a resource
   (SSH certificates, per-lease database users, a git gate remote), so access no longer depends on an agent choosing
   to take the lease.
+- The README gains Worktree locks (installing the guard in managed or user settings, protecting a repository, the
+  honest two-part label) and Authentication (the modes, the overlay, credentials, what it doesn't protect against)
+  sections, each step with its undo, and the 0.3.2 Upgrading notes.
 
 ## [0.3.1] - 2026-11-17
 
@@ -232,7 +278,8 @@ First release.
 - A Rust core with Python bindings, and Rust ports of the CLI, relay, ledgerd and historyd, kept in parity with the
   Python reference by conformance tests.
 
-[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.2...v0.2.3

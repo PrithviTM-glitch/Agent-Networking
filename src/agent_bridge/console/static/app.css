@@ -128,3 +128,8 @@ button.mini{padding:0 6px;font-size:11px;line-height:16px}
 .card.pin .t{color:var(--muted);font-size:12px}
 .card.pin textarea{width:100%;box-sizing:border-box;font:inherit}
 .b.collapsed{max-height:16em;overflow:hidden;-webkit-mask-image:linear-gradient(#000 75%,transparent)}
+.tag.claimed{color:var(--warn);border-color:var(--warn)}
+.badge.warn{background:var(--warn);color:#000}
+#auth{margin-left:8px}
+.card th{white-space:nowrap}
+.mono.wt{overflow-wrap:anywhere}

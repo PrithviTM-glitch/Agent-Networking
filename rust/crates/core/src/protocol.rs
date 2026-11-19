@@ -5,8 +5,8 @@
 
 use crate::json::{Map, float, float_repr};
 use crate::validation::{
-    Result, TOPICS_MAX, check_about, check_body_value, check_caps_value, check_ident, check_mentions,
-    check_topic_value, check_ts, fail, is_count, is_message_id, is_uuid, is_version,
+    ID_MAX, Result, TOPICS_MAX, check_about, check_body_value, check_caps_value, check_ident, check_mentions,
+    check_topic_value, check_ts, fail, is_count, is_ident, is_message_id, is_uuid, is_version,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -65,6 +65,10 @@ pub fn parse_presence(payload: &[u8]) -> Option<Map> {
     if let Some(a) = d.get("about").and_then(Value::as_str).filter(|a| !a.is_empty() && check_about(a).is_ok()) {
         rec.insert("about".into(), a.into());
     }
+    // From 0.3.2: "credentials" when the agent's Bus connected with its own credentials (doctor's warn-mode check).
+    if d.get("auth").and_then(Value::as_str) == Some("credentials") {
+        rec.insert("auth".into(), "credentials".into());
+    }
     Some(rec)
 }
 
@@ -76,12 +80,39 @@ pub fn message_id(topic: &str, from: &str, ts: f64) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A sender-bound topic (0.3.2, AUTH.md 4.4): `inbox/<to>/<from>` or `room/<room>/<from>`, as (today's topic, the
+/// sender in the topic). The broker's ACL lets only `<from>` write its own level once auth is on.
+pub fn sender_bound(topic: &str) -> Option<(String, &str)> {
+    let mut levels = topic.split('/');
+    let (kind, place, from) = (levels.next()?, levels.next()?, levels.next()?);
+    let ok = matches!(kind, "inbox" | "room") && levels.next().is_none();
+    (ok && is_ident(place, ID_MAX) && is_ident(from, ID_MAX)).then(|| (format!("{kind}/{place}"), from))
+}
+
 /// A received payload as a message, or None if it breaks the input rules.
+///
+/// On a sender-bound topic the sender is the topic level: a payload `"from"` that differs drops the message, the topic
+/// is normalised to today's form (so recv, history, ids and threads don't change) and `"sender": "bound"` is added. A
+/// message on today's forms, or any other topic with a sender, carries `"sender": "claimed"` (the payload says so).
 pub fn parse_message(topic: &str, payload: &[u8]) -> Option<Map> {
+    if let Some((base, from)) = sender_bound(topic) {
+        let Some(Value::Object(d)) = parse_json(payload, PAYLOAD_MAX) else { return None };
+        if d.get("from").and_then(Value::as_str) != Some(from) {
+            return None;
+        }
+        let mut msg = message(&base, &d).ok()?;
+        msg.insert("sender".into(), "bound".into());
+        return Some(msg);
+    }
+    if (topic.starts_with("room/") || topic.starts_with("inbox/")) && topic.matches('/').count() != 1 {
+        return None; // neither today's form nor a well-formed sender-bound one
+    }
     if let Some(Value::Object(d)) = parse_json(payload, PAYLOAD_MAX)
         && d.contains_key("from")
     {
-        return message(topic, &d).ok();
+        let mut msg = message(topic, &d).ok()?;
+        msg.insert("sender".into(), "claimed".into());
+        return Some(msg);
     }
     if topic.starts_with("room/") || topic.starts_with("inbox/") || topic == BROADCAST || payload.len() > PAYLOAD_MAX {
         return None;
@@ -143,7 +174,7 @@ mod tests {
         let m = parse_message("room/r", br#"{"from": "a-1", "body": "hi", "ts": 5, "mentions": ["b", "a"]}"#).unwrap();
         assert_eq!(
             dumps_map(&m),
-            r#"{"topic": "room/r", "from": "a-1", "body": "hi", "ts": 5.0, "mentions": ["a", "b"], "id": "0361f55cdae7513a"}"#
+            r#"{"topic": "room/r", "from": "a-1", "body": "hi", "ts": 5.0, "mentions": ["a", "b"], "id": "0361f55cdae7513a", "sender": "claimed"}"#
         );
         let dm = parse_message("inbox/x", br#"{"from": "a-1", "body": "hi", "ts": 1.5, "mentions": 7}"#).unwrap();
         assert!(!dm.contains_key("mentions"), "mentions only count on rooms");
@@ -180,6 +211,35 @@ mod tests {
         assert!(parse_message("ci", &vec![b'x'; 70_000]).is_none());
         assert!(parse_message("ci", &vec![b'['; 100_000]).is_none());
         assert!(parse_message("ci", &vec![b'x'; PAYLOAD_MAX + 1]).is_none());
+    }
+
+    #[test]
+    fn sender_bound_topics() {
+        let p = |topic: &str, payload: &str| parse_message(topic, payload.as_bytes());
+        let base = r#""body": "hi", "ts": 1794518700.0857205"#;
+        let bound = p("inbox/bob-2/al-1", &format!(r#"{{"from": "al-1", {base}}}"#)).expect("a bound DM");
+        let today = p("inbox/bob-2", &format!(r#"{{"from": "al-1", {base}}}"#)).expect("today's form");
+        assert_eq!((bound["topic"].as_str(), bound["sender"].as_str()), (Some("inbox/bob-2"), Some("bound")));
+        assert_eq!(today["sender"], "claimed");
+        assert_eq!(bound["id"], today["id"], "the id is over the normalised topic, so it survives the move");
+        let room = p("room/ops/al-1", &format!(r#"{{"from": "al-1", "mentions": ["bob-2"], {base}}}"#)).unwrap();
+        assert_eq!((room["topic"].as_str(), room["mentions"][0].as_str()), (Some("room/ops"), Some("bob-2")));
+        for (topic, payload) in [
+            ("inbox/bob-2/mallory-3", format!(r#"{{"from": "al-1", {base}}}"#)), // payload disagrees with the topic
+            ("room/ops/al-1", format!(r#"{{{base}}}"#)),                         // no from
+            ("room/ops/al-1", "plain text".to_owned()),
+            ("room/ops/a/b", format!(r#"{{"from": "b", {base}}}"#)), // too deep
+            ("room/ops/bad.name", format!(r#"{{"from": "bad.name", {base}}}"#)),
+            ("inbox/x/", format!(r#"{{"from": "al-1", {base}}}"#)),
+        ] {
+            assert!(p(topic, &payload).is_none(), "{topic} {payload}");
+        }
+        assert_eq!(p("ci/build/x", &format!(r#"{{"from": "al-1", {base}}}"#)).unwrap()["sender"], "claimed");
+        assert!(!p("ci/build", "plain").unwrap().contains_key("sender"), "no sender, nothing claimed");
+        let rec = parse_presence(
+            br#"{"name": "a", "caps": [], "topics": [], "keep": false, "seen": 1, "auth": "credentials"}"#,
+        );
+        assert_eq!(rec.unwrap()["auth"], "credentials");
     }
 
     /// The id is pinned against Python's hashlib.sha256(f"{topic}\n{from}\n{ts!r}"), so any client can compute it.

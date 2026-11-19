@@ -8,6 +8,7 @@ minimal config without packet limits, so oversized requests reach ledgerd. Run a
 process of the stress test.
 """
 
+import hashlib
 import json
 import os
 import random
@@ -1020,6 +1021,141 @@ def test_stress():
     print(
         f"stress ok: {len(writes)} writes, {len(reads)} reads by {len(procs)} processes in {time.monotonic() - t:.1f}s"
     )
+
+
+def wt_id(path):
+    """A worktree's resource: the one definition is ledger::worktree_resource in the core."""
+    return "admin/wt-" + hashlib.sha256(path.encode()).hexdigest()[:16]
+
+
+def test_worktrees():
+    """acquire with a path makes admin/wt-<sha256 of the path> on demand (public, max write) and files the request,
+    so any agent leases a worktree in one call; worktrees lists the live ones for the guard and the console."""
+    a, b = "wt-a1", "wt-b1"
+    for x in (a, b):
+        call("init", x)
+    path, common = "/home/u/proj-wt", "/home/u/proj/.git"
+    wt = wt_id(path)
+    got = call("acquire", a, resource=wt, level="write", ttl=30, path=path, git_common_dir=common)
+    assert got["created"] is True and got["lease"]["holder"] == a, got
+    assert "does not match" in err("acquire", b, resource=wt, level="write", path=path + "/")["error"]
+    busy = err("acquire", b, resource=wt, level="write", path=path)
+    assert busy["error"] == "busy" and busy["holders"][0]["holder"] == a, busy
+    listed = call("worktrees", "anyone-0")["worktrees"]
+    mine = [w for w in listed if w["resource"] == wt]
+    assert mine == [
+        {
+            "resource": wt,
+            "path": path,
+            "git_common_dir": common,
+            "holder": a,
+            "level": "write",
+            "lease_id": got["lease"]["lease_id"],
+            "expires_at": got["lease"]["expires_at"],
+        }
+    ], listed
+    assert call("holders", "anyone-0", resource=wt)["holders"][0]["lease_id"] == got["lease"]["lease_id"]
+    call("release", a, lease_id=got["lease"]["lease_id"])
+    assert all(w["resource"] != wt for w in call("worktrees", "anyone-0")["worktrees"]), "only live leases"
+    unheld = [w for w in call("worktrees", "anyone-0", all=True)["worktrees"] if w["resource"] == wt]
+    assert unheld and unheld[0]["holder"] is None, unheld
+    again = call("acquire", b, resource=wt, level="write", ttl=30, path=path)
+    assert again["created"] is False and again["lease"]["holder"] == b
+    # admin breaks it on the console: the holder is told admin did it
+    inbox = Watch(f"inbox/{b}")
+    call("release", "admin", lease_id=again["lease"]["lease_id"])
+    assert wait_for(lambda: any("admin ended your write lease" in m["body"] for m in inbox.json(f"inbox/{b}")))
+    assert "made by acquire with a path" in err("add", "admin", name="wt-x")["error"]
+    alive()
+
+
+def raw_request(raw, replies, topic, body, reply_topic, corr):
+    props = Properties(PacketTypes.PUBLISH)
+    props.ResponseTopic, props.CorrelationData = reply_topic, corr
+    raw.publish(topic, json.dumps(body), qos=1, properties=props)
+    if not wait_for(lambda: any(c == corr for _, _, c in replies.msgs), 3):
+        return None
+    return next(json.loads(p) for _, p, c in replies.msgs if c == corr)
+
+
+def test_auth_modes(tmp_path, monkeypatch):
+    """Off is 0.3.1's ledgerd. Warn answers as off and logs plain ledger/req and non-admin dumps. Enforce logs in with
+    ledgerd's credentials, refuses plain ledger/req and non-admin dumps, drops one-level reply topics and replies
+    that would land in another agent's space; --health and an agent's own logged-in calls still work there."""
+    global LD
+    LD.terminate()
+    LD.wait()
+    raw = connect()
+    replies = Watch("ledger/resp/#")
+
+    start_ledgerd("warn.db", AGENT_BRIDGE_AUTH="warn")
+    plain = raw_request(raw, replies, "ledger/req", {"op": "ping", "as": "au-1"}, "ledger/resp/au1", b"w1")
+    assert plain["ok"] is True and plain["auth"] == "warn", plain
+    assert call("dump", "au-1")["ok"] is True
+    assert wait_for(lambda: "auth warn: au-1 sent ping on plain ledger/req" in open(LOG).read())
+    assert wait_for(lambda: "auth warn: au-1 read the whole ledger with dump" in open(LOG).read())
+    LD.terminate()
+    LD.wait()
+
+    env = {**os.environ, "LEDGER_DB": str(tmp_path / "enforce.db"), "AGENT_BRIDGE_AUTH": "enforce"}
+    refused = subprocess.run(LEDGERD, env=env, capture_output=True, text=True, timeout=30)
+    assert refused.returncode == 1, refused
+    assert "auth enforce: ledgerd needs its credentials file in AGENT_BRIDGE_CREDENTIALS" in refused.stderr
+    creds = tmp_path / "ledgerd.json"
+    creds.write_text(json.dumps({"username": "ledgerd", "password": "pw", "client_id": "secret-ledgerd-id"}))
+    creds.chmod(0o600)
+    env["AGENT_BRIDGE_CREDENTIALS"] = str(creds)
+    with open(LOG, "a") as log:
+        LD = subprocess.Popen(LEDGERD, stderr=log, env=env)
+    assert wait_for(lambda: "auth enforce: logging in as ledgerd" in open(LOG).read(), 10), open(LOG).read()
+
+    def ask(topic, body, reply_topic, corr):
+        return raw_request(raw, replies, topic, body, reply_topic, corr)
+
+    assert wait_for(lambda: ask("ledger/req/au-1", {"op": "ping"}, "ledger/resp/au-1/c", os.urandom(8)), 10)
+    two = ask("ledger/req/au-1", {"op": "ping"}, "ledger/resp/au-1/c", b"e1")
+    assert two["ok"] is True and two["auth"] == "enforce", two
+    assert ask("ledger/req/au-1", {"op": "ping"}, "ledger/resp/au1", b"e2") is None, "one level is dropped"
+    assert ask("ledger/req/au-1", {"op": "ping"}, "ledger/resp/au-2/c", b"e3") is None, "not into au-2's replies"
+    plain = ask("ledger/req", {"op": "ping", "as": "au-1"}, "ledger/resp/au-1/c", b"e4")
+    assert plain["error"] == "send requests on ledger/req/<your address>", plain
+    dump = ask("ledger/req/au-1", {"op": "dump"}, "ledger/resp/au-1/c", b"e5")
+    assert dump["error"] == "dump: admin only", dump
+    assert ask("ledger/req/admin", {"op": "dump"}, "ledger/resp/admin/c", b"e6")["ok"] is True
+    health = subprocess.run([*LEDGERD, "--health"], env=env, capture_output=True, text=True, timeout=30)
+    assert health.returncode == 0, health
+    # an agent with a credentials file: the ledger client logs in as it and replies come on two levels
+    agents = tmp_path / "config" / "agent-bridge" / "agents"
+    agents.mkdir(parents=True, mode=0o700)
+    (agents / "au-1.json").write_text(json.dumps({"username": "au-1", "password": "pw", "client_id": "secret-au-1"}))
+    (agents / "au-1.json").chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    assert call("worktrees", "au-1", timeout=5)["ok"] is True
+    with pytest.raises(LedgerError, match="no reply from ledgerd"):
+        call("worktrees", "au-2", timeout=2)  # no credentials: anonymous and one level, which enforce drops
+    # admin's credentials only when AGENT_BRIDGE_CREDENTIALS names them, never admin.json found on disk
+    admin = tmp_path / "config" / "agent-bridge" / "admin.json"
+    admin.write_text(json.dumps({"username": "admin", "password": "pw", "client_id": "secret-admin"}))
+    admin.chmod(0o600)
+    monkeypatch.delenv("AGENT_BRIDGE_CREDENTIALS", raising=False)
+    with pytest.raises(LedgerError, match="no reply from ledgerd"):
+        call("worktrees", "admin", timeout=2)
+    monkeypatch.setenv("AGENT_BRIDGE_CREDENTIALS", str(admin))
+    assert call("worktrees", "admin", timeout=5)["ok"] is True
+    monkeypatch.delenv("AGENT_BRIDGE_CREDENTIALS")
+    # inside a session, an agent whose credentials bind it to another session is refused
+    other = agents / "au-3.json"
+    other.write_text(json.dumps({"username": "au-3", "password": "pw", "client_id": "secret-au-3",
+                                 "session": "11111111-1111-4111-8111-111111111111"}))  # fmt: skip
+    other.chmod(0o600)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "22222222-2222-4222-8222-222222222222")
+    with pytest.raises(LedgerError, match="au-3 is not your agent"):
+        call("worktrees", "au-3", timeout=2)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    alive()
+    LD.terminate()
+    LD.wait()
+    start_ledgerd("after-auth.db")
 
 
 def test_stale():

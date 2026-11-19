@@ -27,8 +27,19 @@ pub fn presences(pattern: &str) -> Result<Vec<(String, Map)>> {
 }
 
 pub fn find(addr: &str) -> Result<Option<Map>> {
+    find_with(addr, None)
+}
+
+/// find, read as the agent itself (its own credentials when it has them): for attach and register, never for
+/// looking up someone else, which would read under their identity.
+pub fn find_as(addr: &str) -> Result<Option<Map>> {
+    find_with(addr, Some(addr))
+}
+
+fn find_with(addr: &str, as_: Option<&str>) -> Result<Option<Map>> {
     let addr = check_ident(addr, "address")?;
-    Ok(presences(&format!("agents/{addr}"))?.into_iter().find(|(a, _)| a == addr).map(|(_, rec)| rec))
+    let found = parse_all(&broker::retained_as(&[&format!("agents/{addr}")], as_)?);
+    Ok(found.into_iter().find(|(a, _)| a == addr).map(|(_, rec)| rec))
 }
 
 pub fn need(addr: &str) -> Result<Map> {
@@ -37,8 +48,10 @@ pub fn need(addr: &str) -> Result<Map> {
 
 /// End addr's broker session and clear its presence.
 pub fn wipe(addr: &str) -> Result<()> {
-    // A clean start with expiry 0: the session ends with this connection.
-    let c = broker::one_shot(addr, Arc::new(Ignore))?;
+    // A clean start with expiry 0 under the session's own client id: the secret one from addr's credentials when it has
+    // them (auth warn or enforce), else the address. The session ends with this connection.
+    let id = crate::provision::credentials_for(addr)?.map_or_else(|| addr.to_owned(), |c| c.client_id);
+    let c = broker::one_shot_as(&id, Some(addr), Arc::new(Ignore))?;
     broker::publish(&c, &format!("agents/{addr}"), Bytes::new(), true, None)
 }
 

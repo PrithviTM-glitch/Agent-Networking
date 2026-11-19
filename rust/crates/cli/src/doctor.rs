@@ -20,6 +20,8 @@ const SHOWN: usize = 5;
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
     Ok,
+    /// a fact worth knowing that needs no action
+    Info,
     Warn,
     Fail,
 }
@@ -63,6 +65,10 @@ pub fn run(as_json: bool) -> agent_bridge::Result<()> {
         versions(&services),
         relays(&data.join("relay")),
         hooks(),
+        auth(up),
+        readers(up, &data.join("relay")),
+        groups(),
+        claude_code(),
     ];
     for c in &checks {
         if as_json {
@@ -70,6 +76,7 @@ pub fn run(as_json: bool) -> agent_bridge::Result<()> {
             row.insert("check".into(), c.name.into());
             let status = match c.status {
                 Status::Ok => "ok",
+                Status::Info => "info",
                 Status::Warn => "warn",
                 Status::Fail => "fail",
             };
@@ -80,6 +87,7 @@ pub fn run(as_json: bool) -> agent_bridge::Result<()> {
         } else {
             let status = match c.status {
                 Status::Ok => "OK",
+                Status::Info => "INFO",
                 Status::Warn => "WARN",
                 Status::Fail => "FAIL",
             };
@@ -376,5 +384,201 @@ fn hooks() -> Check {
             check("hooks", Status::Ok, format!("{} agent-bridge hooks, each runs an existing program", commands.len()))
         }
         false => check("hooks", Status::Fail, format!("missing: {}", missing.join(", "))),
+    }
+}
+
+/// (major, minor, patch) of a version like 0.3.2 or 2.1.327, None if it is not one.
+fn semver(v: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = v.trim().split('.').map(|p| p.parse::<u64>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+const AUTH_READERS: (u64, u64, u64) = (0, 3, 2);
+
+/// The full presence records (agents' listing leaves out auth and mcp) of the agents it shows as live.
+fn live_records(up: bool) -> Vec<(String, Map)> {
+    if !up {
+        return Vec::new();
+    }
+    let live: Vec<String> = agent_bridge::presence::agents(None)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|a| a.get("addr").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let mut records = agent_bridge::presence::presences("agents/+").unwrap_or_default();
+    records.retain(|(addr, _)| live.contains(addr));
+    records.sort_by(|a, b| a.0.cmp(&b.0));
+    records
+}
+
+/// The broker's auth mode, its credentials and, under warn, the live agents still connecting anonymously.
+fn auth(up: bool) -> Check {
+    let mode = match config::auth_mode() {
+        Ok(m) => m,
+        Err(e) => return check("auth", Status::Fail, e.0),
+    };
+    let transport = match config::socket() {
+        Some(p) => format!("unix socket {}", p.display()),
+        None => "TCP".into(),
+    };
+    let row = |status, detail: String| check("auth", status, detail).with("mode", mode.as_str().into());
+    if mode == config::Auth::Off {
+        return row(
+            Status::Info,
+            format!("off: an anonymous bus, any local process may claim any address ({transport})"),
+        );
+    }
+    if up && agent_bridge::broker::runs_auth().is_ok_and(|on| !on) {
+        let m = mode.as_str();
+        return row(Status::Warn, format!("auth-mode file says {m} but the broker runs without auth"));
+    }
+    let admin = config::config_dir().join("admin.json");
+    if !admin.exists() {
+        return row(
+            Status::Fail,
+            format!("{}: {} is missing, so nothing can be provisioned", mode.as_str(), admin.display()),
+        );
+    }
+    if mode == config::Auth::Enforce {
+        return row(Status::Ok, format!("enforce: every client logs in ({transport})"));
+    }
+    let anonymous: Vec<String> = live_records(up)
+        .into_iter()
+        .filter(|(_, rec)| rec.get("auth").and_then(Value::as_str) != Some("credentials"))
+        .map(|(addr, _)| addr)
+        .collect();
+    if anonymous.is_empty() {
+        return row(Status::Ok, format!("warn: every live agent logs in, so enforce would refuse none ({transport})"))
+            .with("anonymous", json!([]));
+    }
+    let mut named: Vec<String> = anonymous.iter().take(SHOWN).cloned().collect();
+    if anonymous.len() > SHOWN {
+        named.push(format!("and {} more (doctor --json lists all)", anonymous.len() - SHOWN));
+    }
+    row(
+        Status::Warn,
+        format!(
+            "warn: {} live agents connect anonymously (0.3.1 or older), and enforce would refuse them: {}",
+            anonymous.len(),
+            named.join(", ")
+        ),
+    )
+    .with("anonymous", anonymous.into())
+}
+
+/// Live relays and MCP servers older than 0.3.2 read only today's topic forms, so senders must not switch yet.
+fn readers(up: bool, relays: &Path) -> Check {
+    let old = |v: &str| semver(v).is_none_or(|v| v < AUTH_READERS);
+    let mut found: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(relays).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(session) = name.strip_suffix(".lock").filter(|s| live(s)) else { continue };
+        let version = agent_bridge::relay::version(session).unwrap_or_default();
+        if old(&version) {
+            let shown = if version.is_empty() { "unknown" } else { version.as_str() };
+            found.push(format!("relay {session} ({shown})"));
+        }
+    }
+    for (addr, rec) in live_records(up) {
+        if let Some(v) = rec.get("mcp").and_then(Value::as_str).filter(|v| old(v)) {
+            found.push(format!("MCP server of {addr} ({v})"));
+        }
+    }
+    if found.is_empty() {
+        return check("readers", Status::Ok, "every live relay and MCP server reads the 0.3.2 topic forms")
+            .with("old", json!([]));
+    }
+    let mut named: Vec<String> = found.iter().take(SHOWN).cloned().collect();
+    if found.len() > SHOWN {
+        named.push(format!("and {} more (doctor --json lists all)", found.len() - SHOWN));
+    }
+    check(
+        "readers",
+        Status::Warn,
+        format!(
+            "{} older than 0.3.2, which can't read sender-bound topics yet: {}; restart them (relay restart, /mcp)",
+            found.len(),
+            named.join(", ")
+        ),
+    )
+    .with("old", found.into())
+}
+
+/// Groups that make this user root-equivalent through a local daemon or device, so a same-user agent can get past
+/// any file permission the bridge relies on (AUTH.md section 5).
+const ROOT_GROUPS: [&str; 5] = ["docker", "libvirt", "lxd", "incus", "disk"];
+
+fn groups() -> Check {
+    let names: Vec<String> = nix::unistd::getgroups()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|g| nix::unistd::Group::from_gid(g).ok().flatten().map(|g| g.name))
+        .collect();
+    let has = |g: &str| names.iter().any(|n| n == g);
+    let mut root: Vec<String> = ROOT_GROUPS.iter().filter(|g| has(g)).map(|g| (*g).to_owned()).collect();
+    let admin = ["sudo", "wheel", "admin"].into_iter().find(|g| has(g));
+    // a password-free sudo (NOPASSWD, or credentials still cached) is root on demand
+    let free_sudo = admin.is_some()
+        && std::process::Command::new("sudo")
+            .args(["-n", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+    if let Some(g) = admin.filter(|_| free_sudo) {
+        root.push(format!("{g} (sudo without a password)"));
+    }
+    let mut info: Vec<String> = Vec::new();
+    if let Some(g) = admin.filter(|_| !free_sudo) {
+        info.push(format!("{g} (sudo asks for a password)"));
+    }
+    if has("adm") {
+        info.push("adm (reads system logs)".into());
+    }
+    if !root.is_empty() {
+        return check(
+            "groups",
+            Status::Warn,
+            format!(
+                "root-equivalent: {}; any process of yours, an agent included, can get past file permissions{}",
+                root.join(", "),
+                if info.is_empty() { String::new() } else { format!(" (also {})", info.join(", ")) }
+            ),
+        )
+        .with("root_equivalent", root.into());
+    }
+    if !info.is_empty() {
+        return check("groups", Status::Info, info.join(", ")).with("root_equivalent", json!([]));
+    }
+    check("groups", Status::Ok, "no root-equivalent groups").with("root_equivalent", json!([]))
+}
+
+/// Claude Code's version: from 2.1.295 a hook can fail closed (onFailure: block); before, a guard that crashes or
+/// times out lets the tool call through.
+const FAIL_CLOSED: (u64, u64, u64) = (2, 1, 295);
+
+fn claude_code() -> Check {
+    let out = std::process::Command::new("claude")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let text = out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let Some(version) = text.as_deref().and_then(|t| t.split_whitespace().next()).map(str::to_owned) else {
+        return check("claude", Status::Info, "claude is not on PATH: the guard hooks only matter under Claude Code");
+    };
+    match semver(&version) {
+        Some(v) if v >= FAIL_CLOSED => {
+            check("claude", Status::Ok, format!("Claude Code {version}: hooks can fail closed"))
+                .with("version", version.into())
+        }
+        Some(_) => check(
+            "claude",
+            Status::Warn,
+            format!("Claude Code {version}: before 2.1.295 a guard hook that fails or times out lets the call through"),
+        )
+        .with("version", version.into()),
+        None => check("claude", Status::Info, format!("claude --version said {version:?}")),
     }
 }

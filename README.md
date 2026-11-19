@@ -202,6 +202,9 @@ in the room. `@admin` always reaches the admin console, while `@me` and `@@word`
   by anyone else DMs the holder). A claim lasts until it is released, until its optional ttl (up to 30 days), or until
   its holder leaves. `holders MY_ADDR NAME|OWNER/NAME` shows who holds a resource and who waits for it. Like moderation,
   claims keep cooperating agents from doubling up; they do not stop a process that ignores them.
+- **Lock a worktree.** `worktree acquire MY_ADDR PATH` keeps other agents out of the git worktree PATH is in until the
+  session ends; `worktree release MY_ADDR PATH` gives it back, saving any uncommitted work under a ref, and `worktree
+  status PATH` shows who holds it. It is enforced by hooks you install: see [Worktree locks](#worktree-locks).
 - **Run a command under a lock.** With `--exec`, `acquire` takes the lease, runs the command, renews the lease while
   it runs and releases it when it exits. `--exec` comes last: everything after it is the command.
 
@@ -235,10 +238,11 @@ JSON object instead (`jq -r .addr`). There is no need to unset `CLAUDE_CODE_SESS
 What each release changes, and anything to do when upgrading, is in [CHANGELOG.md](CHANGELOG.md), which is also the
 text of each GitHub release. Upgrade the services first: a new release's services keep answering the previous
 release's commands, but new commands may need new services (0.3.0's `history` and `dms` need historyd 0.3.0, and
-0.3.1's claims and `holders` need ledgerd 0.3.1). From your clone, check out the tag of the release you are installing:
+0.3.1's claims and `holders` need ledgerd 0.3.1, and 0.3.2's worktree locks need ledgerd 0.3.2). From your clone,
+check out the tag of the release you are installing:
 
 ```bash
-git fetch --tags && git checkout v0.3.1 && docker compose up -d --build
+git fetch --tags && git checkout v0.3.2 && docker compose up -d --build
 ```
 
 Then install the release's wheel over the old one, the same way as in the Quick start:
@@ -260,15 +264,22 @@ Running Claude Code sessions keep the old code until each part restarts:
 `agent-bridge doctor` then shows whether the CLI, the services and the installed wheel agree, and lists any relay still
 running a replaced binary.
 
+**0.3.2** changes nothing until you choose to. Authentication ships `off`, `compose.yaml` is unchanged, and the worktree
+guard and ref guard are hooks you install yourself. Each is optional, and each has its own section: [Worktree
+locks](#worktree-locks) (install the guard, protect a repository) and [Authentication](#authentication) (the overlay and
+`warn`). Before switching to `enforce`, let `doctor` show that every relay and MCP server is 0.3.2 and no live agent
+connects anonymously. Received messages now carry `"sender"`.
+
 To roll back, check out the previous release's tag and run `docker compose up -d --build`, then install its wheel the
-same way. Roll back the commands together with the services: 0.3.0's `history`, `dms`, `leases` and `lease-history`, and
-0.3.1's `claim`, `unclaim`, `claims` and `holders`, fail with a one-line error against older services. ledgerd and
+same way. Roll back the commands together with the services: 0.3.0's `history`, `dms`, `leases` and `lease-history`,
+0.3.1's `claim`, `unclaim`, `claims` and `holders`, and 0.3.2's `worktree` commands fail with a one-line error against
+older services. Switch auth back to `off` before rolling back past 0.3.2. ledgerd and
 historyd refuse a database whose schema is newer than they know, so a rollback across a schema change fails at start
 rather than touching the data.
 
 ## MCP server
 
-`agent-bridge-mcp` gives a Claude Code session 46 tools:
+`agent-bridge-mcp` gives a Claude Code session 49 tools:
 - **the bus:** `connect`, `whoami`, `describe`, `agents`, `rooms`, `join`, `part`, `say`, `history`, `dm`, `dms`, `sub`,
   `unsub`, `pub`, `recv`, `keep`, `leave`, `pin`, `unpin`, `wake` (`history` and `dms` entries carry their `id` and
   `seq`, and `before=SEQ` pages back past them; `say` and `dm` take `reply_to`, the id of the message they answer, and
@@ -277,7 +288,8 @@ rather than touching the data.
 - **room moderation:** `room_info` (with the room's pin), `room_set`, `mod`, `mute`, `unmute`, `ban`, `unban`, `kick`;
 - **its ledger:** `add`, `update`, `remove`, `ledger`, `public`, `request` (with `wait`, it blocks for the owner's
   answer), `grant`, `deny`, `grants`, `acquire`, `renew`, `release`, `leases`, `lease_history`, `claim`, `unclaim`,
-  `claims`, `holders`.
+  `claims`, `holders`;
+- **worktree locks:** `worktree_acquire`, `worktree_release`, `worktree_status` (see [Worktree locks](#worktree-locks)).
 
 It posts as the session's own agent, the one the session's relay delivers for (an agent the session registered
 through the CLI), so replies reach it. A session with no agent gets a fixed address derived from its session id and
@@ -336,7 +348,8 @@ shims that run these two subcommands.
   including sessions that are not on the bus, on their next prompt. It asks historyd with a 1 s timeout and shows
   nothing if that fails.
 
-Both hooks, under either name, print nothing on failure and always exit 0, so they cannot block a session. Claude
+Both hooks, under either name, print nothing on failure and always exit 0, so they cannot block a session. The
+worktree guard is a third, optional hook that does fail closed, by design: see [Worktree locks](#worktree-locks). Claude
 Code reads hooks when a session starts, so running sessions pick them up after a restart. To try the broadcast hook
 alone:
 
@@ -344,16 +357,119 @@ alone:
 echo '{"session_id": "00000000-0000-0000-0000-000000000000", "hook_event_name": "UserPromptSubmit"}' | agent-bridge hook broadcast
 ```
 
+## Worktree locks
+
+A worktree lock keeps other agents out of a git worktree while one agent works in it. It is a lease in the ledger, so it
+has a holder, an expiry and a queue, and two local hooks enforce it. **Nothing installs itself**: you run each step
+below, and each one says how to undo it. What a lock can and can't stop is in [docs/ACCESS.md](docs/ACCESS.md) section
+5.6.
+
+```bash
+agent-bridge worktree acquire MY_ADDR ~/Code/project-feature                 # take it; held until the session ends
+agent-bridge worktree status ~/Code/project-feature                          # who holds it
+agent-bridge worktree release MY_ADDR ~/Code/project-feature                 # give it back
+agent-bridge worktree acquire MY_ADDR ~/Code/project-feature --exec make test   # hold it around one command
+```
+
+- **`acquire`** takes the write lease on the worktree the path is in (ledgerd creates its lock resource on demand) and
+  locks it in git with the reason `agent-bridge lease <id> held by <addr>`, which `git worktree remove` respects. Inside
+  a session, the session's relay renews it and releases it when the session ends; without a relay it lapses at `--ttl`
+  (600 s by default). The main worktree can't be git-locked: you get a warning, and the lease and the hooks still hold
+  it.
+
+- **`release`** first saves any uncommitted changes, untracked files included, as a commit under
+  `refs/agent-bridge/released/<lease id>`, without touching your files or index, then unlocks and releases. Get the work
+  back with `git checkout refs/agent-bridge/released/<id> -- .` or `git cherry-pick`.
+
+- **The MCP server** has the same three as `worktree_acquire`, `worktree_release` and `worktree_status`, and the
+  console's Worktrees view shows every lock (see [Admin console](#admin-console)).
+
+**What enforces it.** Each worktree's label has two parts, and the console shows both:
+
+| Part | `hook` when | What it stops | What it doesn't |
+|---|---|---|---|
+| **files** | the guard hook is installed (below) | Another Claude Code session's `Edit`, `Write`, `NotebookEdit`, MCP write tools and shell writes inside the worktree, `git -C` into it, and anything but read-only commands from inside it | Interpreters (`python -c`), scripts run from outside, background jobs, other tools and harnesses |
+| **history** | the repository is protected (below) | Any git command that moves the locked worktree's branch, from any worktree, `--no-verify` included | Direct writes to ref files, which the guard refuses while it's installed |
+
+Without the guard, files are `soft`; without protection, history is `none`; in a per-session sandbox, files are
+`enforced` ([docs/ACCESS.md](docs/ACCESS.md) 5.6). The guard stops agents that forget. It doesn't stop a process that
+sets out to get around it, because every agent runs as your OS user.
+
+**Work elsewhere is never wedged.** The guard only judges a call against worktrees someone else holds. While a lock is
+held in one repository, `rm $X`, `rm *.tmp`, `git -c core.hooksPath=... status` and `cd "$OUT" && make` still run in any
+other repository or directory. In the locked repository, commands whose paths it can't resolve (`$VAR`, `$(...)`) are
+refused, and a write that names the locked worktree, its branch's ref files, or the repository's `hooks/` or `config` is
+refused from anywhere. A refusal says what to run:
+
+```text
+blocked: Write /work/feature/app.py is inside /work/feature, leased by bob-77d0e2 until 14:05:31 (lease
+9f2c4e1ab07d3355). To work there: agent-bridge worktree acquire alice-3f9a1c /work/feature
+```
+
+### Install the guard hook
+
+The guard is a Claude Code `PreToolUse` hook, `agent-bridge hook guard`. A refusal holds in every permission mode,
+`bypassPermissions` included. Unlike the other hooks it fails closed: a crash or bad input refuses the call.
+
+**Recommended: managed settings**, which agents can't edit and a user can't switch off with `disableAllHooks`. As root,
+merge this into `/etc/claude-code/managed-settings.json` (macOS: `/Library/Application
+Support/ClaudeCode/managed-settings.json`), or put it in a file of its own under `managed-settings.d/`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|NotebookEdit|mcp__terminal__run_in_terminal",
+        "hooks": [
+          {"type": "command", "command": "agent-bridge hook guard", "timeout": 10, "onFailure": "block"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+- `onFailure: "block"` makes a guard that times out refuse the call too. It needs Claude Code 2.1.295 or later; older
+  versions ignore it, so a timeout lets the call through. `agent-bridge doctor` checks the version.
+
+- Use the absolute path from `command -v agent-bridge` if the sessions' PATH may not find it.
+
+- Claude Code reloads settings files while it runs; restart a session if the change doesn't show.
+
+- To undo: remove the entry, or the file under `managed-settings.d/`.
+
+**Alternative: user settings**, the same block in `~/.claude/settings.json`. Simpler, but any agent can edit that file,
+so the guard is then a reminder rather than a rule.
+
+### Protect a repository
+
+The ref guard is git's `reference-transaction` hook, `agent-bridge hook ref-guard`, installed per repository. The
+console's **Protect this repo** button installs it into the repository's effective hooks directory (honouring
+`core.hooksPath`), keeps any existing hook and runs it first, and audits the change; **Unprotect** removes only what it
+wrote. By hand, for a repository with no hook of its own:
+
+```bash
+hooks=$(git -C ~/Code/project rev-parse --git-path hooks)
+printf '#!/bin/sh\nexec agent-bridge hook ref-guard "$@"\n' > "$hooks/reference-transaction"
+chmod +x "$hooks/reference-transaction"
+```
+
+To undo, delete that file (and, if the console chained an older hook, rename
+`reference-transaction.agent-bridge-chained` back). If `agent-bridge` is ever missing, every ref update in a protected
+repository fails until you do. Run from your own terminal, outside an agent session, the ref guard allows a move of a
+leased branch with a warning, so you are never locked out.
+
 ## Admin console
 
 ```bash
 agent-bridge-console
 ```
 
-It prints a login URL, `http://127.0.0.1:10000/#token=...`. Open it once: the page keeps the token and removes it
-from the address bar. `MONITOR_PORT` changes the port. The console runs on the host, not in Docker, because it reads
-Claude Code's session registry and transcripts, checks `/proc` and signals processes. `--headless` serves the API and
-`/metrics` without the page.
+It prints a login URL, `http://localhost:10000/#token=...` (`127.0.0.1` is still served). Open it once: the page keeps
+the token and removes it from the address bar. `MONITOR_PORT` changes the port. The console runs on the host, not in
+Docker, because it reads Claude Code's session registry and transcripts, checks `/proc` and signals processes.
+`--headless` serves the API and `/metrics` without the page.
 
 It lists every Claude Code session on the machine, on the bus or not, joined with the bus agents by session id, with a
 friendly name (`branch · task`), liveness and recent activity. It shows rooms, DMs, topics and broadcasts live (a
@@ -408,6 +524,26 @@ crafted word can make matching slow. `!([0-9]+)`, `([A-Z]+-[0-9A-Z]+)` and `(?:S
 host, so a message can never choose where a link goes, and each capture is URL-encoded. A bad file is refused whole,
 with the reason on stderr and in `agent-bridge-admin status`. Git hashes and paths become click-to-copy without any
 configuration.
+
+**Worktrees.** The Worktrees view lists the leased worktrees (path, branch, holder, expiry, lease id) and labels each
+one honestly in two parts, `files: hook|soft · history: hook|none` (see [Worktree locks](#worktree-locks)). It flags
+drift: a lock resource whose id doesn't match its path, a lease with no git lock, a git lock naming someone else, or a
+stale lock with no lease. It shows the live sessions working inside each worktree, and the sidebar marks a session that
+shares its worktree with another live one (⧉N), from where the sessions run, with no lease needed. The view also shows
+whether the guard hook is installed, read from the managed and user settings files, and whether it blocks on failure.
+
+**Protect this repo.** A repository row's button installs the ref guard: it writes a `reference-transaction` hook marked
+`# agent-bridge ref-guard v1` into the repository's effective hooks directory (`git rev-parse --git-path hooks`, so
+`core.hooksPath` is honoured). An existing hook is renamed `reference-transaction.agent-bridge-chained` and runs first,
+with the same arguments and input. Either one refusing aborts the ref update. **Unprotect** removes only a hook carrying
+that marker and puts the chained one back, and refuses a hook that isn't ours. Both are audited. If `agent-bridge` is
+ever missing, every ref update in a protected repository fails: Unprotect, or delete the hook and rename the chained one
+back.
+
+**Auth.** When auth isn't `off`, the header shows the mode and a message whose sender isn't bound to its topic carries a
+"claimed" badge (see [Authentication](#authentication)). The console logs in as admin by setting
+`AGENT_BRIDGE_CREDENTIALS` to `~/.config/agent-bridge/admin.json` for itself, only when that variable is unset and the
+file exists.
 
 **Room kill switch.** A room's "Kill room…" button stops agents in that room, after a preview of each member's
 class and exact action and a typed confirmation of the room name. It sends SIGTERM by default (SIGKILL optional).
@@ -556,6 +692,68 @@ is skipped and flagged as `agent_bridge_scrape_error{source}`. Leftovers (a dock
 A Grafana dashboard with uid `agent-bridge`, built on scrape job `agent-bridge-console`, is what the console's links
 point at; it belongs with your monitoring stack, not this repository.
 
+## Authentication
+
+0.3.2 ships the groundwork for authenticated agents, **off by default**: with nothing changed, the broker and every
+client behave as in 0.3.1. Nothing switches itself on; you choose a mode, and going back is one command. The design, and
+what it does and doesn't protect against, is in [docs/AUTH.md](docs/AUTH.md).
+
+| Mode | The broker | A 0.3.1 client | A 0.3.2 client |
+|---|---|---|---|
+| `off` (default) | Anonymous, as today | Works | Works, anonymously |
+| `warn` | Per-agent credentials and roles; anonymous clients still allowed, with today's rights | Works; `doctor` lists it as anonymous | Logs in with its own credentials |
+| `enforce` | Anonymous clients refused | Refused | Works, within its role |
+
+**Turn it on.** The opt-in overlay `compose.auth.yaml` runs the broker as you, with a unix socket next to TCP 1883;
+`compose.yaml` itself is unchanged. Create its two directories yourself first (a missing one is an error, so Docker
+never creates them as root), then start in `warn`:
+
+```bash
+mkdir -p -m 700 ~/.config/agent-bridge/services ~/.local/state/agent-bridge/broker
+```
+
+```bash
+AGENT_BRIDGE_AUTH=warn docker compose -f compose.yaml -f compose.auth.yaml up -d
+```
+
+- The first start creates the broker's admin, `~/.config/agent-bridge/admin.json`, and ledgerd's and historyd's
+  credentials under `services/`. Every credential file is 0600 in a 0700 directory, and a file others can read is
+  refused.
+
+- From then on each agent gets its own credentials, `~/.config/agent-bridge/agents/<addr>.json`, and a role that may
+  only post as itself: a new one when it registers, and one that already existed the next time it attaches, for example
+  when its session's relay restarts, so running sessions migrate without registering again. What decides is the
+  address's shape: one other than `<name>-<6 or 8 hex>` (for example `register --addr myname`) gets none and stays
+  anonymous. `agent-bridge doctor` lists the live agents still connecting anonymously, which `enforce` would refuse, and
+  the relays and MCP servers older than 0.3.2.
+
+- When `doctor` shows none, switch to `enforce` the same way, with `AGENT_BRIDGE_AUTH=enforce`.
+
+- **To go back**, start the overlay with `AGENT_BRIDGE_AUTH=off`, then plain `docker compose up -d` if you want today's
+  broker. Sessions and queues survive the switch, and the data volume's ownership is handled each way. The credential
+  files can stay: a broker without auth accepts their logins, and the 0.3.2 services answer them.
+
+**The socket** is `~/.local/state/agent-bridge/broker/mqtt.sock`, readable only by you, so other users and host-network
+containers can't use it. Clients use it when it exists and neither `AGENT_BRIDGE_HOST` nor `AGENT_BRIDGE_PORT` is set,
+or when `AGENT_BRIDGE_SOCKET` names it.
+
+**What changes for agents.** A message whose sender is bound to its topic is marked `"sender": "bound"`, any other
+`"claimed"`. In 0.3.2 senders still use today's topics, so everything reads `claimed` until a later release switches
+them, once no reader older than 0.3.2 is left. A post or subscription the role doesn't allow fails with `you may not
+post as <addr> on <topic>` or `you may not read <topic>`. A command for an agent whose credentials belong to another
+session is refused: `agent-bridge: <addr> is not your agent (bound to another session)`. Under `enforce`, a command with
+no credentials to use fails with `this broker requires credentials (auth enforce)`.
+
+**Acting as admin** is always explicit. The console sets `AGENT_BRIDGE_CREDENTIALS` to `admin.json` for itself; nothing
+else uses admin's credentials unless that variable names them, so leaving a session never turns a command into admin's.
+The one exception: `register` uses `admin.json` to create a new agent's own credentials, and can never reset or widen an
+existing one.
+
+**What it doesn't protect against.** Every agent runs as your OS user, so any agent that sets out to can read another's
+credentials, `admin.json` included, and act as it: credentials stop mistakes, other users and other containers, not a
+determined local agent. With the `docker` or `libvirt` group, any agent is effectively root, which `doctor` warns about.
+A bound sender proves who posted, not that a post is safe to follow. The full list is in [docs/AUTH.md](docs/AUTH.md).
+
 ## Security model and limits
 
 This is a single-user, single-machine tool: run it only on a machine where you are the only user. The model is that
@@ -564,10 +762,11 @@ every process that can reach the broker is trusted not to impersonate, and that 
 it runs as. Any of them can read every DM and room and act as any agent. Containers on Docker's default bridge
 network cannot reach it.
 
-- **Loopback only, no authentication yet.** The broker allows anonymous clients, which is only acceptable because
-  Compose binds it to 127.0.0.1 and nobody else uses the machine. Never publish it on another interface: credentials,
-  ACLs and TLS are the planned auth phase in [docs/EXTERNAL.md](docs/EXTERNAL.md), which also says what that phase
-  does not protect against.
+- **Loopback only; authentication off by default.** With auth `off` the broker allows anonymous clients, which is only
+  acceptable because Compose binds it to 127.0.0.1 and nobody else uses the machine. `warn` and `enforce` add per-agent
+  credentials and roles, and the overlay's unix socket keeps other users and host-network containers out (see
+  [Authentication](#authentication)). Never publish the broker on another interface: TLS and remote agents are later
+  phases in [docs/EXTERNAL.md](docs/EXTERNAL.md).
 - **Self-asserted identity.** `"from"` in messages and `as` in requests are whatever the sender says. Any local
   process can read any inbox, post as any agent, fake presence, act on another agent's ledger, or connect as a
   service and take its session over. Requests already travel on per-agent topics (`ledger/req/<addr>`,
@@ -614,6 +813,9 @@ network cannot reach it.
 | `MONITOR_PORT` | `10000` | the admin console |
 | `AGENT_BRIDGE_PROMETHEUS_URL`, `AGENT_BRIDGE_GRAFANA_URL` | unset | the console's Claude usage card and Grafana links |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | where the console finds Claude Code's session registry and transcripts |
+| `AGENT_BRIDGE_AUTH` | `~/.config/agent-bridge/auth-mode` (written by the auth broker), else `off` | the auth mode, `off`, `warn` or `enforce`; the broker overlay, the services and every client |
+| `AGENT_BRIDGE_CREDENTIALS` | unset | a credentials file to log in with: the services' mounted file, and `admin.json` for the console |
+| `AGENT_BRIDGE_SOCKET` | `$XDG_STATE_HOME/agent-bridge/broker/mqtt.sock` when it exists and neither `AGENT_BRIDGE_HOST` nor `AGENT_BRIDGE_PORT` is set | the broker's unix socket, used before TCP |
 
 `XDG_STATE_HOME` defaults to `~/.local/state`. The console's token lives in `$XDG_CONFIG_HOME/agent-bridge`
 (default `~/.config/agent-bridge`).
@@ -671,7 +873,12 @@ scripts/gate.sh
   pid (`agent-bridge-test-<pid>-...`); both are removed when the run exits, including on Ctrl-C, SIGTERM and SIGHUP,
   and what a SIGKILLed run left is removed by the next one.
 - **Never the live state.** The fixtures refuse any ledger or history database, or history log, outside a temp
-  directory.
+  directory. At the start of a run the test process clears the session and auth settings it inherited,
+  `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PROJECT_DIR`, `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`,
+  `AGENT_BRIDGE_STALE_DAYS`, `LEDGER_DB`, `HISTORY_DB`, `AGENT_BRIDGE_AUTH`, `AGENT_BRIDGE_CREDENTIALS` and
+  `AGENT_BRIDGE_SOCKET`, and points `AGENT_BRIDGE_LOG`, `XDG_STATE_HOME` and `XDG_CONFIG_HOME` into its temp directory,
+  with `AGENT_BRIDGE_HOST` 127.0.0.1 and a free `AGENT_BRIDGE_PORT`. Every service, console and command it starts
+  inherits that, so an exported socket can't reach the live broker and a real `admin.json` is never used.
 - **Which commands.** The tests run the commands installed next to the Python that runs them (`.venv/bin` after
   `uv sync`, the gate's virtualenv for the gate). `AGENT_BRIDGE_BIN` points them at another directory of
   `agent-bridge*` commands, and `AGENT_BRIDGE_LEDGERD` and `AGENT_BRIDGE_HISTORYD` at other service command lines.
@@ -688,7 +895,7 @@ scripts/gate.sh
 
 | Module | Covers |
 |---|---|
-| `tests/test_bus.py` | The CLI and the native Bus: delivery, rooms, takeover, stable addresses, a broker restart, the presence cache (read through `cached_agent`, after a marker DM proves the Bus caught up), expiry, hostile payloads and presence, subagents and write-once origin (no process without a session), the admin reservation, broadcasts, the message rules (empty text, DMs to yourself, unresolved @words sent and reported), 3000 retained records arriving before the cache barrier, bad arguments; message ids identical on every path (including a 0.3.0 sender) and replies |
+| `tests/test_bus.py` | The CLI and the native Bus: delivery, rooms, takeover, stable addresses, a broker restart, the presence cache (read through `cached_agent`, after a marker DM proves the Bus caught up), expiry, hostile payloads and presence, subagents and write-once origin (no process without a session), the admin reservation, broadcasts, the message rules (empty text, DMs to yourself, unresolved @words sent and reported), 3000 retained records arriving before the cache barrier, bad arguments; message ids identical on every path (including a 0.3.0 sender) and replies, and messages on the sender-bound topics (`inbox/<to>/<from>`, `room/<room>/<from>`) read, normalised and marked `"sender": "bound"` |
 | `tests/test_rooms.py` | Room moderation: open and announce rooms, mute, kick and ban, non-moderators refused, admin override, spoofed posts dropped, announcements, the CLI and MCP surfaces; pinned messages (who may set them, `room info`, the Observer, the notes) |
 | `tests/test_mentions.py` | @mentions: resolution when sending (case-insensitive; an unresolved @word is sent as text and reported), validation when receiving, `for_me` in `recv`; `@admin` (reaching the console with no membership), `@me`, and agents who are absent from the room |
 | `tests/test_history.py` | historyd end to end: recording and queries (from raw publishes), redelivered messages stored once, drop of one's own inbox only, the one-time import, the CLI and Bus reading through it, restart persistence, health, arguments that start nothing, the reserved level. Pruning, the row and byte caps and the schema refusal are Rust unit tests in `rust/crates/historyd` |
@@ -697,15 +904,16 @@ scripts/gate.sh
 | `tests/test_history_parity.py` | The rollback image's Python historyd (`agent-bridge-historyd:1`, v0.1.0; `AGENT_BRIDGE_ROLLBACK_HISTORYD` names another) and `AGENT_BRIDGE_HISTORYD` taking turns on one database: nothing stored twice, every reply (queries, refusals, truncation, CorrelationData and ResponseTopic handling) byte for byte the same; skipped without the image, so it runs in CI's rollback job |
 | `tests/test_ledger_takeover.py` | A second ledgerd on one broker takes the session over and the first exits instead of taking it back (a module of its own, since every ledgerd shares the client id) |
 | `tests/test_ledger_golden.py` | A fixed script of 115 raw ledger requests (every op, every refusal text, busy and FIFO, fencing, redelivery replay, request topics, hostile input, dump truncation, drop) replayed against `AGENT_BRIDGE_LEDGERD`; the normalised replies (ids as R1/L1, timestamps as `<t>`, tokens from 1) must equal those v0.1.0's Python ledgerd gave, recorded in `tests/golden/ledgerd.jsonl`, apart from the Known differences and the deliberate changes since, which its docstring names; a deliberate change is a reviewed edit of that file |
-| `tests/test_ledger_parity.py` | ledgerd and its rollbacks. With the Python ledgerd in `agent-bridge-ledgerd:2` built from v0.1.0, handing one `ledger.db` back and forth: the state reads the same both ways, a redelivered request is replayed from the other's stored answer, a waiter queued under one is served by the other, fencing tokens keep growing, one schema row; and an interrupted command-line acquire against it, which refuses `cancel` as an unknown op, still ends quietly by its signal. With both that image and `agent-bridge-ledgerd:0.2.3`: a database holding 0.3.0's lease history opens and serves unchanged, the client names the missing `leases` op, and the history is intact afterwards; a claim survives the round trip, and the client names the version it needs. Each case is skipped when its image is not built (CI's rollback job builds both) |
-| `tests/test_ledger.py` | Ledger semantics and their DMs, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, the replay window, quotas including the per-owner pending cap, waiters whose client left (a timeout shorter than the wait, SIGINT and SIGTERM cancelling a queued command-line acquire, a lease granted while the cancel is on its way), busy refusals naming the holders, `leases`, the lease history with every kind of event and its bounds, the expiry DM, `ping`, claims (holder, moderator and admin release, ttl, leaving) and `holders`, a 10-process lock stress test, the admin dump, the stale sweep, the schema guard, the command line and `agent-bridge ledger-raw` |
-| `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice, arguments refused before anything connects; replies by one id across `recv`, `history` and `dms`, absent mentions, pins, claims, `holders` and wake filters |
+| `tests/test_ledger_parity.py` | ledgerd and its rollbacks. With the Python ledgerd in `agent-bridge-ledgerd:2` built from v0.1.0, handing one `ledger.db` back and forth: the state reads the same both ways, a redelivered request is replayed from the other's stored answer, a waiter queued under one is served by the other, fencing tokens keep growing, one schema row; and an interrupted command-line acquire against it, which refuses `cancel` as an unknown op, still ends quietly by its signal. With both that image and `agent-bridge-ledgerd:0.2.3`: a database holding 0.3.0's lease history opens and serves unchanged, the client names the missing `leases` op, and the history is intact afterwards; a claim survives the round trip, and the client names the version it needs. Each case is skipped when its image is not built (CI's rollback job builds both); the lease-history case also hands a worktree and its spec through each rollback (`no worktrees op`, `no worktree locks`, the worktree intact afterwards) |
+| `tests/test_ledger.py` | Ledger semantics and their DMs, a ledgerd kill mid-flight, hostile requests and floods, per-agent request topics and redelivery replay, the replay window, quotas including the per-owner pending cap, waiters whose client left (a timeout shorter than the wait, SIGINT and SIGTERM cancelling a queued command-line acquire, a lease granted while the cancel is on its way), busy refusals naming the holders, `leases`, the lease history with every kind of event and its bounds, the expiry DM, `ping`, claims (holder, moderator and admin release, ttl, leaving) and `holders`, a 10-process lock stress test, the admin dump, the stale sweep, the schema guard, the command line and `agent-bridge ledger-raw`; worktree locks (made on demand, a path mismatch, busy naming the holder, `worktrees` with and without `all`, `holders` lease ids, admin breaking one, `wt-` names refused to `add`); and the auth modes (`warn` logs plain requests and `dump`, `enforce` refuses them and one-level or foreign reply topics, an agent with credentials is answered and one without is not, `--health` passes, ledgerd without its credentials exits) |
+| `tests/test_mcp.py` | The MCP server over stdio: identity, messaging, ledger tools, bad input, presence origin, broadcasts, the channel notice, arguments refused before anything connects; replies by one id across `recv`, `history` and `dms`, absent mentions, pins, claims, `holders` and wake filters; the worktree tools (acquire, status, a second agent refused naming the holder, release and the unlock) |
 | `tests/test_host.py` | The agent-framework adapter: the generic host, Claude Code's session and process detection, the inbox socket, a fake session registry (the `.key` files never opened), transcripts, kind detection, and the native identity calls (project names, session addresses, `/proc` reads) |
 | `tests/test_relay.py` | The relay against a fake inbox socket and a fake `claude` process: coexistence with the MCP server, one channel notice per arrival across the relay taking the session and handing it back, adopting a CLI-registered agent, mentions waking only the mentioned agent |
 | `tests/test_relay_wake.py` | The relay's wake filters through `_native` as the MCP server uses them, with no broker: `RELAY_WAKE_MODES`, setting a room's mode, `all` clearing it, reading them back, refusing an unknown mode, and the session's `.wake` file under the state directory |
-| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho and none of the Python bus, CLI, relay, hooks, ledger or history modules; auto-link rules (one regex subset in Python and the browser's engine, hostile words, refusing any pattern a crafted word could make slow, with a 5 s runaway-only timing backstop in node), the Claims view and admin release without an admin ledger, pins, replies and `@admin` |
+| `tests/test_guard.py` | The worktree guard end to end, through the real CLI on a scratch repo and linked worktree with two sessions: the holder works; another session is refused with the exact text (Edit, git commit, rm, make, a cd plus redirect); reads pass; `core.hooksPath` overrides are refused; with ledgerd unreachable the last-known and git locks are still enforced, with the note; bad input exits 2; with a lock in one repository, work in an unrelated repository or directory (`rm $X`, `rm *.tmp`, a `core.hooksPath` override, `cd "$OUT" && make`) is not refused, while the same commands in the locked repository are, and a glob naming the locked worktree is refused from anywhere |
+| `tests/test_console.py` | The console with a fake HOME: Host, Origin and token checks, messaging, friendly names, death detection, signals, restarts, ledger actions, the room kill switch and targeted stop, room settings, admin mentions, capacity, leftovers, Claude usage, `/metrics`, headless mode and the admin CLI, audit filters, the broadcast hook, and that the console and the MCP server import no paho and none of the Python bus, CLI, relay, hooks, ledger or history modules; auto-link rules (one regex subset in Python and the browser's engine, hostile words, refusing any pattern a crafted word could make slow, with a 5 s runaway-only timing backstop in node), the Claims view and admin release without an admin ledger, pins, replies and `@admin`; the Worktrees view's parts (worktree root and common dir, lock parsing, the resource id, guard detection), Protect and Unprotect with chaining and `core.hooksPath`, and a leased worktree refusing another session's commit through a protected repo's ref guard; the auth mode `off` in state, status and metrics |
 | `tests/test_conformance.py` | The `_native` contract listed above, with the bus behaviours summary |
-| `tests/test_harness.py` | The test harness and release tooling: a killed run's temp directory is swept by the next run, and nothing else is; `scripts/release-notes.sh` gives a tag exactly its CHANGELOG section and refuses a tag without one; `scripts/check-dist.sh` lets only one wheel per architecture and the sdist of the tag's version be published; every command's `--version` and `-V` print `<command> <version>` with an empty environment |
+| `tests/test_harness.py` | The test harness and release tooling: a killed run's temp directory is swept by the next run, and nothing else is; `scripts/release-notes.sh` gives a tag exactly its CHANGELOG section and refuses a tag without one; `scripts/check-dist.sh` lets only one wheel per architecture and the sdist of the tag's version be published; every command's `--version` and `-V` print `<command> <version>` with an empty environment; a user's exported auth setup and real config directory never reach a test |
 
 CI (`.github/workflows/ci.yml`, GitHub Actions) runs ruff; the Rust formatter, clippy and tests, including the ones that
 need Docker; builds manylinux wheels for x86_64 and aarch64, with the native binaries built inside the manylinux
@@ -802,7 +1010,8 @@ would wait 10 s for the kill; docker-init forwards it and they stop at once, whi
 and message is one SQLite transaction, acked to the broker only after it commits.
 
 The Rust tests, then the ones that need Docker (the services' arguments, health and takeover, the CLI replaying its
-golden transcript on a disposable broker, and a relay ending with its `claude` while the broker is down):
+golden transcript on a disposable broker, a relay ending with its `claude` while the broker is down, worktree locks
+from the shell and the relay, and the auth modes on a broker started through the entrypoint):
 
 ```bash
 cargo test --manifest-path rust/Cargo.toml
@@ -833,7 +1042,11 @@ command-line acquire stays queued until its deadline), the waiter cutoff at the 
 cap, the refusal of a lease you already hold, the reply window beyond 300 s, and the reworded refusals and DMs; since
 0.3.0, the `leases`, `lease_history` and `ping` ops (a client is told the ledgerd is older than 0.3.0), the lease
 history and the expiry DM; and since 0.3.1, the `claim`, `unclaim`, `claims` and `holders` ops (claims made before a
-rollback are kept and come back with 0.3.1).
+rollback are kept and come back with 0.3.1); and since 0.3.2, the `worktrees` op and `acquire`'s `path` and
+`git_common_dir` (a client is told the ledgerd is older than 0.3.2 and has no worktrees op, or no worktree locks),
+`on_behalf` and the auth checks. Worktree specs are kept and come back with 0.3.2, but a rollback's stale sweep can drop
+admin's ledger, with its worktrees and any live leases on them, once admin has had no presence for the stale period, so
+keep a rollback short.
 
 ## Roadmap
 

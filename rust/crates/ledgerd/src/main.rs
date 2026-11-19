@@ -14,13 +14,13 @@ use agent_bridge::mqtt::{Ack, Conn, Handler, Message, Options, SESSION_TAKEN_OVE
 use agent_bridge::protocol::NEVER;
 use agent_bridge::service::{Mode, mode, version_line};
 use request::is_addr;
-use rumqttc::v5::mqttbytes::v5::PublishProperties;
+use rumqttc::v5::mqttbytes::v5::{Login, PublishProperties};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use store::{Ledger, Outgoing, log};
+use store::{Auth, Ledger, Outgoing, log};
 
 /// unacked QoS 1 deliveries the broker may push at once, bounds the in-memory queue
 const INFLIGHT: u16 = 32;
@@ -102,6 +102,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+    ledger.auth = cfg.auth;
+    let (client_id, login) = login_or_exit(cfg.auth);
     let (tx, rx) = channel();
     let service = Arc::new(Service {
         tx: Mutex::new(tx),
@@ -110,18 +112,49 @@ fn main() {
         broker: format!("{}:{}", cfg.host, cfg.port),
     });
     let opts = Options {
-        client_id: "ledgerd".into(),
+        client_id,
         clean_start: false,
         expiry: NEVER,
         receive_max: Some(INFLIGHT),
         manual_ack: true,
         reconnect: Some(RECONNECT_MAX),
     };
-    let conn = Conn::start(&cfg.host, cfg.port, opts, service.clone()).unwrap_or_else(|e| {
+    let conn = Conn::start_as(&cfg.host, cfg.port, opts, login, service.clone()).unwrap_or_else(|e| {
         eprintln!("cannot start the MQTT client: {e}");
         std::process::exit(1);
     });
     serve(&mut ledger, &conn, &service, &rx);
+}
+
+/// The client id and login ledgerd connects with: "ledgerd" and none when auth is off; under warn or enforce, the
+/// secret client id and login of its credentials (AGENT_BRIDGE_CREDENTIALS, username ledgerd). Two ledgerds with the
+/// same credentials still share an id, so the newer one takes over and the older steps aside.
+fn login_or_exit(auth: Auth) -> (String, Option<Login>) {
+    if auth == Auth::Off {
+        return ("ledgerd".into(), None);
+    }
+    match config::credentials("ledgerd") {
+        Ok(Some(c)) => {
+            log(&format!(
+                "auth {}: logging in as {}; identity from ledger/req/<addr>, rate limit on",
+                auth.as_str(),
+                c.username
+            ));
+            (c.client_id, Some(Login::new(c.username, c.password)))
+        }
+        Ok(None) if auth == Auth::Warn => {
+            log("auth warn: no credentials for ledgerd (AGENT_BRIDGE_CREDENTIALS), connecting anonymously");
+            ("ledgerd".into(), None)
+        }
+        Ok(None) => {
+            eprintln!("auth enforce: ledgerd needs its credentials file in AGENT_BRIDGE_CREDENTIALS");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// The settings, read once: a bad one ends ledgerd with its one-line message.

@@ -58,6 +58,7 @@ impl Handler for Watcher {
         let topics = vec![
             filter(&format!("rooms/{}", self.room), false, false),
             filter(&format!("room/{}", self.room), true, false),
+            filter(&format!("room/{}/+", self.room), true, false),
         ];
         let _ = conn.subscribe(topics);
     }

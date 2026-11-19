@@ -107,6 +107,35 @@ def _one_run_at_a_time(config):
     config.agent_bridge_lock = lock
 
 
+# what a user's own shell may carry that must never reach a test: the session, the services' databases, and the
+# auth setup (the mode, a credentials file, and above all a socket path, which would point clients at the live broker)
+UNSET = (
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_PROJECT_DIR",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "AGENT_BRIDGE_STALE_DAYS",
+    "LEDGER_DB",
+    "HISTORY_DB",
+    "AGENT_BRIDGE_AUTH",
+    "AGENT_BRIDGE_CREDENTIALS",
+    "AGENT_BRIDGE_SOCKET",
+)
+
+
+def _isolate(env, tmp):
+    """env made safe for tests under tmp: UNSET removed, and the history log, the state dir and the config dir moved
+    there. Never the real ~/.config/agent-bridge, whose auth-mode, admin.json and agents/ would put the test broker's
+    clients and services under the user's auth and provision against a broker without the plugin."""
+    for name in UNSET:
+        env.pop(name, None)
+    env.update(
+        AGENT_BRIDGE_LOG=os.path.join(tmp, "history.jsonl"),
+        XDG_STATE_HOME=os.path.join(tmp, "state"),
+        XDG_CONFIG_HOME=os.path.join(tmp, "config"),
+    )
+
+
 def _interrupted(signum, _frame):
     raise KeyboardInterrupt(f"signal {signum}")
 
@@ -123,22 +152,8 @@ def pytest_configure(config):
     # agent_bridge reads its settings at import, so they are fixed here, before any test module imports it.
     tmp = tempfile.mkdtemp(prefix=f"{TMP_PREFIX}{os.getpid()}-")
     atexit.register(shutil.rmtree, tmp, ignore_errors=True)
-    for name in (
-        "CLAUDE_CODE_SESSION_ID",
-        "CLAUDE_PROJECT_DIR",
-        "CLAUDE_CODE_MESSAGING_SOCKET",
-        "CLAUDE_CODE_MESSAGING_TOKEN",
-        "AGENT_BRIDGE_STALE_DAYS",
-        "LEDGER_DB",
-        "HISTORY_DB",
-    ):
-        os.environ.pop(name, None)
-    os.environ.update(
-        AGENT_BRIDGE_HOST="127.0.0.1",
-        AGENT_BRIDGE_PORT=str(free_port()),
-        AGENT_BRIDGE_LOG=os.path.join(tmp, "history.jsonl"),
-        XDG_STATE_HOME=os.path.join(tmp, "state"),
-    )
+    _isolate(os.environ, tmp)
+    os.environ.update(AGENT_BRIDGE_HOST="127.0.0.1", AGENT_BRIDGE_PORT=str(free_port()))
 
 
 # bridge-core's checklist of bus behaviours, by name, and the tests that pin each; the summary reports them, so the

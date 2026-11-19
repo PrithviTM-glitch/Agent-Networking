@@ -93,10 +93,29 @@ pub fn call(op: &str, as_: Option<&str>, fields: Map, timeout: f64) -> Result<Ma
 }
 
 /// call with op and as_ as the caller gave them; historyd refuses what is wrong with them.
+///
+/// When `as_` may use its credentials (provision::credentials_for: admin only when AGENT_BRIDGE_CREDENTIALS names it,
+/// an agent only from its own session), it logs in as that identity and takes its reply on
+/// `history/resp/<as_>/<random>`, the two-level form historyd 0.3.2 accepts when it names the requester; otherwise it
+/// connects anonymously with a one-level reply topic, as before.
 pub fn call_value(op: Value, as_: Option<Value>, fields: Map, timeout: f64) -> Result<Map, HistoryError> {
     let own = Arc::new(Own(Replies::default()));
-    let c = broker::one_shot("", own.clone()).map_err(|e| HistoryError::new(e.0))?;
-    call_over(&c, &own.0, &request::reply_topic("history", ""), op, as_, fields, timeout)
+    let who = as_.as_ref().and_then(Value::as_str).map(str::to_owned);
+    let creds = match &who {
+        Some(a) => crate::provision::credentials_for(a).map_err(|e| HistoryError::new(e.0))?,
+        None => None,
+    };
+    let (c, reply) = match (&who, &creds) {
+        (Some(a), Some(cr)) => (
+            broker::one_shot_with("", Some(cr), own.clone()).map_err(|e| HistoryError::new(e.0))?,
+            format!("history/resp/{a}/{}", crate::ledger::random_hex(16)),
+        ),
+        _ => (
+            broker::one_shot("", own.clone()).map_err(|e| HistoryError::new(e.0))?,
+            request::reply_topic("history", ""),
+        ),
+    };
+    call_over(&c, &own.0, &reply, op, as_, fields, timeout)
 }
 
 /// The reply's entries, each with its message id added (as recv computes it), when it has a sender and a ts.
@@ -111,12 +130,16 @@ fn messages(reply: Map) -> Vec<Map> {
     out
 }
 
-/// Add "id" (protocol::message_id) to a history entry that has a topic, a sender and a ts; others stay as they are.
+/// Add "id" (protocol::message_id) to a history entry that has a topic, a sender and a ts, and "sender": "claimed" when
+/// historyd didn't mark it "bound" (historyd stores the bound fact only, so its replies stay byte-compatible).
 pub fn with_id(m: &mut Map) {
     let field = |k: &str| m.get(k).and_then(Value::as_str);
     if let (Some(topic), Some(from), Some(ts)) = (field("topic"), field("from"), m.get("ts").and_then(Value::as_f64)) {
         let id = crate::protocol::message_id(topic, from, ts);
         m.insert("id".into(), id.into());
+        if !m.contains_key("sender") {
+            m.insert("sender".into(), "claimed".into());
+        }
     }
 }
 

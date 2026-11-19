@@ -6,22 +6,36 @@ mod commands;
 mod doctor;
 mod hooks;
 mod ledger_raw;
+mod ref_guard;
 mod relay;
 
 use clap::Parser;
 use clap::error::ErrorKind;
 
 fn main() {
-    // A hook must never block or break a session: whatever happens, it exits 0 and says nothing.
+    // A session hook must never block or break a session: whatever happens, it exits 0 and says nothing. The guards
+    // are the opposite: one that fails refuses (guard 2, ref-guard 1), never lets a write through.
     if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
-        std::panic::set_hook(Box::new(|_| std::process::exit(0)));
+        let refuse = match std::env::args_os().nth(2) {
+            Some(w) if w == "guard" => 2,
+            Some(w) if w == "ref-guard" => 1,
+            _ => 0,
+        };
+        if refuse == 0 {
+            std::panic::set_hook(Box::new(|_| std::process::exit(0)));
+        } else {
+            std::panic::set_hook(Box::new(move |_| {
+                eprintln!("blocked: the agent-bridge guard failed (internal error)");
+                std::process::exit(refuse)
+            }));
+        }
         match args::Cli::try_parse() {
             Ok(cli) => {
                 let _ = commands::run(cli.cmd);
             }
             // asked for by a person, not by Claude Code: the help prints as anywhere else
             Err(e) if e.kind() == ErrorKind::DisplayHelp => e.exit(),
-            Err(_) => {}
+            Err(_) => std::process::exit(refuse),
         }
         return;
     }

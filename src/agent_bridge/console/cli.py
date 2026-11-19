@@ -153,6 +153,7 @@ def status(_a):
             "jobs_running": sum(j["state"] == "running" for j in st["jobs"]),
             "dropped": st.get("broker", {}).get("dropped"),
             "version": st.get("version", {}).get("package"),
+            "auth": st.get("auth"),
             "links": links.get("error") or len(links.get("rules", [])),  # rules loaded, or why the file was refused
         }
     )

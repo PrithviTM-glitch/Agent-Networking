@@ -64,6 +64,10 @@ pub enum Hook {
     Broadcast,
     /// SessionStart: start this session's relay in the background
     RelayStart,
+    /// PreToolUse: refuse a write inside a worktree another agent leases (exit 2, the reason on stderr)
+    Guard,
+    /// git reference-transaction: refuse a ref update that moves a worktree another agent leases (exit 1)
+    RefGuard,
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -319,14 +323,17 @@ pub enum Cmd {
         #[arg(long)]
         about: Option<String>,
     },
-    /// check this machine's bridge: broker, services, directories, versions, relays and hooks
+    /// check this machine's bridge: broker, services, directories, versions, relays, hooks, auth and groups
     ///
-    /// One line per check, OK, WARN or FAIL, with what to do; exit 1 if any check fails. It only reads: it never
-    /// creates the state directory, starts or stops a relay, or edits settings. Checks: broker (reachable), ledgerd
-    /// and historyd (answer, and their versions), state_dir and config_dir (exist, yours, modes), cli_lock
+    /// One line per check, OK, INFO, WARN or FAIL, with what to do; exit 1 if any check fails. It only reads: it
+    /// never creates the state directory, starts or stops a relay, or edits settings. Checks: broker (reachable),
+    /// ledgerd and historyd (answer, and their versions), state_dir and config_dir (exist, yours, modes), cli_lock
     /// (writable), versions (this CLI, the services and the installed wheel agree), relays (a live relay on a
-    /// replaced or different binary, or whose session ended) and hooks (each agent-bridge hook in
-    /// ~/.claude/settings.json runs an existing program).
+    /// replaced or different binary, or whose session ended), hooks (each agent-bridge hook in
+    /// ~/.claude/settings.json runs an existing program), auth (the mode, admin.json, and under warn the live agents
+    /// still connecting anonymously), readers (live relays and MCP servers older than 0.3.2), groups
+    /// (root-equivalent groups: docker, libvirt, lxd, incus, disk, sudo without a password) and claude (Claude Code
+    /// 2.1.295 or later, so a guard hook can fail closed).
     Doctor {
         /// one JSON object per check: {"check", "status": "ok"|"warn"|"fail", "detail", ...}
         #[arg(long)]
@@ -357,8 +364,16 @@ pub enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
-    /// a Claude Code hook: broadcast or relay-start. It prints nothing on failure and always exits 0
-    Hook { which: Hook },
+    /// a hook. Claude Code's broadcast and relay-start print nothing on failure and always exit 0. guard (PreToolUse)
+    /// reads the tool call on stdin, exits 0 to allow (a warning as {"systemMessage": ...} on stdout) or 2 to refuse
+    /// with the reason on stderr. ref-guard STATE is git's reference-transaction hook: in "prepared" it exits 1 to
+    /// refuse an update of a ref that moves a worktree another agent leases; outside an agent session it allows with
+    /// a warning, and it refuses when it cannot decide
+    Hook {
+        which: Hook,
+        #[arg(hide = true, num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// one raw ledgerd request: OP [--as ADDR] [--timeout S] [--FIELD VALUE ...], the reply as JSON (what
     /// agent-bridge-ledger runs)
     #[command(name = "ledger-raw", disable_help_flag = true)]
@@ -523,6 +538,48 @@ pub enum Cmd {
         /// a resource, by NAME (yours) or OWNER/NAME
         resource: String,
     },
+    /// worktree locks: acquire MY_ADDR PATH, release MY_ADDR PATH, status PATH
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorktreeCmd {
+    /// take the write lease on the git worktree PATH is in (made on demand) and lock it in git with the reason
+    /// "agent-bridge lease <id> held by <addr>". The main worktree can't be git-locked: the lease and the hooks still
+    /// hold it. With this session's relay running, the relay renews the lease every ttl/3 and releases it when the
+    /// session ends; without one it lapses at the ttl unless renewed. Prints the lease, "resource", "lease_id",
+    /// "path", "git_lock" (true when git-locked), "lock" (the reason), "renewed_by" (relay or none) and any
+    /// "warnings". With --exec, holds the lease and the git lock while CMD runs,
+    /// renewing it every ttl/3, then releases it as release does; the exit status is acquire --exec's.
+    Acquire {
+        #[arg(value_name = "MY_ADDR")]
+        addr: String,
+        path: String,
+        /// lease seconds, default 600
+        #[arg(long, allow_negative_numbers = true)]
+        ttl: Option<f64>,
+        /// seconds to queue if busy, default 0
+        #[arg(long, allow_negative_numbers = true)]
+        wait: Option<f64>,
+        /// run CMD [ARGS...] while holding the lease
+        #[arg(long, value_name = "CMD", num_args = 1.., allow_hyphen_values = true)]
+        exec: Option<Vec<String>>,
+    },
+    /// give the worktree back: uncommitted changes (untracked files included) are saved as a commit under
+    /// refs/agent-bridge/released/<lease id> without touching the files or the index, then the git lock is removed
+    /// and the lease released. Prints "released", "path", "snapshot" (the ref, or null) and "unlocked"
+    Release {
+        #[arg(value_name = "MY_ADDR")]
+        addr: String,
+        path: String,
+    },
+    /// who holds the worktree PATH is in: "holder", "lease_id" and "expires_at" from ledgerd while leased, "lock"
+    /// (the git lock reason, or null), "stale" (a git lock no live lease is behind), "main", or "ledger_error" when
+    /// ledgerd can't say
+    Status { path: String },
 }
 
 #[derive(clap::Args)]

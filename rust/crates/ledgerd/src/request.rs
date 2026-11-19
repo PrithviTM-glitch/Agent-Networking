@@ -26,6 +26,8 @@ enum Check {
     Visibility,
     Level,
     Number(f64, f64),
+    Path,
+    Bool,
 }
 
 #[derive(Clone, Copy)]
@@ -38,7 +40,7 @@ enum Fallback {
 
 type Field = (&'static str, Check, Fallback);
 
-pub const OPS: [&str; 23] = [
+pub const OPS: [&str; 24] = [
     "init",
     "add",
     "update",
@@ -62,6 +64,7 @@ pub const OPS: [&str; 23] = [
     "drop",
     "dump",
     "ping",
+    "worktrees",
 ];
 /// the longest claim, in seconds
 pub const MAX_CLAIM_TTL: f64 = 30.0 * 86400.0;
@@ -82,18 +85,21 @@ fn fields(op: &str) -> &'static [Field] {
             ("visibility", C::Visibility, D::Null),
             ("max_level", C::Level, D::Null),
         ],
-        "remove" => &[("name", C::Name, D::Required)],
+        "remove" => &[("name", C::Name, D::Required), ("on_behalf", C::Addr, D::Null)],
         "ledger" => &[("owner", C::Addr, D::Null)],
         "request" => &[("resource", C::Resource, D::Required), ("level", C::Level, D::Required)],
-        "grant" | "deny" => &[("request_id", C::RowId, D::Required)],
+        "grant" => &[("request_id", C::RowId, D::Required)],
+        "deny" => &[("request_id", C::RowId, D::Required), ("on_behalf", C::Addr, D::Null)],
         "acquire" => &[
             ("resource", C::Resource, D::Required),
             ("level", C::Level, D::Required),
             ("ttl", C::Number(1.0, MAX_TTL), D::Number(60.0)),
             ("wait", C::Number(0.0, MAX_WAIT), D::Number(0.0)),
+            ("path", C::Path, D::Null),
+            ("git_common_dir", C::Path, D::Null),
         ],
         "renew" => &[("lease_id", C::RowId, D::Required), ("ttl", C::Number(1.0, MAX_TTL), D::Number(60.0))],
-        "release" => &[("lease_id", C::RowId, D::Required)],
+        "release" => &[("lease_id", C::RowId, D::Required), ("on_behalf", C::Addr, D::Null)],
         "cancel" => &[("correlation", C::Hex, D::Required)],
         "claim" => &[
             ("room", C::Room, D::Required),
@@ -104,6 +110,7 @@ fn fields(op: &str) -> &'static [Field] {
         "unclaim" => &[("room", C::Room, D::Required), ("key", C::Name, D::Required)],
         "claims" => &[("room", C::Room, D::Null)],
         "holders" => &[("resource", C::Resource, D::Required)],
+        "worktrees" => &[("all", C::Bool, D::Null)],
         "lease_history" => &[("resource", C::Resource, D::Required), ("last", C::Number(1.0, 500.0), D::Number(50.0))],
         _ => &[],
     }
@@ -167,6 +174,16 @@ fn check(key: &str, v: &Value, c: Check) -> Result<Value, Bad> {
         Check::Number(lo, hi) => match v.as_f64() {
             Some(n) if (lo..=hi).contains(&n) => Ok(float(n)),
             _ => Err(Bad(format!("{key}: number between {lo} and {hi}"))),
+        },
+        Check::Path => match v.as_str() {
+            Some(s) if s.starts_with('/') && s.chars().count() <= 1024 && !s.chars().any(char::is_control) => {
+                Ok(v.clone())
+            }
+            _ => Err(Bad(format!("{key}: an absolute path of up to 1024 chars, no control characters"))),
+        },
+        Check::Bool => match v {
+            Value::Bool(_) => Ok(v.clone()),
+            _ => Err(Bad(format!("{key}: true or false"))),
         },
     }
 }
@@ -272,6 +289,15 @@ mod tests {
             err(json!({"op": "grant", "as": "a", "request_id": "ABCDEF0123456789"}), None),
             "request_id: must match [0-9a-f]{16}"
         );
+        assert_eq!(
+            err(json!({"op": "acquire", "as": "a", "resource": "admin/wt-0", "level": "write", "path": "rel/x"}), None),
+            "path: an absolute path of up to 1024 chars, no control characters"
+        );
+        assert_eq!(err(json!({"op": "worktrees", "as": "a", "all": 1}), None), "all: true or false");
+        assert_eq!(
+            err(json!({"op": "grant", "as": "admin", "request_id": "0123456789abcdef", "on_behalf": "o"}), None),
+            "unknown fields for grant: on_behalf"
+        );
         let (op, me, args) =
             parse(&json!({"op": "acquire", "resource": "a/x", "level": "write", "wait": null}), Some("b"))
                 .ok()
@@ -279,7 +305,7 @@ mod tests {
         assert_eq!((op, me.as_str()), ("acquire", "b"));
         assert_eq!(
             agent_bridge::json::dumps_map(&args),
-            r#"{"resource": "a/x", "level": "write", "ttl": 60.0, "wait": 0.0}"#
+            r#"{"resource": "a/x", "level": "write", "ttl": 60.0, "wait": 0.0, "path": null, "git_common_dir": null}"#
         );
     }
 }

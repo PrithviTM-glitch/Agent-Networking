@@ -1,0 +1,58 @@
+# Authentication and the local unix socket (docs/AUTH.md), on top of compose.yaml:
+#   mkdir -p -m 700 ~/.config/agent-bridge/services ~/.local/state/agent-bridge/broker
+#   AGENT_BRIDGE_AUTH=warn docker compose -f compose.yaml -f compose.auth.yaml up -d
+# AGENT_BRIDGE_AUTH is off (the default: today's broker, plus the socket), warn (credentials checked, anonymous 0.3.1
+# clients still allowed) or enforce (anonymous clients refused). Changing it recreates the broker; persistent sessions
+# survive. The broker runs as the owner of the mounted directories, so the socket is yours; the directories must exist
+# first (they are never created here, as Docker would create them as root).
+services:
+  mosquitto:
+    entrypoint: ["/bin/sh", "/agent-bridge/entrypoint.sh"]
+    environment:
+      AGENT_BRIDGE_AUTH: ${AGENT_BRIDGE_AUTH:-off}
+    volumes:
+      - ./config/broker-entrypoint.sh:/agent-bridge/entrypoint.sh:ro
+      - type: bind
+        source: ${XDG_CONFIG_HOME:-${HOME}/.config}/agent-bridge
+        target: /agent-bridge-config
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${XDG_STATE_HOME:-${HOME}/.local/state}/agent-bridge/broker
+        target: /run/agent-bridge
+        bind:
+          create_host_path: false
+    healthcheck:
+      # ready once the config is rendered and, under warn or enforce, the service credentials are written
+      test: ["CMD", "test", "-f", "/tmp/agent-bridge-ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  ledgerd:
+    environment:
+      AGENT_BRIDGE_AUTH: ${AGENT_BRIDGE_AUTH:-off}
+      AGENT_BRIDGE_CREDENTIALS: /run/secrets/agent-bridge/ledgerd.json
+    volumes:
+      - type: bind
+        source: ${XDG_CONFIG_HOME:-${HOME}/.config}/agent-bridge/services
+        target: /run/secrets/agent-bridge
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+  historyd:
+    environment:
+      AGENT_BRIDGE_AUTH: ${AGENT_BRIDGE_AUTH:-off}
+      AGENT_BRIDGE_CREDENTIALS: /run/secrets/agent-bridge/historyd.json
+    volumes:
+      - type: bind
+        source: ${XDG_CONFIG_HOME:-${HOME}/.config}/agent-bridge/services
+        target: /run/secrets/agent-bridge
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      mosquitto:
+        condition: service_healthy

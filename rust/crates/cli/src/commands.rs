@@ -1,11 +1,11 @@
 //! Each command, on the core library.
 
-use crate::args::{Cmd, Details, Hook, Moderation, OnOff, RoomCmd};
+use crate::args::{Cmd, Details, Hook, Moderation, OnOff, RoomCmd, WorktreeCmd};
 use crate::relay;
 use agent_bridge::bus::Bus;
 use agent_bridge::json::{Map, dumps_readable, float};
 use agent_bridge::validation::{check_ident, check_wait, not_admin, os_error};
-use agent_bridge::{Error, Result, claude, config, history, ledger, presence, rooms};
+use agent_bridge::{Error, Result, claude, config, history, ledger, presence, rooms, worktree};
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -97,8 +97,14 @@ fn turn(addr: &str) -> Result<File> {
     Ok(f)
 }
 
-fn attached<T>(addr: &str, take_turn: bool, f: impl FnOnce(&Bus) -> Result<T>) -> Result<T> {
+/// MY_ADDR is one this command may act as: not admin, and not an agent bound to another session.
+fn mine(addr: &str) -> Result<()> {
     not_admin(Some(addr), "address")?;
+    agent_bridge::provision::check_own(addr)
+}
+
+fn attached<T>(addr: &str, take_turn: bool, f: impl FnOnce(&Bus) -> Result<T>) -> Result<T> {
+    mine(addr)?;
     let _turn = if take_turn { Some(turn(addr)?) } else { None };
     f(&Bus::attach(addr)?)
 }
@@ -108,7 +114,7 @@ fn attached<T>(addr: &str, take_turn: bool, f: impl FnOnce(&Bus) -> Result<T>) -
 fn posted<T>(addr: &str, f: impl FnOnce(&Bus) -> Result<T>) -> Result<T> {
     let session = std::env::var(claude::SESSION_ENV).unwrap_or_default();
     if agent_bridge::relay::held(&session).is_some_and(|held| held == addr) {
-        not_admin(Some(addr), "address")?;
+        mine(addr)?;
         return f(&Bus::attach_as(addr, false)?);
     }
     attached(addr, true, f)
@@ -136,7 +142,7 @@ fn register(name: &str, caps: &str, keep: bool, addr: Option<&str>, subagent: bo
 }
 
 fn leave(addr: &str) -> Result<()> {
-    not_admin(Some(addr), "address")?;
+    mine(addr)?;
     let _turn = turn(addr)?;
     if let Some(warning) = Bus::attach(addr)?.leave()? {
         eprintln!("warning: {warning}");
@@ -168,7 +174,7 @@ fn plain(e: ledger::LedgerError) -> Error {
 /// An op that needs no ledger of MY_ADDR's own (claims, holders, unclaim): sent as MY_ADDR without init, so it never
 /// creates one.
 fn ledger_bare(addr: &str, op: &str, fields: &[(&str, Option<Value>)]) -> Result<()> {
-    not_admin(Some(addr), "address")?;
+    mine(addr)?;
     let args: Map = fields.iter().filter_map(|(k, v)| Some(((*k).to_owned(), v.clone()?))).collect();
     let mut reply = ledger::call(op, addr, args, None).map_err(plain)?;
     reply.shift_remove("ok");
@@ -178,7 +184,7 @@ fn ledger_bare(addr: &str, op: &str, fields: &[(&str, Option<Value>)]) -> Result
 
 /// A ledger command: init MY_ADDR's ledger, send op with the given fields, print the reply without "ok".
 fn ledger_op(addr: &str, op: &str, fields: &[(&str, Option<Value>)]) -> Result<()> {
-    not_admin(Some(addr), "address")?;
+    mine(addr)?;
     presence::need(addr)?;
     let args: Map = fields.iter().filter_map(|(k, v)| Some(((*k).to_owned(), v.clone()?))).collect();
     ledger::call("init", addr, Map::new(), None).map_err(plain)?;
@@ -276,11 +282,21 @@ pub fn run(cmd: Cmd) -> Result<()> {
         }
         Cmd::Relay { action, run, session } => relay::command(action, &run, session),
         Cmd::Doctor { json } => crate::doctor::run(json),
-        Cmd::Hook { which: Hook::Broadcast } => {
+        Cmd::Hook { which: Hook::Guard, .. } => {
+            let mut input = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+            let out = agent_bridge::guard::run(&input);
+            print!("{}", out.stdout);
+            eprint!("{}", out.stderr);
+            let _ = std::io::stdout().flush();
+            std::process::exit(out.code)
+        }
+        Cmd::Hook { which: Hook::RefGuard, args } => std::process::exit(crate::ref_guard::run(&args)),
+        Cmd::Hook { which: Hook::Broadcast, .. } => {
             crate::hooks::broadcast();
             Ok(())
         }
-        Cmd::Hook { which: Hook::RelayStart } => {
+        Cmd::Hook { which: Hook::RelayStart, .. } => {
             crate::hooks::relay_start();
             Ok(())
         }
@@ -298,7 +314,7 @@ pub fn run(cmd: Cmd) -> Result<()> {
             ledger_op(&addr, "request", &[("resource", Some(resource.into())), ("level", Some(level.name().into()))])
         }
         Cmd::Request { addr, resource, level, wait: Some(wait) } => {
-            not_admin(Some(&addr), "address")?;
+            mine(&addr)?;
             presence::need(&addr)?;
             let reply = ledger::request_wait(&addr, &resource, &level.name(), wait).map_err(plain)?;
             show_all(&[reply]);
@@ -309,7 +325,7 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::Grants { addr } => ledger_op(&addr, "grants", &[]),
         Cmd::Acquire { addr, resource, level, ttl, wait, exec: Some(cmd) } => {
             // CMD never ran, so the status says "retry" (75), not a status CMD itself could have
-            if let Err(e) = not_admin(Some(&addr), "address").and_then(|_| presence::need(&addr).map(drop)) {
+            if let Err(e) = mine(&addr).and_then(|_| presence::need(&addr).map(drop)) {
                 eprintln!("{e}");
                 std::process::exit(ledger::EXEC_NO_LEASE);
             }
@@ -348,7 +364,47 @@ pub fn run(cmd: Cmd) -> Result<()> {
             let resource = if resource.contains('/') { resource } else { format!("{addr}/{resource}") };
             ledger_op(&addr, "lease_history", &[("resource", Some(resource.into())), ("last", last.map(Value::from))])
         }
+        Cmd::Worktree { action } => worktree_cmd(action),
     }
+}
+
+fn worktree_cmd(action: WorktreeCmd) -> Result<()> {
+    let reply = match action {
+        WorktreeCmd::Acquire { addr, path, ttl, wait, exec: Some(cmd) } => {
+            // CMD never ran, so the status says "retry" (75), not a status CMD itself could have
+            let fail = |e: Error| -> ! {
+                eprintln!("{e}");
+                std::process::exit(ledger::EXEC_NO_LEASE)
+            };
+            if let Err(e) = mine(&addr).and_then(|_| presence::need(&addr).map(drop)) {
+                fail(e)
+            }
+            // before the lease: a signal from here on releases it instead of killing this process
+            ledger::exec_signals();
+            let ttl = ttl.unwrap_or(worktree::DEFAULT_TTL);
+            let held = worktree::acquire_with(&addr, &path, Some(ttl), wait, false).unwrap_or_else(|e| fail(e));
+            let lease = held.get("lease").and_then(Value::as_object).cloned().unwrap_or_default();
+            let text = |k: &str| held.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+            let (root, resource, lease_id) = (text("path"), text("resource"), text("lease_id"));
+            let status = ledger::exec_held(&addr, &lease, ttl, &resource, "write", &cmd);
+            if let Err(e) = worktree::finish(&addr, &root, &lease_id) {
+                eprintln!("agent-bridge: {e}");
+            }
+            std::process::exit(status)
+        }
+        WorktreeCmd::Acquire { addr, path, ttl, wait, exec: None } => {
+            mine(&addr)?;
+            presence::need(&addr)?;
+            worktree::acquire(&addr, &path, ttl, wait)?
+        }
+        WorktreeCmd::Release { addr, path } => {
+            mine(&addr)?;
+            worktree::release(&addr, &path)?
+        }
+        WorktreeCmd::Status { path } => worktree::status(&path)?,
+    };
+    show_all(&[reply]);
+    Ok(())
 }
 
 #[cfg(test)]

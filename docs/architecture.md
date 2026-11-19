@@ -38,6 +38,7 @@ legacy `history.jsonl`, which historyd imports once and never changes (message h
 | `console/cli.py` | `agent-bridge-admin`, the console's API from the shell |
 | `console/events.py` | Fan-out to open event streams |
 | `console/links.py` | The optional link rules: loaded, checked and served to the page |
+| `console/worktrees.py` | The Worktrees view's snapshot (ledgerd's `worktrees`, git locks, drift, sessions inside, guard detection) and Protect/Unprotect |
 | `console/static/` | The page: `index.html`, `app.js`, `app.css`, `markup.js` (message tables and code blocks) and `links.js` (links and click-to-copy) |
 
 **Agent frameworks.** Everything that knows Claude Code lives in `claude/`, reached only through `host.py`:
@@ -52,7 +53,9 @@ legacy `history.jsonl`, which historyd imports once and never changes (message h
 The Rust port of the CLI, the relay and ledgerd lives in `rust/` (crates `core`, `cli`, `ledgerd`, and `py` for the
 Python extension), described in the
 [README](../README.md#rust-implementation). It shares this wire protocol (ledgerd's and historyd's requests included),
-the lock files and the SQLite schema.
+the lock files and the SQLite schema. Since 0.3.2 the core also has `worktree` (the worktree commands), `guard` (the
+hooks' engine) and `provision` (credentials), the CLI has `ref_guard`, and the broker has `config/broker-entrypoint.sh`
+and the opt-in `compose.auth.yaml` (see [Broker authentication](#broker-authentication)).
 
 ## Addresses, topics and payloads
 
@@ -64,14 +67,14 @@ the lock files and the SQLite schema.
   | Topic | Use |
   |---|---|
   | `agents/<addr>` | Retained presence: `{"name", "caps": [...], "topics": [...], "keep": bool, "seen": unix_ts}`, plus `session`, `pid` and `pid_start` when the agent runs under Claude Code, and the optional `about` and `mcp` (see below) |
-  | `inbox/<addr>` | DMs to that agent |
-  | `room/<room>` | Chat room |
+  | `inbox/<addr>`, `inbox/<addr>/<from>` | DMs to that agent; the second form names the sender in the topic (read since 0.3.2) |
+  | `room/<room>`, `room/<room>/<from>` | Chat room; the second form names the sender (read since 0.3.2) |
   | `broadcast` | Admin broadcasts. Every agent subscribes on every connect, only the `admin` Bus may publish. |
   | `rooms/<room>` | Retained room settings, see [Room moderation](#room-moderation). Every Bus subscribes at QoS 0 on every connect. |
   | `rooms/<room>/pin` | A room's pinned message, retained: `{"text", "by", "ts"}`, `text` under the message rules (not empty, at most 64 KiB). Set or cleared (empty payload) by admin or a moderator; one level below `rooms/+`, so no Bus caches it. |
   | anything else | Raw topics. `$...`, `agents`, `inbox`, `ledger`, `broadcast`, `rooms` and `history` (as first level) are reserved for the bridge. |
-  | `history/req/<addr>`, `history/req`, `history/resp/<id>` | historyd request/response, see [History service](#history-service) |
-  | `ledger/req/<addr>`, `ledger/resp/<id>` | ledgerd request/response (see [the wire protocol](#resource-ledger)); plain `ledger/req` is still served |
+  | `history/req/<addr>`, `history/req`, `history/resp/<id>`, `history/resp/<addr>/<conn>` | historyd request/response, see [History service](#history-service) |
+  | `ledger/req/<addr>`, `ledger/resp/<id>`, `ledger/resp/<addr>/<conn>` | ledgerd request/response (see [the wire protocol](#resource-ledger)); plain `ledger/req` is still served |
 
 - **Origin fields** in presence: `session` is `CLAUDE_CODE_SESSION_ID` (a UUID) when set, `pid` the nearest
   ancestor process whose comm is `claude`, and `pid_start` that process's start time (field 22 of
@@ -92,7 +95,8 @@ the lock files and the SQLite schema.
   effort while 0.2.x clients remain: a 0.2.x CLI, relay or MCP server that rewrites the record (a join, a keep, the
   idle refresh) leaves them out, and they stay gone until the agent sets them again.
 - **Message payload** on rooms, inboxes and raw topics: `{"from": "<addr>", "body": "<text>", "ts": unix_ts}`,
-  QoS 1. Plain text on a raw topic is accepted and arrives with `"from": null`. `recv` adds `"topic"`. Room messages
+  QoS 1. Plain text on a raw topic is accepted and arrives with `"from": null`. `recv` adds `"topic"`, and on rooms and
+  inboxes `"sender"` (below). Room messages
   may add `"mentions": [addr, ...]` (see [Mentions](#mentions)), and `recv` then adds `"for_me": true|false`.
   Room and DM messages may add `"reply_to"`: the id of the message they answer (16 lowercase hex, dropped when
   malformed, never checked against an existing message).
@@ -102,12 +106,36 @@ the lock files and the SQLite schema.
   message, including one from an older sender; `_native.message_id(topic, from_, ts)` computes it. historyd itself
   doesn't send it: the history client adds it (CLI `history`, `dms`, `watch`), and a raw `history_call` entry gets it
   from `message_id`.
+- **Identity on the wire** (0.3.2, readers only). A sender can be named by the topic instead of the payload:
+  `inbox/<to>/<from>` and `room/<room>/<from>`, which broker ACLs can bind to the authenticated user (see
+  [docs/AUTH.md](AUTH.md)). Readers take the sender from the topic level and drop a message whose payload `from`
+  differs, then normalise the topic back to `inbox/<to>` or `room/<room>` and add `"sender": "bound"`, so `recv`,
+  `history`, the relay, the console and message ids see today's shape. A message on today's forms gets `"sender":
+  "claimed"`, added on read and never stored: historyd keeps only the bound fact, in a `bound` side table (schema 1),
+  and the history client adds `claimed`. A `room/` or `inbox/` topic of any other depth is dropped. Owning Buses and
+  `watch` subscribe both forms. Senders keep today's topics in 0.3.2 and switch in a later release, once no reader older
+  than 0.3.2 is left, so nothing an older reader sees changes.
 - **Sessions**: each agent connects with client id = its address, `clean_start=False`, and session expiry of 3 days
-  (never with `keep`). Subscriptions use QoS 1 with No Local, so you never receive your own messages.
-- **Retained reads.** A one-off lookup (`agents`, `rooms`, `find`, room `info`) subscribes at QoS 0, then
-  unsubscribes at once: the broker sends every retained record straight after the SUBACK, outside the inflight
-  window, so the UNSUBACK marks the moment all of them are in. There is no fixed wait, so a lookup costs one round
-  trip instead of a timeout.
+  (never with `keep`). Subscriptions use QoS 1 with No Local, so you never receive your own messages. With credentials
+  (an auth mode other than `off`; see the README's Authentication section), the owning connection logs in with its own
+  secret client id from `agents/<addr>.json`, and publish-only and one-shot connections log in with an empty,
+  broker-assigned one, so none takes another over. The Bus then writes `"auth": "credentials"` into presence and takes
+  service replies on `<service>/resp/<addr>/s` (owner) or `<service>/resp/<addr>/<random>` (helpers); without
+  credentials both are as before. `register` provisions the agent's credentials before its first connection. A refused
+  publish reads `you may not post as <addr> on <topic>`, and a refused subscribe `you may not read <topic>`.
+- **Which credentials a process uses** (`provision::credentials_for`, the one place every connection asks: `Bus::open`,
+  the ledger and history clients, retained reads and one-shots). Admin's credentials only when
+  `AGENT_BRIDGE_CREDENTIALS` is set and names admin's file: never because `admin.json` is on disk, and never because a
+  caller passed `admin` as its address. The console and `agent-bridge-admin` set the variable for themselves, and the
+  services set it to their own mounted file. An agent's file only after the own-session check passes: a file bound to
+  another session is refused (`<addr> is not your agent (bound to another session)`), and one bound to no session is
+  allowed, as for a plain CLI agent. For a read with no address of its own, the agent bound to this process's session.
+  Otherwise anonymous, which `enforce` refuses with `this broker requires credentials (auth enforce)`. So leaving a
+  session (unsetting `CLAUDE_CODE_SESSION_ID`) never turns a command into admin's.
+- **Retained reads.** A one-off lookup (`agents`, `rooms`, `find`, room `info`) subscribes at QoS 0, then unsubscribes
+  at once: the broker sends every retained record straight after the SUBACK, outside the inflight window, so the
+  UNSUBACK marks the moment all of them are in. There is no fixed wait, so a lookup costs one round trip instead of a
+  timeout. Under auth these connections log in too, by the credentials rule below.
 - **Presence cache.** Every Bus subscribes to `agents/+` and `rooms/+` at QoS 0 on every connect and keeps both sets
   of records current. The ack of the next request after connecting marks both caches complete, and nothing that
   reads them runs before that. `dm` (is the recipient live?), mentions, `sub`/`join`, `describe`, `keep`, `leave`,
@@ -150,6 +178,8 @@ the lock files and the SQLite schema.
 | `describe` | `MY_ADDR [--name NAME] [--caps a,b] [--about TEXT]` | Changes your display name, caps or one-line description (`""` clears caps or about). The address never changes; `@name` mentions follow the new name. Like `say`, it never takes over a live relay's session. |
 | `doctor` | `[--json]` | Checks this machine's bridge, read-only (see [Doctor](#doctor)); exit 1 if any check fails. |
 | `relay` | `[start\|stop\|status\|restart\|wake] [--session ID]` | This session's relay and its wake filters (see [Relay](#relay)). |
+| `worktree` | `acquire MY_ADDR PATH [--ttl S] [--wait S] [--exec CMD...]`, `release MY_ADDR PATH`, `status PATH` | A worktree lock (see [Worktree locks and the guard](#worktree-locks-and-the-guard)). `--ttl` defaults to 600. |
+| `hook` | `broadcast\|relay-start\|guard\|ref-guard [STATE]` | Claude Code's and git's hooks. `broadcast` and `relay-start` print nothing on failure and always exit 0; `guard` and `ref-guard` fail closed (see [Worktree locks and the guard](#worktree-locks-and-the-guard)). |
 
 Ledger commands. Each one runs `init` for `MY_ADDR` first, except `claims`, `holders` and `unclaim`, which need no
 ledger. They print the ledgerd reply (see [Resource ledger](#resource-ledger)).
@@ -232,7 +262,8 @@ conformance and golden tests pinned.
   `mentions`, `unresolved` and `absent`), `dm(to, body, reply_to=None)`, `pin(room, text)` (the pin record),
   `unpin(room)`, `describe(name, caps, about)` and `set_client_version(version)` (the presence `mcp` field) included;
   `ledger(op, **fields)` and `history_call(op, **fields)` go over the Bus's own connection (replies on
-  `<service>/resp/<addr>` for an owning Bus, a random reply id for a publisher; acked at once and never buffered).
+  `<service>/resp/<addr>` for an owning Bus, a random reply id for a publisher, or under credentials
+  `<service>/resp/<addr>/s` and `<service>/resp/<addr>/<random>`; acked at once and never buffered).
   `wait_arrival(timeout, after_seq=0) -> (pending, seq)` returns as soon as a message newer than `after_seq` is buffered
   and otherwise waits out its timeout, so unread messages never wake it twice. `cached_agent(addr)` and
   `cached_room(room)` read the Bus's own presence and room caches (`None` when absent): `cached_agent` first waits until
@@ -251,7 +282,9 @@ conformance and golden tests pinned.
   `relay_lock_path/live/held/stop`, `relay_session_agent(session)` (the agent a session's relay adopts),
   `relay_wake_modes(session)` and `relay_set_wake(session, room, mode)` with `RELAY_WAKE_MODES`, `message_id(topic,
   from_, ts)` (a message's id), `identity_*` (including `identity_read_proc(pid)`: `{comm, ppid, start}` or `None`),
-  `ledger_call(op, as_, timeout=None, **fields)` and `history_call` on a connection of their own, the `check_*`
+  `ledger_call(op, as_, timeout=None, **fields)` and `history_call` on a connection of their own,
+  `worktree_acquire(addr, path, ttl=None, wait=0)`, `worktree_release(addr, path)` and `worktree_status(path)` (the
+  CLI's `worktree` replies as dicts), `auth_mode()` (`off`, `warn` or `enforce`), the `check_*`
   validators, and the limits as constants (`BODY_MAX`, `TOPIC_MAX`, the room limits `RULES_MAX`, `MODS_MAX` and
   `LIST_MAX`, the relay's `RELAY_BACKLOG`, the ledger's `MAX_REQUESTS`, `MAX_PENDING`, `MAX_TTL`, ...).
 
@@ -359,10 +392,11 @@ the same schema, row digests and replies, so either can take over the other's `h
 - **Retention.** Every hour (or stale period, if shorter) it deletes what it received longer ago than
   `AGENT_BRIDGE_STALE_DAYS`. Receive time, not the sender's `ts`, so a forged timestamp cannot keep a row. It also
   keeps at most 500,000 rows and 256 MiB of bodies, oldest dropped first.
-- **Requests** are JSON on `history/req/<addr>` with ResponseTopic `history/resp/<id>` (`[A-Za-z0-9_-]{1,128}`,
-  others get no reply) and 1-256 bytes of CorrelationData; the reply has the same CorrelationData and a 300 s expiry.
-  Bodies are at most 16 KiB, unknown fields are refused, and `"as"`, when given, must match the topic's address.
-  Ops that name nobody may also use plain `history/req`; ops on one agent's data must use that agent's topic.
+- **Requests** are JSON on `history/req/<addr>` with ResponseTopic `history/resp/<id>` (`[A-Za-z0-9_-]{1,128}`) or,
+  since 0.3.2, `history/resp/<addr>/<conn>` when `<addr>` is the request topic's address (others are dropped with a log
+  line and get no reply) and 1-256 bytes of CorrelationData; the reply has the same CorrelationData and a 300 s expiry.
+  Bodies are at most 16 KiB, unknown fields are refused, and `"as"`, when given, must match the topic's address. Ops
+  that name nobody may also use plain `history/req`; ops on one agent's data must use that agent's topic.
 
   | op | fields | topic | reply |
   |---|---|---|---|
@@ -406,7 +440,7 @@ compare-and-set over MQTT and no second writer.
   read or write. Only the owner adds, updates or removes it.
 - **Visibility**: `ledger` shows your own ledger in full and another agent's public entries only. `public` is the
   public ledger: every public resource of every agent. Private means unlisted, not secret: `dump` (the console's view)
-  answers any address with everything, private resources and pending requests included.
+  answers any address with everything, private resources and pending requests included, until auth is `enforce`.
 - **Request and grant**: `request resource level` is granted on the spot when the resource is public and the level is
   at most `max_level`. Otherwise it goes pending and the owner gets a DM in `inbox/<owner>` from `ledgerd` that names
   the `request_id` and the commands that answer it (`agent-bridge grant <owner> <request_id>` or `deny`). The
@@ -452,6 +486,16 @@ compare-and-set over MQTT and no second writer.
   moderators from the retained `rooms/<room>` record), and someone else's release DMs the holder. Like moderation, this
   is cooperative: any local process can rewrite a room record or claim as anyone. Keys use the resource-name charset. At
   most 256 claims per agent and 1024 per room. Claims are their own table, so the database stays schema 1.
+- **Worktrees**: a git worktree's lock is the admin-owned resource `admin/wt-<first 16 hex of sha256(realpath)>`, made
+  on demand by an `acquire` that carries `path` (the realpath) and `git_common_dir`. ledgerd recomputes the id from the
+  path and refuses a mismatch (`path: does not match admin/wt-<hex> (its id is the sha256 of the realpath)`), creates
+  the resource public with `max_level` write, the path as its description and an access spec `{kind: "worktree", path,
+  git_common_dir, enforcement: "hook"}` in an additive `specs` table, files the caller's request (granted at once while
+  public; if admin made it private, the request stays filed and the reply is `your write request for admin/wt-<hex> is
+  pending with admin (request_id <id>)`) and acquires as usual, so `ttl`, `wait`, waiters and `cancel` behave as for any
+  resource. At most 1024 worktrees, apart from the per-ledger limit; `add` refuses `wt-` names in admin's ledger, and
+  admin's ledger is exempt from the stale sweep. `worktrees` lists them. `core::ledger::worktree_resource` is the one
+  definition of the id, used by the CLI, the guard hooks and the console.
 
 **Running a command under a lease.**
 `agent-bridge acquire MY_ADDR OWNER/NAME read|write [--ttl S] [--wait S] --exec CMD [ARGS...]` takes the lease, runs
@@ -482,28 +526,51 @@ early.
 | `init` | | `created`, `owner`, `since` |
 | `add` | `name`, `description=""`, `visibility=private`, `max_level=read` | `resource` |
 | `update` | `name` and any of `description`, `visibility`, `max_level` | `resource` |
-| `remove` | `name` | `{}`. Anyone waiting on it gets an error. |
+| `remove` | `name`, `on_behalf` (admin only) | `{}`. Anyone waiting on it gets an error (`<resource> was removed by admin` when admin acted for the owner). |
 | `ledger` | `owner` (optional) | `owner`, `resources` |
 | `public` | | `resources` |
 | `request` | `resource`, `level` | `request {id, resource, owner, holder, level, status, ts}`, status `granted`, `pending` or `denied` |
-| `grant` / `deny` | `request_id` (owner only) | `request` |
+| `grant` / `deny` | `request_id`; `deny` also takes `on_behalf` (admin only) | `request` (owner, or admin acting for the owner) |
 | `grants` | | `held` (requests you made), `asked` (requests on your resources) |
-| `acquire` | `resource`, `level`, `ttl=60`, `wait=0` | `lease {lease_id, resource, holder, level, expires_at, token}` (token only for write), or `ok: false, error: "busy", holders: [...]` |
+| `acquire` | `resource`, `level`, `ttl=60`, `wait=0`; for a worktree also `path` and `git_common_dir` (below) | `lease {lease_id, resource, holder, level, expires_at, token}` (token only for write), or `ok: false, error: "busy", holders: [...]`; with `path`, also `created` |
 | `renew` | `lease_id`, `ttl=60` | `lease` (holder only) |
-| `release` | `lease_id` | `{}` (holder or owner; an owner breaking another agent's lease DMs its holder) |
+| `release` | `lease_id`, `on_behalf` (admin only) | `{}` (holder or owner; an owner breaking another agent's lease DMs its holder, and admin acting for the owner is named: `admin ended your write lease <id> on <resource>`) |
 | `cancel` | `correlation` (hex of the CorrelationData of your queued acquire) | `cancelled` (0 or 1). Drops your waiter queued under this request's ResponseTopic with that correlation; 0 when it was served, timed out or never queued. |
 | `leases` | | `leases [{lease_id, resource, owner, holder, level, expires_at, token}]`: the leases you hold, soonest expiry first |
 | `lease_history` | `resource`, `last=50` (1 to 500) | `resource`, `events [{ts, event, lease_id, holder, level, token, by}]`, oldest first (owner only) |
-| `ping` | | `service: "ledgerd"`, `version`. Any `as` works, needs no ledger and writes nothing (what `agent-bridge doctor` asks). |
+| `ping` | | `service: "ledgerd"`, `version`, and `auth` (`warn` or `enforce`) when auth isn't off. Any `as` works, needs no ledger and writes nothing (what `agent-bridge doctor` asks). |
 | `claim` | `room`, `key`, `ttl` (optional), `note=""` | `claim {room, key, holder, since, expires_at (null without ttl), note}`, or `ok: false` naming the holder, with its `claim` |
 | `unclaim` | `room`, `key` | `{}`. Any `as`, no ledger: the holder, a moderator of the room or admin. |
 | `claims` | `room` | `room`, `claims [...]`. Any `as`, no ledger; without `room`, every room's claims, admin only. |
-| `holders` | `resource` | `resource`, `holders [{holder, level, expires_at}]`, `waiting [{holder, level, queued_at}]`. Any `as`, no ledger. |
+| `holders` | `resource` | `resource`, `holders [{holder, level, expires_at, lease_id}]`, `waiting [{holder, level, queued_at}]`. Any `as`, no ledger. |
+| `worktrees` | `all=false` | `worktrees [{resource, path, git_common_dir, holder, level, lease_id, expires_at}]`: the worktrees with a live lease, or with `all` every one (`holder` null when free). Any `as`, no ledger; what the guard hooks and the console's Worktrees view ask. |
 | `drop` | | `{}`. Deletes your ledger, resources, grants given and held, leases and queued waits. |
-| `dump` | | Everything, for the admin console: `ledgers [{owner, since, last_seen}]`, `resources`, `requests` (pending first), `leases` (`lease_id, resource, holder, level, expires_at, token`), `waiters [{resource, holder, level, queued_at, deadline}]`, `ts`, and from the Rust ledgerd `ledgerd {impl, version}`. Any `as` works and needs no ledger. If the reply would pass ~240 KB every list is cut to the same length and `truncated: true` is set. |
+| `dump` | | Everything, for the admin console: `ledgers [{owner, since, last_seen}]`, `resources`, `requests` (pending first), `leases` (`lease_id, resource, holder, level, expires_at, token`), `waiters [{resource, holder, level, queued_at, deadline}]`, `ts`, and from the Rust ledgerd `ledgerd {impl, version}`. Any `as` works and needs no ledger, except under `enforce`, where it is admin only (`dump: admin only`; `warn` logs a non-admin dump). If the reply would pass ~240 KB every list is cut to the same length and `truncated: true` is set. |
 
 Any reply over 240 KB is replaced by `{"ok": false, "error": "reply over 240000 bytes"}`, since mosquitto's
 `max_packet_size` would otherwise disconnect ledgerd. This mostly matters for `public` with very many resources.
+
+**Under auth** (`AGENT_BRIDGE_AUTH` `warn` or `enforce`; `off` is 0.3.1's behaviour byte for byte):
+- **Identity from the topic.** `ledger/req/<addr>` carries the identity. A request on plain `ledger/req` (identity from
+  `as`) is logged in `warn` (`auth warn: <addr> sent <op> on plain ledger/req`, once per address an hour) and refused in
+  `enforce` (`send requests on ledger/req/<your address>`).
+- **Reply topics.** `ledger/resp/<addr>/<conn>` is accepted in every mode when `<addr>` is the requester; any other
+  two-level topic is dropped with a log line and nothing is published. A one-level `ledger/resp/<id>` is accepted in
+  `off` and `warn` and dropped in `enforce`. The ledger client does this by itself: `core::ledger::call` (so
+  `_native.ledger_call`, `ledger-raw`, `--exec`, the worktree helpers and the console) logs in as `as` and replies on
+  `ledger/resp/<as>/<16 hex>` when the credentials rule (see [Addresses, topics and
+  payloads](#addresses-topics-and-payloads)) gives it that identity. Otherwise it is anonymous and one-level, as before,
+  which `enforce` drops (`call_with` is the explicit form). That is safe because credentials exist only after the `warn`
+  init, which needs the 0.3.2 broker and services.
+- **Admin acting for an owner.** `on_behalf: <owner>` on `release`, `deny` and `remove`, from admin only (`on_behalf:
+  only admin acts for another ledger`), acts on that owner's ledger, records `by: admin` in `lease_events`, and names
+  admin in the holder's DM.
+- **Rate limit.** 20 requests a second per identity, burst 100, admin exempt: `rate limited: at most 20 requests a
+  second`, not stored for redelivery.
+- **Its own login.** ledgerd logs in with `config::credentials("ledgerd")` (the `AGENT_BRIDGE_CREDENTIALS` file) and its
+  secret client id. Without the file it connects anonymously under `warn` and exits under `enforce` (`auth enforce:
+  ledgerd needs its credentials file in AGENT_BRIDGE_CREDENTIALS`). `--health` asks for `worktrees` (logged in as
+  ledgerd under auth) instead of `dump`.
 
 **From the shell**, use the ledger commands of `agent-bridge`:
 
@@ -632,8 +699,8 @@ agent writes to it.
 - **One per session.** The relay holds an exclusive flock on `relay/<session id, lowercase>.lock` in the state
   directory, which also holds its pid, on the second line the address it relays, and on the third (from 0.3.0) its
   version. A relay is live while that lock cannot be taken; the console and the broadcast hook use the same test. Next
-  to it, `relay/<session>.wake` holds the session's wake filters and, briefly during a self-restart,
-  `relay/<session>.backlog` its quiet backlog.
+  to it, `relay/<session>.wake` holds the session's wake filters, `relay/<session>.leases` the worktree leases it
+  renews (one JSON line each), and, briefly during a self-restart, `relay/<session>.backlog` its quiet backlog.
 - **Address.** The relay adopts the most recently seen live agent whose presence carries this session id, such as one
   registered through the CLI, so its rooms and queued messages come along. Otherwise it uses the same session-derived
   address as the MCP server.
@@ -689,12 +756,131 @@ first. When the relay ends, the MCP server takes the session back and anything n
 message reaches the session once. Known gap: if a relay starts while the MCP server owns the session, they can take it
 from each other for up to 0.5 s, and a message caught in that window could in principle arrive twice.
 
+## Broker authentication
+
+The groundwork for authenticated agents ([docs/AUTH.md](AUTH.md)), off by default. `compose.yaml` is unchanged; the
+opt-in overlay `compose.auth.yaml` switches the broker to `config/broker-entrypoint.sh`, and `AGENT_BRIDGE_AUTH` picks
+the mode.
+
+- **Modes.** The entrypoint renders mosquitto's config from `config/mosquitto.conf`. `off`: today's broker plus the unix
+  socket. `warn`: the dynamic-security plugin, `check_retain_source true` and `allow_anonymous true`, with anonymous
+  clients in the group `legacy` (role `legacy-all`, today's full rights), so 0.3.1 clients keep working. `enforce`: as
+  `warn` with `allow_anonymous false`. It writes the mode to `~/.config/agent-bridge/auth-mode` (removed under `off`),
+  which clients read when `AGENT_BRIDGE_AUTH` isn't set; a bad value is a config error (`AGENT_BRIDGE_AUTH must be off,
+  warn or enforce, got '<v>'`). Switching modes recreates the broker; persistent sessions survive.
+- **Runs as you.** mosquitto runs as the owner of the mounted config directory (the image's mosquitto user is remapped
+  to that uid), so the socket and the files are yours. The data volume is chowned to that user at each start, and the
+  image's own entrypoint chowns it back under plain `compose.yaml`, so switching needs no manual chown either way. The
+  binds use `create_host_path: false`: a missing directory is an error, never one Docker creates as root, and a
+  root-owned one is refused (`refusing to run the broker as root: the mounted directory belongs to root ...`).
+- **The socket** is `~/.local/state/agent-bridge/broker/mqtt.sock` (`srwxrwx---`, yours), next to TCP 1883. Not under
+  `$XDG_RUNTIME_DIR`, which doesn't exist at boot, when Docker's restart policy starts the broker. Clients use it when
+  `AGENT_BRIDGE_SOCKET` names it, or when it exists and neither `AGENT_BRIDGE_HOST` nor `AGENT_BRIDGE_PORT` is set; it
+  takes precedence over TCP.
+- **First start under `warn` or `enforce`.** `mosquitto_ctrl dynsec init` with a random admin password, then
+  `~/.config/agent-bridge/admin.json` and the service clients with their files under `services/` (ledgerd: subscribe and
+  receive `ledger/req`, `ledger/req/+`, `agents/+`, `rooms/+`, `ledger/resp/ledgerd/+`; send `ledger/resp/#`, `inbox/+`,
+  `inbox/+/ledgerd`, `ledger/req/ledgerd`. historyd: read `#`; send `history/resp/#`, `history/req/historyd`). Default
+  ACLs deny send, receive and subscribe; admin's role has `#` for all three. If the dynamic-security store exists but
+  `admin.json` is gone, it refuses and names the file to restore or the command that starts over. Its healthcheck
+  reports ready once the config and the service files exist; ledgerd and historyd wait for it and get
+  `AGENT_BRIDGE_AUTH` and `AGENT_BRIDGE_CREDENTIALS`.
+- **Credential files**: `admin.json`, `services/{ledgerd,historyd}.json` and `agents/<addr>.json` under
+  `~/.config/agent-bridge`, JSON `{username, password, client_id}` (agents also `session`), 0600 in 0700 directories. A
+  file others can read is refused: `credentials <path> are readable by others (mode 640); fix it with: chmod 600
+  <path>`.
+- **Provisioning** (`provision::ensure`, called by `register`, and by a Bus attach when the agent has no file yet, so
+  existing agents migrate on their next relay start or attach, the MCP server's or a CLI post's. The file is bound to
+  the agent's own session from its presence record, never to whoever attached, so a post from another session can't take
+  an address over; an agent with no session, attached from inside one, is left for its own `register`, and `admin` is
+  skipped) is the one use of `admin.json` from disk, and only to create a new agent: `createClient` goes alone first and
+  never resets an existing client (`<addr> already has credentials elsewhere; ask admin to reissue` when its file is
+  gone); then only `role-<addr>` is made and given to it; and only register-made `<name>-<6 hex>` addresses and session
+  addresses `<project>-<8 hex>` (the relay's and the MCP server's) qualify. An address of any other shape (`register
+  --addr myname`; `--addr alpha-000001` qualifies, since the shape decides) gets no credentials and carries on
+  anonymously, which `enforce` refuses and `doctor` lists; `admin` is a hard error (`address 'admin' is reserved for the
+  admin console`), and so are `already has credentials elsewhere` and `not your agent`. The agent's file gets a secret
+  `client_id` (`c-` and 32 hex) and its session. Under `off` nothing is provisioned.
+- **An agent's role** (`role-<addr>`, literal topics only). Send: `agents/<a>`, `inbox/+`, `inbox/+/<a>`, `room/+`,
+  `room/+/<a>`, `rooms/+`, `rooms/+/pin`, `ledger/req`, `ledger/req/<a>`, `history/req`, `history/req/<a>`. Receive and
+  subscribe: `agents/+`, `rooms/+`, `rooms/+/pin`, `room/+`, `room/+/+`, `inbox/<a>`, `inbox/<a>/+`, `ledger/resp/<a>`,
+  `ledger/resp/<a>/+`, `history/resp/<a>`, `history/resp/<a>/+`, `broadcast`. Every other topic under `agents`, `inbox`,
+  `room`, `rooms`, `ledger` and `history` is denied, and so is sending on `broadcast`; raw topics are free. Today's
+  topic forms stay allowed until senders switch.
+- **Refusals.** A refused password: `broker did not accept the login of <user>`. A publish or subscribe the ACL refuses
+  is an error, `not authorized to publish on <topic>` or `not authorized to subscribe to <topic>`, which the Bus words
+  as `you may not post as ...` and `you may not read ...`; before 0.3.2 the broker's refusal was silently taken as
+  success. Every `MY_ADDR` command refuses an agent whose file binds it to another session (`agent-bridge: <addr> is not
+  your agent (bound to another session)`); calls from outside a session and agents without a file pass. Which
+  credentials a connection uses is the rule under [Addresses, topics and payloads](#addresses-topics-and-payloads).
+
+
+## Worktree locks and the guard
+
+A worktree lock is a lease on `admin/wt-<first 16 hex of sha256(realpath)>` (see [Resource ledger](#resource-ledger)),
+enforced locally by two hooks that share one lock lookup, so they never disagree. The design, and why it is labelled
+`hook` rather than enforced, is in [docs/ACCESS.md](ACCESS.md) section 5.6.
+
+- **`agent-bridge worktree`** (`core::worktree`; `_native.worktree_acquire`, `worktree_release`, `worktree_status`).
+  `acquire` resolves the realpath, acquires the write lease with `path` and `git_common_dir` (ledgerd creates the
+  resource on demand), and runs `git worktree lock --reason "agent-bridge lease <id> held by <addr>"`, with no expiry in
+  it, so renewals never rewrite it. The main worktree can't be git-locked: a warning, and the lease and the hooks still
+  hold it. It prints the lease plus `resource`, `lease_id`, `path`, `git_lock`, `lock` (the reason), `renewed_by`
+  (`relay` or `none`) and `warnings`. With this session's relay running, the relay renews the lease every ttl/3 (default
+  ttl 600 s) and releases it when the session ends (`relay/<session>.leases`); without one it lapses at its ttl.
+  `--exec` holds the lease and the git lock while the command runs, renewing every ttl/3, then releases as `release`
+  does, with `acquire --exec`'s exit status. `release` first saves uncommitted changes, untracked files included, as a
+  commit on top of HEAD under `refs/agent-bridge/released/<lease id>` through a scratch index, so the files and the real
+  index are untouched; then it removes the git lock if it is this lease's, and releases. It prints `released`, `path`,
+  `snapshot` (the ref or null) and `unlocked`. `status` needs no ledger for the git side and prints `path`, `resource`,
+  `git_common_dir`, `main`, `lock`, `stale` (an agent-bridge lock no live lease is behind), and `holder`, `lease_id`,
+  `expires_at` while leased, or `ledger_error` when ledgerd can't say.
+- **The lock lookup** (`core::guard`). A worktree is locked only while an agent other than this session's (or its
+  subagents') holds its lease. ledgerd's `worktrees` op is authoritative, asked on every call (2 s timeout), logged in
+  as the session's agent when it has credentials. A git lock reason never allows anything on its own: a lock with no
+  live lease is stale, allowed with a warning. If ledgerd is unreachable or older than 0.3.2, the lookup falls back to
+  the union of `<data dir>/guard-locks.json` (the last successful lookup, written 0600 atomically) and the git lock
+  reasons, and fails closed; the main worktree can't be git-locked, which is why the last-known file is part of it.
+- **`agent-bridge hook guard`**, a Claude Code `PreToolUse` hook. It reads the hook event on stdin. Inside a worktree
+  another agent holds, without the lease, it refuses `Edit`, `Write`, `NotebookEdit` and the MCP filesystem write tools
+  by resolved path (symlinks, `..`, new files, hard links); shell writes: mutators' paths, redirections, `sed -i`, `perl
+  -i`, `find -delete`/`-exec`, and git writes through `-C`, `--git-dir`, `--work-tree` or `GIT_DIR`; and, when the cwd
+  is inside, every program but a read-only allowlist. While a lock is held it also refuses, in that worktree's
+  repository, the branch's ref file, `packed-refs`, `hooks/` and `config`; when the call's cwd (or its `-C` or
+  `--git-dir` target) is inside a repository that has a locked worktree, paths it can't resolve (`$VAR`, `$(...)`,
+  `xargs` operands) and the `core.hooksPath` overrides (`-c`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_n`, `git
+  config`); and writes to a file with more than one hard link on the same device as a locked worktree. Globs are
+  expanded from the call's cwd and judged as real paths, and a `cd` to a directory it can't resolve is judged by the
+  call's own working directory. Elsewhere, nothing is refused for being unresolvable: in a repository with no locked
+  worktree, or outside any, only writes that name a locked worktree or its repository's protected files (or a multi-link
+  file on its device) are refused. It unwraps `bash -c`, `eval`, wrappers, `$(...)` and backticks, and skips heredoc
+  bodies.
+- **`agent-bridge hook ref-guard STATE`**, git's `reference-transaction` hook. Only `prepared` is checked. It refuses
+  (exit 1) an update of `HEAD` or a per-worktree ref (`refs/bisect`, `refs/worktree`, `refs/rewritten`, `ORIG_HEAD`,
+  ...) of the worktree git runs in, or of a branch any worktree has checked out, when that worktree is held by someone
+  else. It uses the guard's lookup and refusal text, with `the update of <ref>` as `<what>`. Outside an agent session
+  (no `CLAUDE_CODE_SESSION_ID`) it allows, with `agent-bridge ref-guard: allowed outside an agent session, but
+  <refusal>` on stderr; when it can't decide, it refuses with `agent-bridge ref-guard: blocked: <why>`. Shared refs no
+  worktree has checked out (tags, remotes, `refs/agent-bridge/*`) are free. The console's Protect this repo installs it;
+  by hand, the hook file is `#!/bin/sh` and `exec agent-bridge hook ref-guard "$@"`.
+- **Outputs.** Allowed: exit 0, silent. Refused: exit 2 (the guard) or 1 (ref-guard) with `blocked: <what> is inside
+  <path>, leased by <holder> until <HH:MM:SS> (lease <id>). To work there: agent-bridge worktree acquire <session agent>
+  <path>`; `until` is left out when the expiry is unknown, and ` (ledgerd unreachable; using locks as of <t>)` is added
+  in the fallback. A warning: exit 0 with `{"systemMessage": ...}`, never a `permissionDecision`, since `allow` would
+  approve the call past the user's permission prompt. Unreadable input exits 2, and so does a crash or arguments that
+  don't parse (`blocked: the agent-bridge guard failed (internal error)`); unlike the other hooks, both guards fail
+  closed.
+- **What it can't see**: interpreters (`python -c`), scripts run from outside, background jobs, and other tools and
+  harnesses. That is why the label is `hook`, and why a per-session sandbox ([docs/ACCESS.md](ACCESS.md) 5.6) is the
+  hard local option.
+
+
 ## Doctor
 
-`agent-bridge doctor` checks this machine's bridge and prints one line per check, `OK`, `WARN` or `FAIL`, with what to
-do; any `FAIL` makes it exit 1. With `--json` each check is one object, `{"check", "status": "ok"|"warn"|"fail",
-"detail"}` plus the check's own fields. It only reads: it never creates the state directory, starts or stops a relay,
-or edits settings. The checks, in order:
+`agent-bridge doctor` checks this machine's bridge and prints one line per check, `OK`, `WARN`, `FAIL` or (since 0.3.2)
+`INFO`, with what to do; any `FAIL` makes it exit 1. With `--json` each check is one object, `{"check", "status":
+"ok"|"warn"|"fail"|"info", "detail"}` plus the check's own fields. It only reads: it never creates the state directory,
+starts or stops a relay, or edits settings. The checks, in order:
 
 - `broker`: a TCP connection to `AGENT_BRIDGE_HOST:AGENT_BRIDGE_PORT` within 2 s.
 - `ledgerd`, `historyd`: each answers `ping` within 3 s with its `version` (ledgerd's `ping` op; historyd's `ping`
@@ -710,6 +896,20 @@ or edits settings. The checks, in order:
   plain line names at most five stale sessions, then `and N more (doctor --json lists all)`.
 - `hooks`: every hook command in `~/.claude/settings.json` that mentions agent-bridge runs an existing program; a
   `FAIL` names only the missing path.
+- `auth` (0.3.2): the auth mode and the transport (the unix socket or TCP). `off` is `INFO` (`off: an anonymous bus, any
+  local process may claim any address`). Under `warn` it is `OK` when every live agent logs in, else a `WARN` naming the
+  agents that connect anonymously, which `enforce` would refuse (`--json`: `mode`, `anonymous`). `enforce` is `OK`. A
+  mode other than `off` with no `admin.json` is a `FAIL`, since nothing can be provisioned. A stale `auth-mode` file,
+  saying `warn` or `enforce` while the broker accepts a made-up login (which only a broker without dynamic security
+  does), is a `WARN`: `auth-mode file says <x> but the broker runs without auth`.
+- `readers` (0.3.2): a `WARN` for live relays and MCP servers older than 0.3.2, which don't read the sender-bound topics
+  yet (`restart them (relay restart, /mcp)`; `--json`: `old`).
+- `groups` (0.3.2): a `WARN` for root-equivalent groups, `docker`, `libvirt`, `lxd`, `incus` and `disk`, and
+  `sudo`/`wheel`/`admin` when `sudo -n true` succeeds; `INFO` for a `sudo` that asks for a password and for `adm`
+  (`--json`: `root_equivalent`). Any agent in a root-equivalent group can get round every local control
+  ([docs/AUTH.md](AUTH.md)).
+- `claude` (0.3.2): `OK` when `claude --version` is at least 2.1.295, the first version whose hooks can fail closed
+  (`onFailure: "block"`); a `WARN` when it's older; `INFO` when `claude` isn't on PATH.
 
 ## Admin console
 
@@ -721,11 +921,12 @@ transcripts, checks `/proc` and signals processes. Start it by hand with the bro
 agent-bridge-console
 ```
 
-It prints a login URL, `http://127.0.0.1:10000/#token=...`. Open it once; the page stores the token in the
-browser's localStorage and removes it from the address bar. `MONITOR_PORT` changes the port. The console joins the
-bus as the reserved agent `admin` (keep on) and sees everything else through a read-only `#` subscription, both from
-the native core (`agent_bridge._native`: `Bus.register_admin()` and `Observer`). Ledger requests go over the admin
-connection while the console holds it (else over one of their own); history requests use connections of their own.
+It prints a login URL, `http://localhost:10000/#token=...` (`127.0.0.1` is still served). Open it once; the page stores
+the token in the browser's localStorage and removes it from the address bar. `MONITOR_PORT` changes the port. The
+console joins the bus as the reserved agent `admin` (keep on) and sees everything else through a read-only `#`
+subscription, both from the native core (`agent_bridge._native`: `Bus.register_admin()` and `Observer`). Ledger requests
+go over the admin connection while the console holds it (else over one of their own); history requests use connections
+of their own.
 
 **Sessions and agents.** The console lists two kinds of entries, joined by Claude session id:
 
@@ -805,6 +1006,23 @@ as a dead session. Dead sessions that have not been updated for the stale period
   words of at most 200 characters, at most 2000 per run, URL-encodes each capture, checks again that the built link is
   http(s) on the template's origin, links nothing for a `.` or `..` capture, and builds the element with `textContent`
   and the `href` property. Git hashes and paths become click-to-copy spans. Code blocks never link.
+- **Worktrees**: `GET /api/worktrees` (`console/worktrees.py`) joins ledgerd's `worktrees` op with each worktree's git
+  lock, read from `<gitdir>/locked` and parsed as `agent-bridge lease <id> held by <addr>`. Each row has the path,
+  branch, holder, expiry and lease id; its drift (an id that isn't `sha256(realpath)[:16]`, no git lock, a lock naming
+  someone else, or a stale lock with no lease); the live sessions inside and those working there without the lease; and
+  the two-part label. Unleased worktrees that two live sessions share are listed too, and `sessions` gains `worktree`.
+  The guard is detected read-only from `/etc/claude-code/managed-settings.json`, `managed-settings.d/*.json` and
+  `~/.claude/settings.json`, including whether `onFailure` is `block`. Against an older ledgerd the view shows `ledgerd
+  is older than 0.3.2 and has no worktrees op`.
+- **Protect this repo**: `POST /api/repo/protect` and `/api/repo/unprotect` (`{repo}`, audited as `repo/protect` and
+  `repo/unprotect`) write or remove the marked `reference-transaction` wrapper in the effective hooks directory,
+  chaining an existing hook first and calling the console's own `agent-bridge hook ref-guard`. Unprotect touches only a
+  file with the marker.
+- **Auth**: `/api/state`, `agent-bridge-admin status` and `/metrics` (`agent_bridge_console_auth_mode{mode}`) report
+  `_native.auth_mode()`; the page shows the mode when it isn't `off` and a "claimed" badge on a named sender that isn't
+  `bound` (history stores only `bound`, so a missing sender counts as claimed). `main()` calls
+  `auth.use_admin_credentials()`, which sets `AGENT_BRIDGE_CREDENTIALS` to `admin.json` only when the variable is unset
+  and the file exists: the explicit act the credentials rule asks for, never a fallback.
 - **Capacity, leftovers, the room kill switch and targeted stop**: described in the
   [README](../README.md#admin-console).
 
@@ -892,7 +1110,7 @@ the service.
 | `--wait`, `--last` | 0-3600 s, 1-1000. |
 | Broker | `max_packet_size 270000`, `max_connections 1024`, `max_queued_messages 1000` and `max_queued_bytes` 32 MiB per client, `memory_limit` 512 MiB. |
 | ledgerd requests | At most 16 KiB of UTF-8 JSON object, unknown fields rejected, every field type-, charset-, length- and range-checked. Resource names are `[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}`. Descriptions are at most 1024 chars with no control characters except tab and newline. ids are 16 hex chars. Bad requests get `ok: false`, or are dropped without a valid ResponseTopic. |
-| ledgerd quotas | 1000 ledgers, 128 resources per ledger, 64 pending and 512 stored requests per agent (the oldest denied one makes room), 256 pending requests per owner, 256 leases per agent, 256 waiters per resource, the last 200 lease events per resource, 256 claims per agent and 1024 per room. |
+| ledgerd quotas | 1000 ledgers, 128 resources per ledger, 64 pending and 512 stored requests per agent (the oldest denied one makes room), 256 pending requests per owner, 256 leases per agent, 256 waiters per resource, the last 200 lease events per resource, 256 claims per agent and 1024 per room, 1024 worktrees, and under auth 20 requests a second per identity (burst 100, admin exempt). |
 
 ## Persistence and cleanup
 

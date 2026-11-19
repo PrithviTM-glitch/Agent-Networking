@@ -34,6 +34,7 @@ CREATE INDEX IF NOT EXISTS messages_topic ON messages(topic, id);
 CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender, id);
 CREATE INDEX IF NOT EXISTS messages_received ON messages(received);
 CREATE TABLE IF NOT EXISTS replies(id INTEGER PRIMARY KEY, reply_to TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bound(id INTEGER PRIMARY KEY);
 ";
 
 /// One reply: topic, payload and CorrelationData.
@@ -167,6 +168,10 @@ impl History {
             // SQLite may hand out a deleted row's id again, so a reply left behind by a rollback's prune must go first
             let id = db.last_insert_rowid();
             db.execute("DELETE FROM replies WHERE id=?", [id])?;
+            db.execute("DELETE FROM bound WHERE id=?", [id])?;
+            if msg.get("sender").and_then(Value::as_str) == Some("bound") {
+                db.execute("INSERT INTO bound VALUES (?)", [id])?;
+            }
             if let Some(parent) = msg.get("reply_to").and_then(Value::as_str).filter(|r| is_message_id(r)) {
                 db.execute("INSERT INTO replies VALUES (?, ?)", params![id, parent])?;
             }
@@ -174,8 +179,10 @@ impl History {
         Ok(n == 1)
     }
 
-    /// Replies whose message is gone: a schema-1 historyd without this table (a rollback) prunes messages only.
+    /// Replies and bound marks whose message is gone: a schema-1 historyd without these tables (a rollback) prunes
+    /// messages only.
     fn forget_orphans(db: &Connection) -> rusqlite::Result<usize> {
+        db.execute("DELETE FROM bound WHERE id NOT IN (SELECT id FROM messages)", [])?;
         db.execute("DELETE FROM replies WHERE id NOT IN (SELECT id FROM messages)", [])
     }
 
@@ -263,8 +270,19 @@ impl History {
         let resp = |id: &str| {
             !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         };
-        let Some(topic) = topic.filter(|t| t.strip_prefix("history/resp/").is_some_and(resp)) else {
-            return log("dropped request without a ResponseTopic under history/resp/");
+        // history/resp/<id>, or from 0.3.2 history/resp/<addr>/<conn> under the request topic's own address
+        let reply_ok = |rest: &str| match rest.split_once('/') {
+            None => resp(rest),
+            Some((addr, conn)) => via == Some(addr) && resp(conn),
+        };
+        let Some(topic) = topic.filter(|t| t.strip_prefix("history/resp/").is_some_and(reply_ok)) else {
+            return log(match via {
+                Some(addr) => {
+                    format!("dropped request without a ResponseTopic under history/resp/ or history/resp/{addr}/")
+                }
+                None => "dropped request without a ResponseTopic under history/resp/".into(),
+            }
+            .as_str());
         };
         let Some(corr) = corr.filter(|c| (1..=MAX_CORR).contains(&c.len())) else {
             let body = json!({"ok": false, "error": format!("CorrelationData of 1 to {MAX_CORR} bytes required")});
@@ -370,7 +388,8 @@ impl Page {
 /// query's last parameter is the row limit.
 fn messages<P: Params>(db: &Connection, filter: &str, args: P, seq: bool) -> rusqlite::Result<Map> {
     let sql = format!(
-        "SELECT topic, sender, body, ts, mentions, id, (SELECT reply_to FROM replies r WHERE r.id = messages.id) FROM messages WHERE {filter} ORDER BY id DESC LIMIT ?"
+        "SELECT topic, sender, body, ts, mentions, id, (SELECT reply_to FROM replies r WHERE r.id = messages.id), \
+         EXISTS(SELECT 1 FROM bound b WHERE b.id = messages.id) FROM messages WHERE {filter} ORDER BY id DESC LIMIT ?"
     );
     let mut stmt = db.prepare(&sql)?;
     let rows = stmt.query_map(args, |r| {
@@ -384,6 +403,10 @@ fn messages<P: Params>(db: &Connection, filter: &str, args: P, seq: bool) -> rus
         }
         if let Some(parent) = r.get::<_, Option<String>>(6)? {
             entry.insert("reply_to".into(), parent.into());
+        }
+        // only bound messages say so: an old-form entry stays byte-identical to 0.3.1's
+        if r.get::<_, bool>(7)? {
+            entry.insert("sender".into(), "bound".into());
         }
         if seq {
             entry.insert("seq".into(), r.get::<_, i64>(5)?.into());
@@ -531,6 +554,51 @@ mod tests {
             ask(&mut h, r#"{"op": "ping", "version": true}"#, None),
             json!({"ok": true, "service": "historyd", "version": env!("CARGO_PKG_VERSION")})
         );
+    }
+
+    /// A sender-bound post (room/<r>/<from>) is stored under its normalised topic and served by the room op with
+    /// "sender": "bound"; an old-form post stores and serves no sender at all, byte-identical to 0.3.1.
+    #[test]
+    fn bound_senders_ride_beside_the_message() {
+        let dir = temp("bound");
+        let mut h = History::open(&dir.join("h.db"), 86400).ok().expect("opens");
+        let m = |from: &str, body: &str, ts: f64| json!({"from": from, "body": body, "ts": ts}).to_string();
+        h.record("room/r", m("a-1", "claimed", 1.0).as_bytes()).expect("records");
+        h.record("room/r/a-1", m("a-1", "bound", 2.0).as_bytes()).expect("records");
+        h.record("room/r/a-1", m("b-1", "spoofed", 3.0).as_bytes()).expect("records");
+        h.record("inbox/b-1/a-1", m("a-1", "bound dm", 4.0).as_bytes()).expect("records");
+        let room = ask(&mut h, r#"{"op": "room", "room": "r"}"#, None);
+        assert_eq!(
+            dumps(&room),
+            r#"{"ok": true, "messages": [{"topic": "room/r", "from": "a-1", "body": "claimed", "ts": 1.0}, {"topic": "room/r", "from": "a-1", "body": "bound", "ts": 2.0, "sender": "bound"}]}"#
+        );
+        let dms = ask(&mut h, r#"{"op": "dms", "as": "b-1"}"#, Some("b-1"));
+        assert_eq!(dms["messages"][0]["topic"], "inbox/b-1");
+        assert_eq!(dms["messages"][0]["sender"], "bound");
+        h.db.execute("DELETE FROM messages", []).expect("a rollback's prune");
+        History::forget_orphans(&h.db).expect("sweeps");
+        let marks: i64 = h.db.query_row("SELECT count(*) FROM bound", [], |r| r.get(0)).expect("counts");
+        assert_eq!(marks, 0, "no mark outlives its message");
+    }
+
+    /// Replies go to history/resp/<id>, or to history/resp/<addr>/<conn> only under the request topic's address.
+    #[test]
+    fn reply_topics_under_the_requesters_address() {
+        let dir = temp("resp");
+        let mut h = History::open(&dir.join("h.db"), 86400).ok().expect("opens");
+        let mut sent = Vec::new();
+        let req = br#"{"op": "ping"}"#;
+        for (topic, via) in [
+            ("history/resp/x", None),
+            ("history/resp/a-1/s", Some("a-1")),
+            ("history/resp/a-1/s", None),
+            ("history/resp/b-1/s", Some("a-1")),
+            ("history/resp/a-1/s/t", Some("a-1")),
+            ("history/resp/a-1/", Some("a-1")),
+        ] {
+            h.handle(&mut |o| sent.push(o.0), req, Some(topic), Some(b"c"), via);
+        }
+        assert_eq!(sent, ["history/resp/x", "history/resp/a-1/s"]);
     }
 
     /// reply_to rides in its own table: shown only when set and well formed, and never inherited by a later message

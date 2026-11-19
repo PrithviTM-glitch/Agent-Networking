@@ -13,6 +13,17 @@ HOSTS = {f"{h}:{PORT}" for h in ("localhost", "127.0.0.1")}
 ORIGINS = {f"http://{h}" for h in HOSTS}
 CONFIG = config.CONFIG_DIR
 TOKEN_FILE = os.path.join(CONFIG, "admin-token")
+ADMIN_CREDENTIALS = os.path.join(CONFIG, "admin.json")  # the broker's admin client, written by its first warn start
+
+
+def use_admin_credentials():
+    """Make this process's broker connections log in as admin, when auth is on: AGENT_BRIDGE_CREDENTIALS names
+    admin.json unless the operator set it already. The core never falls back to admin by itself (a command run outside
+    a session must not become admin's), so the console says so explicitly. Returns the file it set, or None."""
+    if "AGENT_BRIDGE_CREDENTIALS" in os.environ or not os.path.isfile(ADMIN_CREDENTIALS):
+        return None
+    os.environ["AGENT_BRIDGE_CREDENTIALS"] = ADMIN_CREDENTIALS
+    return ADMIN_CREDENTIALS
 
 
 def load_token():

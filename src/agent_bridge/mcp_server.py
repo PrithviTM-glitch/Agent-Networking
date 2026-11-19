@@ -543,6 +543,27 @@ def lease_history(resource: str, last: int = 50):
     return _ledger("lease_history", resource=resource, last=last)
 
 
+@tool("worktree_acquire", untrusted=True)
+def worktree_acquire(path: str, ttl: float | None = None, wait: float = 0):
+    """Take the write lease on the git worktree at path (any path inside it), so other agents' edits, writes and git
+    commands there are refused by the path guard and the ref guard while you hold it. It also git-locks the worktree,
+    and this session's relay renews the lease and releases it when the session ends. With wait, queue up to that many
+    seconds if someone else holds it; otherwise this fails naming the holder."""
+    return _native.worktree_acquire(_bus().addr, path, ttl=ttl, wait=wait)
+
+
+@tool("worktree_release")
+def worktree_release(path: str):
+    """Release your lease on the worktree at path, and its git lock."""
+    return _native.worktree_release(_bus().addr, path)
+
+
+@tool("worktree_status", untrusted=True)
+def worktree_status(path: str):
+    """Who holds the worktree at path, until when, and its git lock."""
+    return _native.worktree_status(path)
+
+
 @tool("claim", untrusted=True)
 def claim(room: str, key: str, ttl: float | None = None, note: str | None = None):
     """Claim a key in a room (an issue id, a question) so others see you are on it. Held until you unclaim it, its

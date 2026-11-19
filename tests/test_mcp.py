@@ -475,6 +475,40 @@ async def threads():
     cli("leave", outsider)
 
 
+async def worktree_tools():
+    """worktree_acquire takes the lease and git-locks the tree, worktree_status names the holder, a second agent is
+    refused naming them, and worktree_release unlocks."""
+    base = tempfile.mkdtemp()
+    main, lane = os.path.join(base, "main"), os.path.join(base, "lane")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+    who = ["-c", "user.name=t", "-c", "user.email=t@example.com"]
+    for args in (
+        ["init", "-q", "-b", "main", main],
+        ["-C", main, *who, "commit", "-q", "--allow-empty", "-m", "i"],
+        ["-C", main, "worktree", "add", "-q", lane, "-b", "lane"],
+    ):
+        subprocess.run(["git", *args], env=env, check=True, capture_output=True)
+    lane = os.path.realpath(lane)
+    async with server(str(uuid.uuid4()), "wta") as a, server(str(uuid.uuid4()), "wtb") as b:
+        me = (await call(a, "whoami"))["addr"]
+        got = await call(a, "worktree_acquire", path=os.path.join(lane, "."), ttl=120)
+        assert got["path"] == lane and got["git_lock"] is True, got
+        status = await call(b, "worktree_status", path=lane)
+        assert status["holder"] == me, status
+        assert me in await fails(b, "worktree_acquire", path=lane), "the refusal names the holder"
+        await call(a, "worktree_release", path=lane)
+        assert not (await call(b, "worktree_status", path=lane)).get("holder")
+        assert not os.path.exists(os.path.join(main, ".git", "worktrees", "lane", "locked")), "release unlocks it"
+        await call(a, "leave")
+        await call(b, "leave")
+    shutil.rmtree(base, ignore_errors=True)
+
+
+def test_worktree_tools():
+    anyio.run(worktree_tools)
+
+
 def test_threads():
     anyio.run(threads)
 

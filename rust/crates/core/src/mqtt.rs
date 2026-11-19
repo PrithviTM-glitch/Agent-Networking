@@ -4,13 +4,16 @@
 
 use bytes::{Bytes, BytesMut};
 use rumqttc::v5::mqttbytes::v5::{
-    ConnAck, Connect, ConnectProperties, ConnectReturnCode, Disconnect, DisconnectReasonCode, Filter, Packet, PingReq,
-    PubAck, Publish, PublishProperties, Subscribe, SubscribeReasonCode, UnsubAckReason, Unsubscribe,
+    ConnAck, Connect, ConnectProperties, ConnectReturnCode, Disconnect, DisconnectReasonCode, Filter, Login, Packet,
+    PingReq, PubAck, PubAckReason, Publish, PublishProperties, Subscribe, SubscribeReasonCode, UnsubAckReason,
+    Unsubscribe,
 };
 use rumqttc::v5::mqttbytes::{Error as CodecError, QoS};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -63,7 +66,59 @@ pub trait Handler: Send + Sync {
 
 pub enum DialError {
     Unreachable(io::Error),
+    /// Includes CONNACK 0x86 and 0x87: a refused username and password, or no anonymous access.
     NotAccepted,
+}
+
+/// The broker connection: TCP, or the unix socket config::socket() names.
+enum Stream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl Stream {
+    fn try_clone(&self) -> io::Result<Stream> {
+        Ok(match self {
+            Stream::Tcp(s) => Stream::Tcp(s.try_clone()?),
+            Stream::Unix(s) => Stream::Unix(s.try_clone()?),
+        })
+    }
+
+    fn shutdown(&self) {
+        let _ = match self {
+            Stream::Tcp(s) => s.shutdown(Shutdown::Both),
+            Stream::Unix(s) => s.shutdown(Shutdown::Both),
+        };
+    }
+
+    fn set_timeouts(&self, read: Duration, write: Duration) {
+        let _ = match self {
+            Stream::Tcp(s) => s.set_read_timeout(Some(read)).and(s.set_write_timeout(Some(write))),
+            Stream::Unix(s) => s.set_read_timeout(Some(read)).and(s.set_write_timeout(Some(write))),
+        };
+    }
+}
+
+impl Read for &Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => (&*s).read(buf),
+            Stream::Unix(s) => (&*s).read(buf),
+        }
+    }
+}
+
+impl Write for &Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => (&*s).write(buf),
+            Stream::Unix(s) => (&*s).write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -73,6 +128,7 @@ struct Inner {
     host: String,
     port: u16,
     opts: Options,
+    login: Option<Login>,
     handler: Arc<dyn Handler>,
     writer: Mutex<Writer>,
     state: Mutex<State>,
@@ -81,7 +137,7 @@ struct Inner {
 }
 
 struct Writer {
-    stream: Option<TcpStream>,
+    stream: Option<Stream>,
     last_sent: Instant,
 }
 
@@ -102,10 +158,12 @@ struct State {
     outgoing: VecDeque<Outgoing>,
     waiting: HashSet<u16>,
     acks: HashMap<u16, bool>,
+    /// Tracked publishes and subscribes the broker refused, by pkid, until wait_ack reports them.
+    refused: HashSet<u16>,
     ping_sent: Option<Instant>,
 }
 
-type Dialed = (TcpStream, ConnAck, BytesMut);
+type Dialed = (Stream, ConnAck, BytesMut);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -114,8 +172,19 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Conn {
     /// Connect now, then keep the connection in a reader thread.
     pub fn open(host: &str, port: u16, opts: Options, handler: Arc<dyn Handler>) -> Result<Conn, DialError> {
-        let first = dial(host, port, &opts)?;
-        let conn = Conn::new(host, port, opts, handler);
+        Conn::open_as(host, port, opts, None, handler)
+    }
+
+    /// Conn::open, logging in with login (username and password) when given.
+    pub fn open_as(
+        host: &str,
+        port: u16,
+        opts: Options,
+        login: Option<Login>,
+        handler: Arc<dyn Handler>,
+    ) -> Result<Conn, DialError> {
+        let first = dial(host, port, &opts, login.as_ref())?;
+        let conn = Conn::new(host, port, opts, login, handler);
         conn.spawn(Some(first)).map_err(DialError::Unreachable)?;
         if !conn.wait_up(TIMEOUT) {
             conn.close();
@@ -126,16 +195,28 @@ impl Conn {
 
     /// Connect in the background, retrying until the broker answers; for services that start before the broker.
     pub fn start(host: &str, port: u16, opts: Options, handler: Arc<dyn Handler>) -> io::Result<Conn> {
-        let conn = Conn::new(host, port, opts, handler);
+        Conn::start_as(host, port, opts, None, handler)
+    }
+
+    /// Conn::start, logging in with login when given.
+    pub fn start_as(
+        host: &str,
+        port: u16,
+        opts: Options,
+        login: Option<Login>,
+        handler: Arc<dyn Handler>,
+    ) -> io::Result<Conn> {
+        let conn = Conn::new(host, port, opts, login, handler);
         conn.spawn(None)?;
         Ok(conn)
     }
 
-    fn new(host: &str, port: u16, opts: Options, handler: Arc<dyn Handler>) -> Conn {
+    fn new(host: &str, port: u16, opts: Options, login: Option<Login>, handler: Arc<dyn Handler>) -> Conn {
         Conn(Arc::new(Inner {
             host: host.to_owned(),
             port,
             opts,
+            login,
             handler,
             writer: Mutex::new(Writer { stream: None, last_sent: Instant::now() }),
             state: Mutex::new(State {
@@ -149,6 +230,7 @@ impl Conn {
                 outgoing: VecDeque::new(),
                 waiting: HashSet::new(),
                 acks: HashMap::new(),
+                refused: HashSet::new(),
                 ping_sent: None,
             }),
             cv: Condvar::new(),
@@ -220,8 +302,14 @@ impl Conn {
         Ok(pkid)
     }
 
-    /// Whether the broker accepted the tracked request pkid, or None if no answer came within timeout.
+    /// Whether the broker accepted the tracked request pkid, or None if no answer came within timeout. false also
+    /// covers a refused publish or subscribe; wait_refused tells those apart.
     pub fn wait_ack(&self, pkid: u16, timeout: Duration) -> Option<bool> {
+        self.wait_refused(pkid, timeout).map(|r| r == Acked::Yes)
+    }
+
+    /// The broker's answer to the tracked request pkid, or None if none came within timeout.
+    pub fn wait_refused(&self, pkid: u16, timeout: Duration) -> Option<Acked> {
         let st = lock(&self.0.state);
         let (mut st, _) = self
             .0
@@ -232,7 +320,12 @@ impl Conn {
         if got.is_none() {
             st.waiting.remove(&pkid);
         }
-        got
+        let refused = st.refused.remove(&pkid);
+        got.map(|ok| match (ok, refused) {
+            (true, _) => Acked::Yes,
+            (false, true) => Acked::Refused,
+            (false, false) => Acked::No,
+        })
     }
 
     /// Ack a QoS 1 message, unless the connection it came on is gone (the broker then resends it, or never will).
@@ -327,7 +420,7 @@ impl Conn {
                 return None;
             }
             drop(st);
-            if let Ok(d) = dial(&self.0.host, self.0.port, &self.0.opts) {
+            if let Ok(d) = dial(&self.0.host, self.0.port, &self.0.opts, self.0.login.as_ref()) {
                 return Some(d);
             }
             delay = (delay * 2).clamp(Duration::from_secs(1), max.max(Duration::from_secs(1)));
@@ -336,7 +429,7 @@ impl Conn {
 
     /// false if the Conn was closed while it was redialling: the session it just took is let go at once, so a
     /// closed Conn never holds it against the client that owns it now.
-    fn attach(&self, stream: &TcpStream, ack: &ConnAck) -> bool {
+    fn attach(&self, stream: &Stream, ack: &ConnAck) -> bool {
         if let Ok(clone) = stream.try_clone() {
             let mut w = lock(&self.0.writer);
             w.stream = Some(clone);
@@ -374,7 +467,7 @@ impl Conn {
 
     fn detach(&self, reason: Option<u8>) {
         if let Some(s) = lock(&self.0.writer).stream.take() {
-            let _ = s.shutdown(Shutdown::Both);
+            s.shutdown();
         }
         {
             let mut st = lock(&self.0.state);
@@ -385,8 +478,8 @@ impl Conn {
         self.0.handler.disconnected(reason);
     }
 
-    fn read_loop(&self, stream: &mut TcpStream, mut buf: BytesMut) -> Option<u8> {
-        let _ = stream.set_read_timeout(Some(TICK));
+    fn read_loop(&self, stream: &mut Stream, mut buf: BytesMut) -> Option<u8> {
+        stream.set_timeouts(TICK, TIMEOUT);
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
             loop {
@@ -403,7 +496,7 @@ impl Conn {
                     Err(_) => return None,
                 }
             }
-            match stream.read(&mut chunk) {
+            match (&*stream).read(&mut chunk) {
                 Ok(0) => return None,
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
@@ -463,13 +556,20 @@ impl Conn {
                     st.in_flight -= 1;
                 }
                 if st.waiting.remove(&a.pkid) {
-                    st.acks.insert(a.pkid, true);
+                    let ok = matches!(a.reason, PubAckReason::Success | PubAckReason::NoMatchingSubscribers);
+                    if !ok {
+                        st.refused.insert(a.pkid);
+                    }
+                    st.acks.insert(a.pkid, ok);
                 }
                 self.flush(&mut st);
                 self.0.cv.notify_all();
             }
             Packet::SubAck(s) => {
                 let ok = s.return_codes.iter().all(|c| matches!(c, SubscribeReasonCode::Success(_)));
+                if s.return_codes.iter().any(|c| matches!(c, SubscribeReasonCode::NotAuthorized)) {
+                    lock(&self.0.state).refused.insert(s.pkid);
+                }
                 self.settle(s.pkid, ok);
             }
             Packet::UnsubAck(u) => {
@@ -508,12 +608,12 @@ fn short_disconnect(buf: &[u8]) -> Option<u8> {
 }
 
 /// End a connection cleanly: DISCONNECT, then shut the socket for every clone of it.
-fn disconnect(stream: &TcpStream) {
+fn disconnect(stream: &Stream) {
     let mut buf = BytesMut::new();
     if Packet::Disconnect(Disconnect::new(DisconnectReasonCode::NormalDisconnection)).write(&mut buf, None).is_ok() {
         let _ = (&*stream).write_all(&buf);
     }
-    let _ = stream.shutdown(Shutdown::Both);
+    stream.shutdown();
 }
 
 fn alloc(st: &mut State) -> u16 {
@@ -527,29 +627,49 @@ fn alloc(st: &mut State) -> u16 {
     }
 }
 
+/// The broker's answer to a tracked publish or subscribe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Acked {
+    Yes,
+    /// PUBACK or SUBACK "not authorized": the broker's ACL refused the topic.
+    Refused,
+    /// Any other failure code.
+    No,
+}
+
 pub fn filter(path: &str, qos1: bool, no_local: bool) -> Filter {
     let mut f = Filter::new(path, if qos1 { QoS::AtLeastOnce } else { QoS::AtMostOnce });
     f.nolocal = no_local;
     f
 }
 
-fn dial(host: &str, port: u16, opts: &Options) -> Result<Dialed, DialError> {
+fn dial_tcp(host: &str, port: u16) -> io::Result<Stream> {
     let mut last = io::Error::new(io::ErrorKind::NotFound, "no address to connect to");
-    let mut stream = None;
-    for addr in (host, port).to_socket_addrs().map_err(DialError::Unreachable)? {
+    for addr in (host, port).to_socket_addrs()? {
         match TcpStream::connect_timeout(&addr, TIMEOUT) {
             Ok(s) => {
-                stream = Some(s);
-                break;
+                // Without it every request/response round trip waits on Nagle plus delayed ACK (~40 ms each way).
+                let _ = s.set_nodelay(true);
+                return Ok(Stream::Tcp(s));
             }
             Err(e) => last = e,
         }
     }
-    let mut stream = stream.ok_or(DialError::Unreachable(last))?;
-    // Without it every request/response round trip waits on Nagle plus delayed ACK (~40 ms each way).
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(TIMEOUT));
-    let _ = stream.set_write_timeout(Some(TIMEOUT));
+    Err(last)
+}
+
+fn dial_unix(path: &Path) -> io::Result<Stream> {
+    UnixStream::connect(path).map(Stream::Unix)
+}
+
+/// The broker's unix socket when config::socket() names one, else TCP to host:port.
+fn dial(host: &str, port: u16, opts: &Options, login: Option<&Login>) -> Result<Dialed, DialError> {
+    let stream = match crate::config::socket() {
+        Some(path) => dial_unix(&path),
+        None => dial_tcp(host, port),
+    };
+    let stream = stream.map_err(DialError::Unreachable)?;
+    stream.set_timeouts(TIMEOUT, TIMEOUT);
     let properties = ConnectProperties {
         session_expiry_interval: (opts.expiry > 0).then_some(opts.expiry),
         receive_maximum: opts.receive_max,
@@ -562,8 +682,8 @@ fn dial(host: &str, port: u16, opts: &Options) -> Result<Dialed, DialError> {
         properties: Some(properties),
     };
     let mut buf = BytesMut::new();
-    Packet::Connect(connect, None, None).write(&mut buf, None).map_err(|_| DialError::NotAccepted)?;
-    stream.write_all(&buf).map_err(DialError::Unreachable)?;
+    Packet::Connect(connect, None, login.cloned()).write(&mut buf, None).map_err(|_| DialError::NotAccepted)?;
+    (&stream).write_all(&buf).map_err(DialError::Unreachable)?;
     buf.clear();
     let mut chunk = [0u8; 4096];
     loop {
@@ -572,7 +692,7 @@ fn dial(host: &str, port: u16, opts: &Options) -> Result<Dialed, DialError> {
             Err(CodecError::InsufficientBytes(_)) => {}
             _ => return Err(DialError::NotAccepted),
         }
-        match stream.read(&mut chunk) {
+        match (&stream).read(&mut chunk) {
             Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
             _ => return Err(DialError::NotAccepted),
         }

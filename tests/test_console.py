@@ -136,7 +136,11 @@ def agent(addr):
 def start_fake(path):
     """A fake claude: a copy of /bin/sh named claude, waiting on a sleep child. Not a copied sleep: coreutils that
     dispatch on argv[0] (uutils, as on Ubuntu 26.04) exit at once when the binary is called claude."""
-    p = subprocess.Popen([path, "-c", "sleep 600 & wait"])
+    # Default SIGINT for the fake whatever this run inherited: a shell background job starts with SIGINT ignored, and a
+    # non-interactive sh keeps a signal ignored on entry, so the console's "interrupt" would do nothing.
+    p = subprocess.Popen(
+        [path, "-c", "sleep 600 & wait"], preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL)
+    )
     procs.append(p)
     loose.extend(wait_for(lambda: children(p.pid)) or ())
     with open(f"/proc/{p.pid}/stat") as f:
@@ -282,7 +286,7 @@ def console(ledgerd, historyd, state_dir):
         state["mon"] = mon = subprocess.Popen([CONSOLE], env=env, stdout=subprocess.PIPE, stderr=err, text=True)
     mon.stdout.readline()
     login = mon.stdout.readline().strip()
-    assert login.startswith(f"login: http://127.0.0.1:{WEB}/#token="), login
+    assert login.startswith(f"login: http://localhost:{WEB}/#token="), login  # a security key needs a domain
     state["token"] = login.split("#token=")[1]
     assert wait_for(lambda: (a := agent("admin")) and a), "admin never joined the bus"
     yield
@@ -914,6 +918,146 @@ def test_admin_mentions():
     w.loop_stop()
 
 
+def git(*args, cwd=None):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+    p = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0, (args, p.stderr)
+    return p.stdout.strip()
+
+
+def scratch_repo(base):
+    """A repo with one commit and a linked worktree on its own branch: (main, lane)."""
+    main, lane = os.path.join(base, "main"), os.path.join(base, "lane")
+    git("init", "-q", "-b", "main", main)
+    git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init", cwd=main)
+    git("worktree", "add", "-q", lane, "-b", "lane", cwd=main)
+    return os.path.realpath(main), os.path.realpath(lane)
+
+
+def test_worktree_parts(tmp_path, monkeypatch):
+    """The Worktrees view's local facts, without a broker: a path's worktree root and common dir, the git lock reason
+    (only the ruled "agent-bridge lease <id> held by <addr>" names a holder), the resource id the CLI and hooks derive,
+    the path guard read from the settings files, and Protect / Unprotect chaining an existing hook in the effective
+    hooks dir (core.hooksPath honoured) and removing only its own."""
+    from agent_bridge.console import worktrees as wt
+
+    main, lane = scratch_repo(str(tmp_path))
+    os.makedirs(os.path.join(lane, "src", "deep"))
+    root, gitdir, common = wt.root_of(os.path.join(lane, "src", "deep"))
+    assert (root, common) == (lane, os.path.join(main, ".git")) and gitdir != common, (root, gitdir, common)
+    assert wt.root_of(main) == (main, os.path.join(main, ".git"), os.path.join(main, ".git"))
+    assert wt.root_of(str(tmp_path)) is None
+    assert wt.lock_of(gitdir, common) is None and wt.lock_of(common, common) is None, "unlocked; main can't lock"
+    git(
+        "worktree",
+        "lock",
+        "--reason",
+        "agent-bridge lease 3f9a01b2c4d5e6f7 held by sentry-logging-400c35",
+        lane,
+        cwd=main,
+    )
+    reason = wt.lock_of(gitdir, common)
+    assert wt.parse_lock(reason) == ("3f9a01b2c4d5e6f7", "sentry-logging-400c35"), reason
+    assert wt.parse_lock("someone's own lock") is None and wt.parse_lock("") is None and wt.parse_lock(None) is None
+    assert wt.wt_resource(lane) == "admin/wt-" + __import__("hashlib").sha256(lane.encode()).hexdigest()[:16]
+    assert wt.wt_resource(os.path.join(lane, "src", "..")) == wt.wt_resource(lane), "the realpath"
+    from agent_bridge.console import auth as console_auth
+    from agent_bridge.console import sessions as sess
+
+    creds = tmp_path / "admin.json"
+    monkeypatch.setattr(console_auth, "ADMIN_CREDENTIALS", str(creds))
+    # setenv first so monkeypatch records the variable (absent or not) and restores it at teardown: the helper
+    # below sets it in os.environ itself, and a leak would make every later native call use this test's file.
+    monkeypatch.setenv("AGENT_BRIDGE_CREDENTIALS", "unset")
+    monkeypatch.delenv("AGENT_BRIDGE_CREDENTIALS")
+    assert console_auth.use_admin_credentials() is None, "auth off: no admin.json, nothing set"
+    creds.write_text("{}")
+    assert console_auth.use_admin_credentials() == str(creds) and os.environ["AGENT_BRIDGE_CREDENTIALS"] == str(creds)
+    monkeypatch.setenv("AGENT_BRIDGE_CREDENTIALS", "/explicit.json")
+    assert console_auth.use_admin_credentials() is None and os.environ["AGENT_BRIDGE_CREDENTIALS"] == "/explicit.json"
+
+    assert sess.worktree_root(os.path.join(lane, "src", "deep")) == lane and sess.worktree_root(str(tmp_path)) is None
+
+    settings = tmp_path / "settings.json"
+    monkeypatch.setattr(wt, "SETTINGS", (str(settings),))
+    assert wt.guard() == {"installed": False, "where": []}
+    hook = {"type": "command", "command": "agent-bridge hook guard", "onFailure": "block"}
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash|Edit", "hooks": [hook]}]}}))
+    assert wt.guard() == {"installed": True, "where": [{"file": str(settings), "blocks_on_failure": True}]}
+    settings.write_text("not json")
+    assert wt.guard()["installed"] is False, "an unreadable file is skipped, not an error"
+
+    # Protect into the effective hooks dir: core.hooksPath (as husky sets it), chaining the hook already there.
+    hooks = os.path.join(main, ".husky")
+    os.makedirs(hooks)
+    git("config", "core.hooksPath", hooks, cwd=main)
+    theirs = os.path.join(hooks, wt.HOOK)
+    with open(theirs, "w") as f:
+        f.write('#!/bin/sh\necho theirs >> "$(dirname "$0")/ran"\n')
+    os.chmod(theirs, 0o755)
+    common_, result = wt.protect(lane)
+    assert common_ == os.path.join(main, ".git") and "chaining the existing hook" in result, result
+    with open(theirs) as f:
+        mine = f.read()
+    assert wt.MARKER in mine and " hook ref-guard " in mine and os.access(theirs, os.X_OK), mine
+    assert os.path.isfile(os.path.join(hooks, wt.CHAINED)), "theirs kept, renamed"
+    assert wt.protect(main)[1] == "already protected"
+    assert wt.protected(hooks) and wt.repo_paths(lane) == (os.path.join(main, ".git"), hooks)
+    with pytest.raises(wt.Refused, match="absolute"):
+        wt.protect("relative/path")
+    with pytest.raises(wt.Refused, match="not a git repository"):
+        wt.protect(str(tmp_path))
+    assert wt.unprotect(main)[1] == "unprotected, the earlier hook restored"
+    with open(theirs) as f:
+        assert "echo theirs" in f.read() and not os.path.exists(os.path.join(hooks, wt.CHAINED))
+    with pytest.raises(wt.Refused, match="not agent-bridge's"):
+        wt.unprotect(main)
+    os.remove(theirs)
+    with pytest.raises(wt.Refused, match="not protected"):
+        wt.unprotect(main)
+
+
+def test_worktrees_view():
+    """A leased worktree in the Worktrees view (holder, lease, the git lock it wrote, no drift), Protect this repo
+    installing the ref guard into the repo's hooks (a ref update in the leased worktree from another session is then
+    refused, one on an unleased branch passes), Unprotect, and release clearing the row and the lock."""
+    from agent_bridge.console import worktrees as wt
+
+    main, lane = scratch_repo(tempfile.mkdtemp(dir=TMP))
+    holder = _native.Bus.register("wt-holder", [], False)
+    try:
+        got = _native.worktree_acquire(holder.addr, lane, ttl=120)
+        assert got["path"] == lane and got["resource"] == wt.wt_resource(lane), got
+        rows = wait_for(lambda: [w for w in req("GET", "/api/worktrees")[1]["worktrees"] if w["path"] == lane])
+        [row] = rows
+        assert (row["holder"], row["drift"], row["protected"]) == (holder.addr, [], False), row
+        assert wt.parse_lock(row["lock"]) == (row["lease_id"], holder.addr), row["lock"]
+        assert row["branch"] == "lane" and row["repo"] == os.path.join(main, ".git"), row
+        view = req("GET", "/api/worktrees")[1]
+        assert view["guard"] == {"installed": False, "where": []}, "the fake HOME has no guard hook"
+
+        ok("/api/repo/protect", {"repo": lane})
+        [repo] = [r for r in req("GET", "/api/worktrees")[1]["repos"] if r["repo"] == os.path.join(main, ".git")]
+        assert repo["protected"] is True, repo
+        other = dict(CLAUDE_CODE_SESSION_ID=str(uuid.uuid4()))
+        commit = ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "x"]
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        blocked = subprocess.run(["git", *commit], cwd=lane, env={**env, **other}, capture_output=True, text=True)
+        assert blocked.returncode != 0 and "leased by" in blocked.stderr and holder.addr in blocked.stderr, blocked
+        git(*commit, cwd=main)  # the main branch isn't leased: the guard lets it through
+        ok("/api/repo/unprotect", {"repo": lane})
+        refused("/api/repo/unprotect", {"repo": lane}, "not protected")
+        refused("/api/repo/protect", {"repo": "relative"}, "absolute")
+    finally:
+        _native.worktree_release(holder.addr, lane)
+        holder.leave()
+    assert wait_for(lambda: not [w for w in req("GET", "/api/worktrees")[1]["worktrees"] if w["path"] == lane])
+    log = [json.loads(x) for x in open(os.path.join(DATA, "admin-audit.jsonl"))]
+    acts = [(e["action"], e["target"]) for e in log if e["action"].startswith("repo/")]
+    assert ("repo/protect", f"repo:{os.path.join(main, '.git')}") in acts and len(acts) >= 3, acts
+
+
 def test_claims_pins_replies():
     """0.3.1: the Claims view and admin release, the pinned message (set, shown, cleared, audited), replies sent
     from the console carrying reply_to, and an @admin mention reaching the console marked for_admin."""
@@ -928,9 +1072,11 @@ def test_claims_pins_replies():
         assert [(c["room"], c["key"], c["holder"], c["note"]) for c in rows if c["room"] == room] == [
             (room, "APP-9", asker.addr, "mine")
         ], rows
+        admin_ledger = "admin" in [x["owner"] for x in req("GET", "/api/ledger")[1]["ledgers"]]  # worktrees make one
         ok("/api/claims/release", {"room": room, "key": "APP-9"})
         assert not [c for c in req("GET", "/api/claims")[1]["claims"] if c["room"] == room]
-        assert "admin" not in [x["owner"] for x in req("GET", "/api/ledger")[1]["ledgers"]], "no admin ledger made"
+        after = "admin" in [x["owner"] for x in req("GET", "/api/ledger")[1]["ledgers"]]
+        assert after == admin_ledger, "releasing a claim creates no admin ledger"
         refused("/api/claims/release", {"room": room, "key": "APP-9"}, "no claim")
 
         ok("/api/room/pin", {"room": room, "text": "## digest\n!1 open"})
@@ -1248,6 +1394,7 @@ def test_metrics():
 
     build = {"version": agent_bridge.__version__, "native": _native.__version__}
     assert s["agent_bridge_console_build_info"] == [(build, 1.0)], "tokenless, one series"
+    assert s["agent_bridge_console_auth_mode"] == [({"mode": "off"}, 1.0)], "auth ships off"
     sids = [lab["session_id"] for lab, _ in s["agent_bridge_session"]]
     assert len(sids) == len(set(sids)), "one agent_bridge_session series per session"
     assert "hello room" not in text and "please look" not in text, "no message text in metrics"
@@ -1324,6 +1471,7 @@ def test_admin_cli():
 
     assert st["version"] == agent_bridge.__version__, st
     assert st["links"] == len(LINK_RULES), "the console loaded the rules file named by AGENT_BRIDGE_LINKS"
+    assert st["auth"] == "off" and req("GET", "/api/state")[1]["auth"] == "off", "auth ships off"
     assert req("GET", "/api/state")[1]["links"] == {"rules": LINK_RULES, "error": None}
     assert req("GET", "/links.js")[0] == 200, "the page loads links.js"
     assert req("GET", "/api/state")[1]["version"] == {

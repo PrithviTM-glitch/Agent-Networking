@@ -85,6 +85,7 @@ function go(v) {
   if (v.type === "agent") { S.tab = "overview"; S.profile = null; loadProfile(); loadCapacity(); loadUsage(); }
   if (v.type === "ledger") { S.ledger = null; loadLedger(); }
   if (v.type === "claims") { S.claims = null; loadClaims(); }
+  if (v.type === "worktrees") { S.worktrees = null; loadWorktrees(); }
   if (v.type === "inbox") markInboxRead();
   if (v.type === "kill" || v.type === "stop") {
     S.kill = {signal: "terminate", sessions: false, preview: null, results: null, selected: new Set()};
@@ -147,7 +148,14 @@ function renderNav() {
     const sub = [a.friendly === a.addr ? null : a.addr, a.alive && a.status].filter(Boolean).join(" · ");
     const d = item("agent:" + a.key, {type: "agent", key: a.key}, a.friendly, sub, dot);
     if (a.alive === false) d.classList.add("dead");
+    const peers = a.worktree && a.alive !== false ? shared[a.worktree] || 0 : 0;
+    if (peers > 1) {
+      const b = add(d, el("span", "badge warn", "⧉" + peers));
+      b.title = peers + " live sessions work in " + a.worktree + ". Take a lease (Worktrees) so they don't collide.";
+    }
   };
+  const shared = {};  // worktree -> live sessions in it, to flag two working in one tree (no lease needed)
+  for (const a of S.agents) if (a.worktree && a.alive !== false && (a.alive || a.on_bus)) shared[a.worktree] = (shared[a.worktree] || 0) + 1;
   const order = (x, y) => (y.alive === true) - (x.alive === true) || y.seen - x.seen;
   const onBus = S.agents.filter(a => a.on_bus).sort(order), off = S.agents.filter(a => !a.on_bus).sort(order);
   head("Agents on the bus (" + onBus.length + ")");
@@ -159,6 +167,7 @@ function renderNav() {
   item("leaks", {type: "leaks"}, "Leftovers");
   item("ledger", {type: "ledger"}, "Ledger");
   item("claims", {type: "claims"}, "Claims");
+  item("worktrees", {type: "worktrees"}, "Worktrees");
   item("audit", {type: "audit"}, "Audit log");
   nav.scrollTop = top;
 }
@@ -184,6 +193,7 @@ function setTitle(t1, t2, actions) {
 const LIVE = [
   {every: 5000, on: v => v.type === "ledger", load: () => loadLedger()},
   {every: 5000, on: v => v.type === "claims", load: () => loadClaims()},
+  {every: 5000, on: v => v.type === "worktrees", load: () => loadWorktrees()},
   {every: 3000, on: v => v.type === "capacity" || (v.type === "agent" && S.tab === "overview"), load: () => loadCapacity()},
   {every: 10000, on: v => v.type === "leaks", load: () => loadLeaks()},
   {every: 5000, on: v => v.type === "agent", load: () => loadProfile()},
@@ -226,6 +236,11 @@ function msgNode(m, tag, opts) {
   add(h, who);
   if (m.from && nameOf(m.from) !== m.from) add(h, el("span", "t mono", m.from));
   if (tag) add(h, el("span", "tag", label(chanOf(m))));
+  // History stores only "bound" (claimed is a reader-side marker), so a missing sender is a claimed one.
+  if (S.auth && S.auth !== "off" && m.from && m.sender !== "bound") {
+    const c = add(h, el("span", "tag claimed", "claimed"));
+    c.title = "The broker didn't bind this sender: it named itself in the message, so the name is not verified.";
+  }
   if (m.ts) add(h, el("span", "t", clock(m.ts)));
   if (o.reply && m.id) {
     const r = button("Reply", e => { e.stopPropagation(); startReply(m); });
@@ -642,6 +657,66 @@ function renderLedger() {
   }
   if (!d.resources.length) body.append(el("div", "empty", "No resources in any ledger."));
   body.append(table("Ledgers", ["Owner", "Since", "Last request"], d.ledgers.map(x => [x.owner, clock(x.since), ago(x.last_seen)])));
+  body.scrollTop = top;
+}
+
+// worktrees: leased git worktrees (ledgerd 0.3.2), the sessions in each, and protecting a repo with the ref guard
+
+async function loadWorktrees() {
+  let err = null;
+  try { S.worktrees = await api("/api/worktrees"); } catch (e) { S.worktrees = {error: err = e.message}; }
+  if (S.view.type === "worktrees") renderPane();
+  return err;
+}
+function renderWorktrees() {
+  const body = $("body"), top = body.scrollTop, d = S.worktrees;
+  $("compose").hidden = true;
+  setTitle("Worktrees", "Leased git worktrees, and worktrees two live sessions share");
+  body.replaceChildren();
+  if (!d) { body.append(el("div", "empty", "Loading…")); return; }
+  if (d.error && !d.worktrees) { body.append(el("div", "empty", d.error)); return; }
+  const g = d.guard || {}, card = el("div", "card");
+  card.append(el("h4", null, "Path guard (Claude Code PreToolUse hook)"));
+  card.append(el("div", "muted", g.installed
+    ? "Installed in " + g.where.map(w => w.file + (w.blocks_on_failure ? "" : " (a failure or timeout lets the call through: set onFailure \"block\", Claude Code 2.1.295+)")).join("; ")
+      + ". Files in a leased worktree: hook."
+    : "Not installed, so files in a leased worktree are a soft lock only. See the README's Worktree locks to install it."));
+  body.append(card);
+  if (d.error) body.append(el("div", "card", "Leases unavailable: " + d.error));
+  const files = g.installed ? "hook" : "soft";
+  const short = p => d.home && p && p.startsWith(d.home + "/") ? "~" + p.slice(d.home.length) : p;  // display only
+  if (!d.worktrees.length) body.append(el("div", "empty", "No leased worktrees, and none shared by two live sessions."));
+  else body.append(table("Worktrees", ["Path", "Branch", "Holder", "Expires", "Enforcement", "Sessions"], d.worktrees.map(w => {
+    const path = el("div", "mono wt", short(w.path));
+    path.title = w.path;
+    if (w.drift.length) path.append(el("div", "bad", "drift: " + w.drift.join("; ")));
+    if (w.lock !== null && w.lock !== undefined) path.append(el("div", "muted", "git lock: " + (w.lock || "(no reason)")));
+    const who = w.holder ? nameOf(w.holder) : el("span", "bad", "nobody: shared by " + w.sessions.length + " sessions");
+    const label = "files: " + files + " · history: " + (w.protected ? "hook" : "none");
+    const sess = el("div");
+    for (const s of w.sessions) {
+      const x = add(el("div", w.others.includes(s.key) ? "bad" : null), s.friendly);
+      if (w.others.includes(s.key)) x.title = "Works here without the lease";
+      sess.append(x);
+    }
+    return [path, w.branch || "—", who, w.expires_at ? ago(w.expires_at) : "—", label, sess];
+  })));
+  if (d.repos.length) body.append(table("Repos", ["Repo", "Ref guard", ""], d.repos.map(r => {
+    const state = r.error ? el("span", "bad", r.error) : r.protected ? "protected (history: hook)" : "not protected (history: none)";
+    const btn = r.protected
+      ? button("Unprotect", () => {
+        if (confirm("Remove agent-bridge's reference-transaction hook from " + r.hooks + "? A hook it chained is put back."))
+          act("/api/repo/unprotect", {repo: r.worktree}, "unprotect").then(loadWorktrees);
+      })
+      : button("Protect this repo", () => {
+        if (confirm("Write a reference-transaction hook into " + r.hooks + " that refuses ref updates in worktrees leased by "
+          + "someone else (agent-bridge hook ref-guard)? An existing hook there is kept and run first. Unprotect removes it."))
+          act("/api/repo/protect", {repo: r.worktree}, "protect").then(loadWorktrees);
+      });
+    const repo = el("span", "mono wt", short(r.repo));
+    repo.title = r.repo;
+    return [repo, state, r.error ? null : btn];
+  })));
   body.scrollTop = top;
 }
 
@@ -1078,6 +1153,7 @@ function renderPane(fresh) {
   else if (v.type === "agent") renderAgent();
   else if (v.type === "ledger") renderLedger();
   else if (v.type === "claims") renderClaims();
+  else if (v.type === "worktrees") renderWorktrees();
   else if (v.type === "inbox") renderInbox();
   else if (v.type === "kill") renderKill();
   else if (v.type === "roomset") renderRoomSettings();
@@ -1155,6 +1231,11 @@ async function loadState() {
   S.version = st.version || null;
   S.links = Links.compile(st.links && st.links.rules);
   if (st.version) { $("ver").textContent = "v" + st.version.package; $("ver").title = "native core " + st.version.native; }
+  S.auth = st.auth || "off";
+  $("auth").hidden = S.auth === "off";
+  $("auth").textContent = "auth: " + S.auth;
+  $("auth").title = S.auth === "warn" ? "Agents with credentials are bound to their address; the rest still connect anonymously."
+    : "Every client must authenticate; a sender is bound to its address.";
   S.jobs = Object.fromEntries(st.jobs.map(j => [j.id, j]));
   render(true);
 }

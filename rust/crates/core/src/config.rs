@@ -12,6 +12,44 @@ pub struct Config {
     pub stale_s: u64,
     pub state_dir: PathBuf,
     pub log: PathBuf,
+    pub auth: Auth,
+}
+
+/// The broker's authentication mode (docs/AUTH.md section 4.8): off is 0.3.1's anonymous bus; warn lets anonymous
+/// clients in while credentialed ones are checked; enforce refuses anonymous clients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Auth {
+    Off,
+    Warn,
+    Enforce,
+}
+
+impl Auth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Auth::Off => "off",
+            Auth::Warn => "warn",
+            Auth::Enforce => "enforce",
+        }
+    }
+
+    fn parse(raw: &str, source: &str) -> Result<Auth, String> {
+        match raw.trim() {
+            "off" => Ok(Auth::Off),
+            "warn" => Ok(Auth::Warn),
+            "enforce" => Ok(Auth::Enforce),
+            _ => Err(format!("{source} must be off, warn or enforce, got {}", py_repr(raw.trim()))),
+        }
+    }
+}
+
+/// An identity's broker login: username is its address (or a service's or admin's name), and client_id is the secret
+/// id its owning connection uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+    pub client_id: String,
 }
 
 /// The settings now; a bad AGENT_BRIDGE_PORT or AGENT_BRIDGE_STALE_DAYS is an error with a one-line message.
@@ -43,7 +81,91 @@ fn load() -> Result<Config, String> {
         stale_s: ((stale_days * 86400.0) as u64).max(1),
         state_dir,
         log,
+        auth: load_auth()?,
     })
+}
+
+/// AGENT_BRIDGE_AUTH (compose passes it to the services), else the auth-mode file the broker's entrypoint writes, else
+/// off.
+fn load_auth() -> Result<Auth, String> {
+    if let Ok(raw) = env::var("AGENT_BRIDGE_AUTH") {
+        return Auth::parse(&raw, "AGENT_BRIDGE_AUTH");
+    }
+    let path = config_dir().join("auth-mode");
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => Auth::parse(&raw, &path.display().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Auth::Off),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+/// The broker's authentication mode now.
+pub fn auth_mode() -> crate::Result<Auth> {
+    load_auth().map_err(Error)
+}
+
+/// addr's credentials: the AGENT_BRIDGE_CREDENTIALS file (a service's, mounted into its container) when its username
+/// is addr, else agents/<addr>.json in the config dir, or admin.json for "admin". None when there is no file; a file
+/// that is unreadable, malformed, or readable by anyone but its owner is an error naming it.
+pub fn credentials(addr: &str) -> crate::Result<Option<Credentials>> {
+    if let Some(path) = env::var_os("AGENT_BRIDGE_CREDENTIALS").filter(|v| !v.is_empty())
+        && let Some(c) = read_credentials(Path::new(&path))?.filter(|c| c.username == addr)
+    {
+        return Ok(Some(c));
+    }
+    let path = if addr == "admin" {
+        config_dir().join("admin.json")
+    } else {
+        crate::validation::check_ident(addr, "address")?;
+        config_dir().join("agents").join(format!("{addr}.json"))
+    };
+    read_credentials(&path)
+}
+
+fn read_credentials(path: &Path) -> crate::Result<Option<Credentials>> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error(format!("cannot read credentials {}: {e}", path.display()))),
+    };
+    if meta.mode() & 0o077 != 0 {
+        return Err(Error(format!(
+            "credentials {} are readable by others (mode {:o}); fix it with: chmod 600 {}",
+            path.display(),
+            meta.mode() & 0o777,
+            path.display()
+        )));
+    }
+    let raw = std::fs::read(path).map_err(|e| Error(format!("cannot read credentials {}: {e}", path.display())))?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap_or_default();
+    let field = |k: &str| value.get(k).and_then(serde_json::Value::as_str).map(str::to_owned);
+    match (field("username"), field("password"), field("client_id")) {
+        (Some(username), Some(password), Some(client_id)) => Ok(Some(Credentials { username, password, client_id })),
+        _ => Err(Error(format!(
+            "credentials {} are not JSON with string username, password and client_id",
+            path.display()
+        ))),
+    }
+}
+
+/// The broker's unix socket: AGENT_BRIDGE_SOCKET; else, unless AGENT_BRIDGE_HOST or AGENT_BRIDGE_PORT picks a TCP
+/// broker, socket_dir()/mqtt.sock when it exists (compose.auth.yaml). None means TCP.
+pub fn socket() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("AGENT_BRIDGE_SOCKET").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    if env::var_os("AGENT_BRIDGE_HOST").is_some() || env::var_os("AGENT_BRIDGE_PORT").is_some() {
+        return None;
+    }
+    let path = socket_dir().join("mqtt.sock");
+    std::os::unix::fs::FileTypeExt::is_socket(&std::fs::metadata(&path).ok()?.file_type()).then_some(path)
+}
+
+/// $XDG_STATE_HOME/agent-bridge/broker (default ~/.local/state/agent-bridge/broker), the broker's socket directory.
+/// Not $XDG_RUNTIME_DIR: that tmpfs is gone at boot, when Docker restarts the broker before anyone logs in.
+pub fn socket_dir() -> PathBuf {
+    xdg("XDG_STATE_HOME", ".local/state").join("broker")
 }
 
 /// $XDG_CONFIG_HOME/agent-bridge (default ~/.config/agent-bridge): the console's admin token; 0700 from the console.
@@ -117,6 +239,44 @@ fn denied(path: &Path, dir: &Path, owner: u32, me: u32) -> Error {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn auth_modes_parse_and_a_bad_one_names_its_source() {
+        assert_eq!(Auth::parse("warn\n", "f"), Ok(Auth::Warn), "the entrypoint's file ends in a newline");
+        assert_eq!(Auth::parse("enforce", "f"), Ok(Auth::Enforce));
+        assert_eq!(Auth::parse("off", "f").map(Auth::as_str), Ok("off"));
+        assert_eq!(
+            Auth::parse("on", "AGENT_BRIDGE_AUTH"),
+            Err("AGENT_BRIDGE_AUTH must be off, warn or enforce, got 'on'".into())
+        );
+    }
+
+    #[test]
+    fn credentials_files_must_be_private_and_complete() {
+        let dir = std::env::temp_dir().join(format!("agent-bridge-config-creds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("a.json");
+        assert_eq!(read_credentials(&path), Ok(None), "no file, no credentials");
+        let write = |body: &str, mode: u32| {
+            std::fs::write(&path, body).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        write(r#"{"username": "a", "password": "p", "client_id": "c", "session": "s"}"#, 0o600);
+        let want = Credentials { username: "a".into(), password: "p".into(), client_id: "c".into() };
+        assert_eq!(read_credentials(&path), Ok(Some(want)));
+        write(r#"{"username": "a", "password": "p", "client_id": "c"}"#, 0o640);
+        let p = path.display();
+        assert_eq!(
+            read_credentials(&path).unwrap_err().0,
+            format!("credentials {p} are readable by others (mode 640); fix it with: chmod 600 {p}")
+        );
+        write(r#"{"username": "a", "password": 5}"#, 0o600);
+        assert_eq!(
+            read_credentials(&path).unwrap_err().0,
+            format!("credentials {p} are not JSON with string username, password and client_id")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_unwritable_data_dir_says_how_to_fix_it() {

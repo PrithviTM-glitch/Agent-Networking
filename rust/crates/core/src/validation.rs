@@ -43,6 +43,18 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The broker's ACL refused a publish or subscribe: "not authorized to publish on <topic>" or "not authorized to
+/// subscribe to <topic>". is_refused tells it from other errors.
+pub fn refused(what: &str, topic: &str) -> Error {
+    Error(format!("{REFUSED}{what} {topic}"))
+}
+
+const REFUSED: &str = "not authorized to ";
+
+pub fn is_refused(e: &Error) -> bool {
+    e.0.starts_with(REFUSED)
+}
+
 pub fn fail<T>(message: impl Into<String>) -> Result<T> {
     Err(Error(message.into()))
 }

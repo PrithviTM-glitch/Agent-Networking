@@ -20,7 +20,7 @@ use agent_bridge::relay::{
 };
 use agent_bridge::stamp::stamp;
 use agent_bridge::validation::{ID_MAX, check_session, fail, is_ident, os_error};
-use agent_bridge::{Error, Result, claude, config, host, identity};
+use agent_bridge::{Error, Result, claude, config, host, identity, worktree};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::fs::{OpenOptions, TryLockError};
@@ -244,7 +244,11 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
     let mut down = false;
     let mut away: Option<Instant> = None;
     let mut upgrade = Upgrade::new(execed_at);
+    let mut leases = worktree::Renewer::default();
     while !DONE.load(Ordering::SeqCst) && alive() {
+        for line in leases.tick(&session) {
+            log(&me, &line);
+        }
         if arrived.wait(Duration::from_secs(1)) && !done_within(COALESCE, &alive) {
             arrived.clear();
         }
@@ -290,6 +294,12 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
                 false => log(&me, &format!("broker unreachable, retrying: {e}")),
             }
             done_within(RETRY, &alive);
+        }
+    }
+    // The session ended (not a stop or restart, which keep them for the next relay): its worktrees go back.
+    if !alive() {
+        for line in worktree::release_session(&session) {
+            log(&me, &line);
         }
     }
     bus.close();
