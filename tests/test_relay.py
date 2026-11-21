@@ -23,6 +23,7 @@ import pytest
 from conftest import BIN
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from waits import await_until, holds_for, wait_until
 
 from agent_bridge import _native, config
 
@@ -138,7 +139,8 @@ def session_claude(session=SESSION):
     )
     CLAUDES.append(p)
     t = time.monotonic()
-    assert p.stdout.readline().strip() == "hooked" and time.monotonic() - t < 5, "the hook returns at once"
+    # ceiling: a hook that waited on the relay would never return while the session runs
+    assert p.stdout.readline().strip() == "hooked" and time.monotonic() - t < 10, "the hook returns at once"
     until(lambda: _native.relay_live(session), what="relay start")
     return p
 
@@ -216,7 +218,8 @@ def test_relay(s):
     # Ack after write: with the inbox gone nothing is acked, through a relay restart, until the inbox is back.
     inbox.close()
     sender.dm(ADDR, "while the inbox is down")
-    time.sleep(3)
+    relay_log = config.data_path("relay", "relay.log")
+    wait_until(lambda: "not delivered, kept queued" in open(relay_log).read(), 30, "the relay to fail a post")
     assert _native.relay_stop(SESSION) and not _native.relay_live(SESSION), "SIGTERM stops it"
     end(claude)
     inbox.open()
@@ -361,10 +364,8 @@ async def notices_across_flip(sender):
         await collect(2)
         assert [m["params"]["meta"] for m in notes] == [{"waiting": str(n)}], notes
     assert [m["body"] for m in await tool("recv")] == ["one", "two"]
-    deadline = time.monotonic() + 10  # a closed connection's mqtt thread can take a few seconds to wind down
-    while threads() != before and time.monotonic() < deadline:
-        await anyio.sleep(0.1)
-    assert threads() == before, "the replaced Buses' threads are gone"
+    # a closed connection's mqtt thread can take a few seconds to wind down
+    await await_until(lambda: threads() == before, 10, "the replaced Buses' threads gone")
 
     await tool("leave")
     await proc.stdin.aclose()
@@ -417,8 +418,7 @@ def test_mentions_wake_only_the_mentioned(s):
         until(lambda: any(joined in p[1]["message"]["content"] for p in s.inbox.posts), what="the join notices' post")
         before = len(s.inbox.posts)
         s.sender.say(room, f"@{other.addr} just for other")
-        time.sleep(2.5)
-        assert len(s.inbox.posts) == before, "a mention of someone else does not wake this session"
+        holds_for(lambda: len(s.inbox.posts) == before, 2.5, "no post for a mention of someone else")
         s.sender.say(room, f"@{me} for you")
         until(lambda: len(s.inbox.posts) > before, what="the mention's post")
         lines = s.inbox.posts[-1][1]["message"]["content"].split("\n")

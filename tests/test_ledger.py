@@ -30,6 +30,7 @@ import pytest
 from conftest import BIN, LEDGERD
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
+from waits import holds_for, wait_until
 
 from agent_bridge import _native, config
 from agent_bridge.errors import LedgerError
@@ -254,12 +255,13 @@ def test_functional():
     call("request", b, resource=f"{a}/pubw", level="write")
     t = time.monotonic()
     got = call("acquire", b, resource=f"{a}/pubw", level="write", ttl=1, wait=5)["lease"]
-    assert 0.5 < time.monotonic() - t < 3, "expired lease handed to the waiter"
+    # only once the 1 s lease expired; a waiter never handed it would get busy after its own 5 s wait instead
+    assert time.monotonic() - t > 0.5, "expired lease handed to the waiter"
 
     # renew and release
     renewed = call("renew", b, lease_id=got["lease_id"], ttl=6)["lease"]
     assert renewed["expires_at"] > got["expires_at"]
-    time.sleep(1.2)
+    wait_until(lambda: time.time() > got["expires_at"] + 0.2, 10, "the first ttl to pass")
     assert err("acquire", a, resource=f"{a}/pubw", level="write")["error"] == "busy", "renew kept it past the first ttl"
     not_yours = f"lease {got['lease_id']} is not yours, {b} holds it"
     assert err("release", c, lease_id=got["lease_id"])["error"] == not_yours, "only holder or owner releases"
@@ -272,7 +274,8 @@ def test_functional():
     broken = f"{a} ended your write lease {stuck['lease_id']} on {a}/pubw"
     assert wait_for(lambda: any(m["body"] == broken for m in inbox.json(f"inbox/{b}"))), "and its holder is told"
     expiring = call("acquire", b, resource=f"{a}/pubw", level="write", ttl=1)["lease"]
-    time.sleep(1.3)
+    live = lambda: any(x["lease_id"] == expiring["lease_id"] for x in call("dump", "admin-0")["leases"])  # noqa: E731
+    wait_until(lambda: not live(), 30, "the 1 s lease to expire")
     assert "no such lease" in err("renew", b, lease_id=expiring["lease_id"])["error"], (
         "expired leases cannot be renewed"
     )
@@ -327,8 +330,7 @@ def test_restart():
     LD.wait()
     granted = background("grant", a, request_id=pend["id"], timeout=30)
     added = background("add", a, name="afterdown", timeout=30)
-    time.sleep(0.3)
-    assert "reply" not in granted and "reply" not in waiting
+    holds_for(lambda: "reply" not in granted and "reply" not in waiting, 0.3, "no reply while ledgerd is down")
     start_ledgerd()
     for x in (granted, added, waiting):
         x["thread"].join()
@@ -623,7 +625,8 @@ def test_waiters_that_leave():
     # a timeout shorter than the wait: busy just before the client gives up, and nothing queued afterwards
     t = time.monotonic()
     short = err("acquire", w, resource=res, level="write", ttl=600, wait=60, timeout=3)
-    assert short["error"] == "busy" and 1 < time.monotonic() - t < 3, short
+    # ceiling: the wait was 60 s; busy must come back near the client's 3 s timeout, never after the wait
+    assert short["error"] == "busy" and 1 < time.monotonic() - t < 10, short
     assert not call("dump", "admin-0")["waiters"]
 
     # SIGINT and SIGTERM withdraw the queued acquire, a chain of them included
@@ -799,26 +802,31 @@ def test_exec_runs_a_command_under_the_lease(tmp_path):
         assert p.returncode == 75 and f"busy, held by {o}" in p.stderr and "touch was not run" in p.stderr, p
         assert not ran.exists()
 
-        # lost it while running: the owner breaks the lease, the command gets SIGTERM, 75
-        trap = 'trap "echo stopped; exit 9" TERM; sleep 30 & wait'
+        # lost it while running: the owner breaks the lease, the command gets SIGTERM, 75. The shell says "ready" once
+        # its trap is set: a SIGTERM before that kills it untrapped, and its orphaned sleep holds stdout open.
+        trap = 'trap "echo stopped; exit 9" TERM; echo ready; sleep 30 & wait'
         proc = subprocess.Popen(
-            run("sh", "-c", trap, ttl="3", wait="10"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            run("sh", "-c", trap, ttl="3", wait="30"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
         call("release", o, lease_id=held["lease_id"])
-        assert wait_for(lambda: holders(res) == {h}, 10)
+        assert proc.stdout.readline() == "ready\n"
+        assert holders(res) == {h}
         mine = call("leases", h)["leases"][0]["lease_id"]
         call("release", o, lease_id=mine)
-        out, errs = proc.communicate(timeout=30)
+        out, errs = proc.communicate(timeout=60)
         assert proc.returncode == 75 and out == "stopped\n" and "ledger: lost the lease on" in errs, (out, errs)
 
         # a signal sent to agent-bridge reaches the command, whose status is returned; the lease is released
         proc = subprocess.Popen(
-            run("sh", "-c", 'trap "exit 7" TERM; sleep 30 & wait'), stderr=subprocess.PIPE, text=True
+            run("sh", "-c", 'trap "exit 7" TERM; echo ready; sleep 30 & wait'),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        assert wait_for(lambda: holders(res) == {h}, 10)
-        time.sleep(0.3)  # the shell has set its trap
+        assert proc.stdout.readline() == "ready\n", "the shell has set its trap"
+        assert holders(res) == {h}
         proc.send_signal(signal.SIGTERM)
-        assert proc.wait(15) == 7 and wait_for(lambda: not holders(res), 5)
+        assert proc.wait(60) == 7 and wait_for(lambda: not holders(res), 30)
 
         # killed by a signal: 128+n; not startable: 127, released
         p = subprocess.run(run("sh", "-c", "kill -9 $$"), capture_output=True, text=True, timeout=60)
@@ -1156,6 +1164,29 @@ def test_auth_modes(tmp_path, monkeypatch):
     LD.terminate()
     LD.wait()
     start_ledgerd("after-auth.db")
+
+
+def test_the_model_replays_against_ledgerd():
+    """specs/ledger: random behaviours of the ledger model (LedgerReplay.cfg, the untimed part of Ledger.tla) replayed
+    against this ledgerd over raw MQTT. Every reply, redelivery replay, holder, fencing token and waiter must be the
+    model's, with ledgerd restarted every 7th delivery."""
+    global LD
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "specs" / "ledger"))
+    import replay
+
+    LD.terminate()
+    LD.wait()
+    start_ledgerd("replay.db")
+
+    def restart():
+        global LD
+        LD.terminate()
+        LD.wait()
+        start_ledgerd("replay.db")
+
+    done = replay.replay(config.HOST, config.PORT, n=30, seed=1, restart=restart, restart_every=7)
+    assert done["walks"] == 30 and done["redeliveries"] > 50 and done["restarts"] > 10, done
+    alive()
 
 
 def test_stale():

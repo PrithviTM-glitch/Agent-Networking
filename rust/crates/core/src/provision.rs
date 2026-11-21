@@ -90,12 +90,10 @@ fn exists(error: &str) -> bool {
     error.contains("already exists") || error.contains("already in")
 }
 
-/// An address register makes: <name>-<6 hex> (a new agent) or <name>-<8 hex> (a session's own, shared by its relay
-/// and MCP server). Provisioning makes no other, so never admin, a service or a name chosen to look like one.
-fn provisionable(addr: &str) -> bool {
-    addr.rsplit_once('-').is_some_and(|(name, hex)| {
-        !name.is_empty() && matches!(hex.len(), 6 | 8) && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
+/// An address register makes (address::Address): provisioning makes no other, so never admin, a service or a name
+/// chosen to look like one.
+pub fn provisionable(addr: &str) -> bool {
+    crate::address::Address::parse(addr).is_some()
 }
 
 #[derive(Default)]
@@ -162,20 +160,89 @@ pub fn bound_session(addr: &str) -> Option<String> {
 /// - an agent's file only when it isn't bound to another session (check_own; that refusal is the error);
 /// - otherwise None: anonymous.
 pub fn credentials_for(addr: &str) -> Result<Option<Credentials>> {
-    if addr == crate::validation::ADMIN {
-        return Ok(explicit().filter(|c| c.username == addr));
-    }
-    let Some(c) = config::credentials(addr)? else { return Ok(None) };
-    check_own(addr)?;
-    Ok(Some(c))
+    decide(addr, &Facts::of(addr)?)
 }
 
-/// The AGENT_BRIDGE_CREDENTIALS file's credentials, whoever they name.
+/// What credentials_for decides from.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Facts {
+    /// The AGENT_BRIDGE_CREDENTIALS file's credentials, whoever they name.
+    pub explicit: Option<Credentials>,
+    /// addr's own credentials file (never admin.json: that one counts only through the variable).
+    pub own: Option<Credentials>,
+    /// The session that file binds addr to.
+    pub bound: Option<String>,
+    /// This process's session.
+    pub session: Option<String>,
+}
+
+impl Facts {
+    /// The facts for addr now, from the environment and the files; a file that is unreadable, malformed or too open
+    /// is an error.
+    #[expect(clippy::disallowed_methods, reason = "the one rule's own read of addr's file; decide applies the rules")]
+    pub fn of(addr: &str) -> Result<Facts> {
+        let admin = addr == crate::validation::ADMIN;
+        Ok(Facts {
+            explicit: config::explicit_credentials()?,
+            own: if admin { None } else { config::credentials_file(addr)? },
+            bound: if admin { None } else { bound_session(addr) },
+            session: host::current().session(),
+        })
+    }
+}
+
+/// The rule itself, a pure function: admin's credentials only when the variable names admin; an agent's (its file, or
+/// the variable's when it names that agent) unless the file binds it to another session than this one; else None.
+pub fn decide(addr: &str, f: &Facts) -> Result<Option<Credentials>> {
+    let user = f.explicit.as_ref().map(|c| c.username.as_bytes());
+    let bound = f.bound.as_deref().map(str::as_bytes);
+    let session = f.session.as_deref().map(str::as_bytes);
+    match choose(addr.as_bytes(), user, f.own.is_some(), bound, session) {
+        Choice::Explicit => Ok(f.explicit.clone()),
+        Choice::Own => Ok(f.own.clone()),
+        Choice::Nothing => Ok(None),
+        Choice::NotYours => Err(not_yours(addr)),
+    }
+}
+
+/// Which credentials decide hands out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Choice {
+    /// the AGENT_BRIDGE_CREDENTIALS file's
+    Explicit,
+    /// addr's own file's
+    Own,
+    /// none: anonymous
+    Nothing,
+    /// "not your agent": addr's file binds it to another session
+    NotYours,
+}
+
+/// decide's rule on bytes alone, with no allocation, so a Kani proof covers it whole: user is the variable's
+/// username, bound the session addr's file binds it to, session this process's.
+pub fn choose(addr: &[u8], user: Option<&[u8]>, has_own: bool, bound: Option<&[u8]>, session: Option<&[u8]>) -> Choice {
+    let named = user == Some(addr);
+    if addr == crate::validation::ADMIN.as_bytes() {
+        return if named { Choice::Explicit } else { Choice::Nothing };
+    }
+    if !named && !has_own {
+        return Choice::Nothing;
+    }
+    if let (Some(bound), Some(mine)) = (bound, session)
+        && !bound.eq_ignore_ascii_case(mine)
+    {
+        return Choice::NotYours;
+    }
+    if named { Choice::Explicit } else { Choice::Own }
+}
+
+fn not_yours(addr: &str) -> Error {
+    Error(format!("agent-bridge: {addr} is not your agent (bound to another session)"))
+}
+
+/// The AGENT_BRIDGE_CREDENTIALS file's credentials, whoever they name; None also when the file is unusable.
 fn explicit() -> Option<Credentials> {
-    let path = std::env::var_os("AGENT_BRIDGE_CREDENTIALS").filter(|v| !v.is_empty())?;
-    let raw = std::fs::read(&path).ok()?;
-    let name = serde_json::from_slice::<Value>(&raw).ok()?.get("username")?.as_str()?.to_owned();
-    config::credentials(&name).ok().flatten()
+    config::explicit_credentials().ok().flatten()
 }
 
 /// The credentials a helper connection logs in with: credentials_for(addr) when the caller knows its address; else
@@ -194,7 +261,7 @@ fn session_credentials() -> Option<Credentials> {
     if let Some(addr) = crate::relay::held(&session)
         && bound_session(&addr).is_some_and(|s| s.eq_ignore_ascii_case(&session))
     {
-        return config::credentials(&addr).ok().flatten();
+        return credentials_for(&addr).ok().flatten();
     }
     let mut bound: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(agents_dir())
         .ok()?
@@ -208,7 +275,7 @@ fn session_credentials() -> Option<Credentials> {
         })
         .collect();
     bound.sort();
-    config::credentials(&bound.pop()?.1).ok().flatten()
+    credentials_for(&bound.pop()?.1).ok().flatten()
 }
 
 /// The CLI's own-session rule: inside a session, acting as an agent whose credentials bind it to another session is
@@ -218,7 +285,7 @@ pub fn check_own(addr: &str) -> Result<()> {
     if bound.eq_ignore_ascii_case(&mine) {
         return Ok(());
     }
-    Err(Error(format!("agent-bridge: {addr} is not your agent (bound to another session)")))
+    Err(not_yours(addr))
 }
 
 /// addr's credentials, made on first use when the broker runs auth (admin.json exists): Ok(None) under auth off, and
@@ -231,7 +298,9 @@ pub fn ensure(addr: &str, session: Option<&str>) -> Result<Option<Credentials>> 
         return Ok(Some(c));
     }
     // Provisioning is the one use of admin.json from disk (AUTH.md decision 5): it only creates addr's own client.
-    let Some(admin) = config::credentials(crate::validation::ADMIN)? else { return Ok(None) };
+    #[expect(clippy::disallowed_methods, reason = "AUTH.md decision 5: provisioning, create-only, uses admin.json")]
+    let admin = config::credentials(crate::validation::ADMIN)?;
+    let Some(admin) = admin else { return Ok(None) };
     // anything else stays anonymous: under warn it keeps working, under enforce the broker refuses it, and doctor
     // lists it
     if !provisionable(addr) {
@@ -276,9 +345,93 @@ fn write(addr: &str, c: &Credentials, session: Option<&str>) -> Result<()> {
     std::fs::rename(&tmp, &path).map_err(|e| config::data_error(&e, &path))
 }
 
+/// Kani (scripts/verify-kani.sh): decide over symbolic choices of every input.
+/// Kani (scripts/verify-kani.sh): choose over every byte string up to its bound, no heap.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Up to N bytes of any value.
+    fn any_bytes<const N: usize>(bytes: &[u8; N]) -> &[u8] {
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        &bytes[..len]
+    }
+
+    /// admin's credentials iff "admin" was asked for and the variable names admin; the variable's credentials only
+    /// when they name the address asked for; "not your agent" only for an agent bound to another session.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn decide_gives_admin_iff_the_variable_names_it() {
+        let (a, u, b, m): ([u8; 5], [u8; 5], [u8; 2], [u8; 2]) = (kani::any(), kani::any(), kani::any(), kani::any());
+        let addr = any_bytes(&a);
+        let user = kani::any::<bool>().then(|| any_bytes(&u));
+        let bound = kani::any::<bool>().then(|| any_bytes(&b));
+        let session = kani::any::<bool>().then(|| any_bytes(&m));
+        let admin = addr == b"admin";
+        let choice = choose(addr, user, kani::any(), bound, session);
+        assert!((admin && choice == Choice::Explicit) == (admin && user == Some(b"admin".as_slice())));
+        if admin {
+            assert!(matches!(choice, Choice::Explicit | Choice::Nothing));
+        }
+        if choice == Choice::Explicit {
+            assert!(user == Some(addr));
+        }
+        if choice == Choice::NotYours {
+            assert!(!admin);
+            assert!(matches!((bound, session), (Some(x), Some(y)) if !x.eq_ignore_ascii_case(y)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// credentials_for's rule over every combination of its inputs: the address asked for, what the variable names,
+    /// whether the address has its own file, the session that file binds it to, and this process's session.
+    /// Invariant: admin's credentials iff "admin" was asked for and the variable names admin; an agent's only its own
+    /// (by username); "not your agent" iff it has credentials and a binding to a session other than this one.
+    #[test]
+    fn credentials_for_decides_admin_iff_the_variable_names_it() {
+        let creds = |u: &str| Credentials { username: u.into(), password: format!("{u}-pw"), client_id: "c".into() };
+        let (s1, s2) = ("11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222");
+        let mut cases = 0;
+        for addr in ["admin", "al-a1b2c3", "ledgerd", "ADMIN"] {
+            for explicit in [None, Some("admin"), Some("ledgerd"), Some("al-a1b2c3")] {
+                for own in [false, true] {
+                    for bound in [None, Some(s1), Some(s2)] {
+                        for session in [None, Some(s1), Some(s2.to_uppercase()).as_deref()] {
+                            let facts = Facts {
+                                explicit: explicit.map(creds),
+                                own: (own && addr != "admin").then(|| creds(addr)),
+                                bound: bound.map(str::to_owned),
+                                session: session.map(str::to_owned),
+                            };
+                            let got = decide(addr, &facts);
+                            let has = explicit == Some(addr) || facts.own.is_some();
+                            let other_session =
+                                matches!((bound, session), (Some(b), Some(m)) if !b.eq_ignore_ascii_case(m));
+                            let case = format!("{addr} {facts:?} -> {got:?}");
+                            let admin = matches!(&got, Ok(Some(c)) if c.username == "admin");
+                            assert_eq!(admin, addr == "admin" && explicit == Some("admin"), "{case}");
+                            if let Ok(Some(c)) = &got {
+                                assert_eq!(c.username, addr, "only its own credentials: {case}");
+                            }
+                            if addr == "admin" {
+                                assert!(got.is_ok(), "admin is never 'not your agent': {case}");
+                            } else {
+                                assert_eq!(got.is_err(), has && other_session, "{case}");
+                                assert_eq!(matches!(got, Ok(Some(_))), has && !other_session, "{case}");
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 4 * 4 * 2 * 3 * 3);
+    }
 
     #[test]
     fn only_register_made_addresses_are_provisioned() {

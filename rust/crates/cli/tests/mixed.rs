@@ -4,6 +4,11 @@
 //! behaviour. Needs Docker, so it is ignored by default: cargo test --workspace -- --ignored (which also builds the
 //! services next to agent-bridge; AGENT_BRIDGE_LEDGERD and AGENT_BRIDGE_HISTORYD name others).
 
+#![allow(
+    clippy::let_underscore_must_use,
+    reason = "best-effort cleanup: killing, waiting for and removing what the test started"
+)]
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -224,11 +229,35 @@ fn relayed_by(w: &World, session: &str, exe: &Path) -> (Killed, i32) {
     relayed_with(w, session, exe, &[])
 }
 
+/// Puts a copy of the executable src at dst with a `cp` of its own, so this process never holds a write fd to an
+/// executable. Another test thread that forks while fs::copy has dst open would carry that fd until its child execs,
+/// and an exec of dst meanwhile fails with ETXTBSY ("Text file busy", rust-lang/rust#114554). The relay's re-exec,
+/// the fake claude's `relay start` and git's hooks exec these files out of this test's hands, so the fd must never
+/// exist here, not only be retried around.
+fn install(src: &Path, dst: &Path) {
+    let out = Command::new("cp").arg(src).arg(dst).output().expect("cp runs");
+    assert!(out.status.success(), "cp {} {}: {}", src.display(), dst.display(), String::from_utf8_lossy(&out.stderr));
+}
+
+/// c spawned, retrying while its executable is busy (ETXTBSY) for up to 5 s, then failing with what it was.
+fn spawn_busy_retry(c: &mut Command, what: &str) -> Child {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match c.spawn() {
+            Ok(child) => return child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            Err(e) => panic!("{what}: {e}"),
+        }
+    }
+}
+
 /// relayed_by, with extra environment for the fake claude and so for its relay.
 fn relayed_with(w: &World, session: &str, exe: &Path, env: &[(&str, &str)]) -> (Killed, i32) {
     let claude = w.dir.join("claude");
     if !claude.exists() {
-        std::fs::copy("/bin/sh", &claude).expect("a fake claude");
+        install(Path::new("/bin/sh"), &claude);
     }
     let mut fake = w.cmd(&claude);
     fake.args(["-c", &format!("{} relay start; while read -r c; do eval \"$c\"; done", exe.display())])
@@ -236,7 +265,7 @@ fn relayed_with(w: &World, session: &str, exe: &Path, env: &[(&str, &str)]) -> (
         .env("CLAUDE_CODE_MESSAGING_SOCKET", w.dir.join("inbox.sock"))
         .envs(env.iter().copied())
         .stdin(Stdio::piped());
-    let fake = Killed(fake.spawn().expect("the fake claude runs"));
+    let fake = Killed(spawn_busy_retry(&mut fake, "the fake claude runs"));
     let lock = w.dir.join("relay").join(format!("{session}.lock"));
     let deadline = Instant::now() + Duration::from_secs(10);
     let live = || {
@@ -341,7 +370,7 @@ fn doctor_and_relay_restart_see_what_a_relay_runs() {
     // an "old install": a copy of the binary, which the upgrade then deletes
     let old = w.dir.join("old").join("agent-bridge");
     std::fs::create_dir_all(old.parent().expect("a dir")).expect("a dir");
-    std::fs::copy(RUST, &old).expect("a copy");
+    install(Path::new(RUST), &old);
     let (mut fake, first) = relayed_by(&w, session, &old);
     let status = json_lines(&w.run(&["relay", "status", "--session", session]).stdout).remove(0);
     assert_eq!(status["pid"], first);
@@ -408,12 +437,12 @@ fn a_relay_restarts_itself_on_an_upgraded_binary() {
     let session = "c3d4e5f6-0718-4293-a4b5-c6d7e8f90a1b";
     let bin = w.dir.join("tool").join("agent-bridge");
     std::fs::create_dir_all(bin.parent().expect("a dir")).expect("a dir");
-    std::fs::copy(RUST, &bin).expect("the installed binary");
+    install(Path::new(RUST), &bin);
     let (_fake, pid) = relayed_with(&w, session, &bin, &[("AGENT_BRIDGE_RELAY_UPGRADE_CHECK", "1")]);
     let status = || json_lines(&w.run(&["relay", "status", "--session", session]).stdout).remove(0);
     // the upgrade: a new file at the same path, as uv tool install --force leaves it
     std::fs::remove_file(&bin).expect("the old binary goes");
-    std::fs::copy(RUST, &bin).expect("the new binary");
+    install(Path::new(RUST), &bin);
     let deadline = Instant::now() + Duration::from_secs(10);
     while !relay_log(&w).contains("changed less than 30 s ago") {
         assert!(Instant::now() < deadline, "the relay never noticed the fresh binary\n{}", relay_log(&w));
@@ -613,7 +642,7 @@ fn a_relay_survives_a_failed_restart() {
     let session = "d4e5f6a7-b8c9-40d1-82e3-f4a5b6c7d8e9";
     let bin = w.dir.join("tool").join("agent-bridge");
     std::fs::create_dir_all(bin.parent().expect("a dir")).expect("a dir");
-    std::fs::copy(RUST, &bin).expect("the installed binary");
+    install(Path::new(RUST), &bin);
     let env = [("AGENT_BRIDGE_RELAY_UPGRADE_CHECK", "1"), ("AGENT_BRIDGE_RELAY_EXEC_AS", "/nowhere/agent-bridge")];
     let (_fake, pid) = relayed_with(&w, session, &bin, &env);
     let addr = std::fs::read_to_string(w.dir.join("relay").join(format!("{session}.lock")))
@@ -621,7 +650,7 @@ fn a_relay_survives_a_failed_restart() {
         .and_then(|t| t.lines().nth(1).map(str::to_owned))
         .expect("the relay's address");
     std::fs::remove_file(&bin).expect("the old binary goes");
-    std::fs::copy(RUST, &bin).expect("the new binary");
+    install(Path::new(RUST), &bin);
     assert!(Command::new("touch").args(["-d", "-1 minute"]).arg(&bin).status().expect("touch").success());
     let deadline = Instant::now() + Duration::from_secs(15);
     while !relay_log(&w).contains("still running on the old image") {
@@ -707,8 +736,11 @@ fn worktree_locks_from_the_shell_and_the_relay() {
 
     // the ref guard, as git's reference-transaction hook of this repository
     let hook = main.join(".git/hooks/reference-transaction");
-    std::fs::write(&hook, format!("#!/bin/sh\nexec {RUST} hook ref-guard \"$@\"\n")).expect("the hook");
-    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
+    // written beside it and installed by cp, so no write fd to the hook git execs is ever open here
+    let draft = w.dir.join("reference-transaction.draft");
+    std::fs::write(&draft, format!("#!/bin/sh\nexec {RUST} hook ref-guard \"$@\"\n")).expect("the hook");
+    std::fs::set_permissions(&draft, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
+    install(&draft, &hook);
     let commit = |session: Option<&str>, dir: &Path| {
         let mut c = w.cmd(Path::new("git"));
         c.args(["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "x"])

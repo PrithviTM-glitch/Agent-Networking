@@ -10,12 +10,14 @@ struct Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        #[allow(clippy::let_underscore_must_use, reason = "cleanup: a leftover scratch dir is harmless")]
         let _ = fs::remove_dir_all(&self.base);
     }
 }
 
 fn fixture(name: &str) -> Fixture {
     let base = std::env::temp_dir().join(format!("guard-{name}-{}", std::process::id()));
+    #[allow(clippy::let_underscore_must_use, reason = "a leftover from an earlier run, usually none")]
     let _ = fs::remove_dir_all(&base);
     let git = base.join("repo/.git");
     fs::create_dir_all(git.join("worktrees/lane")).unwrap();
@@ -255,4 +257,48 @@ fn hook_output() {
     assert_eq!((allow.code, allow.stderr.as_str(), allow.stdout.as_str()), (0, "", ""));
     let ids = worktree_resource(Path::new("/home/u/wt"));
     assert!(ids.starts_with("admin/wt-") && ids.len() == "admin/wt-".len() + 16);
+}
+
+#[test]
+fn the_last_known_file_never_loses_a_recorded_lease() {
+    let f = fixture("known");
+    let path = f.base.join("guard-locks.json");
+    let lane = lane_lock(&f, "other-1");
+    let ids = |p: &Path| recalled_in(p).1.into_iter().map(|l| l.lease_id).collect::<Vec<_>>();
+    // a lookup queried before the grant writes after the acquire recorded it: the lease stays (WorktreeLock.tla)
+    let asked_at = now() - 1.0;
+    record_in(&path, &lane).unwrap();
+    remember_in(&path, &[], asked_at).unwrap();
+    assert_eq!(ids(&path), ["a1b2c3d4e5f60718"], "recorded after the query: kept");
+    // a lookup queried after the record is authoritative: a lease ledgerd no longer lists is dropped
+    remember_in(&path, &[], now() + 1.0).unwrap();
+    assert!(ids(&path).is_empty(), "older than the query and not listed: gone");
+    // record is add-only and replaces only the same worktree; forget drops only its lease
+    let mut other = lane_lock(&f, "other-2");
+    other.root = f.base.join("free");
+    other.resource = worktree_resource(&other.root);
+    other.lease_id = "ffffffffffffffff".into();
+    record_in(&path, &lane).unwrap();
+    record_in(&path, &other).unwrap();
+    let mut again = lane.clone();
+    again.lease_id = "0000000000000001".into();
+    record_in(&path, &again).unwrap();
+    assert_eq!(ids(&path), ["ffffffffffffffff", "0000000000000001"]);
+    forget_in(&path, "ffffffffffffffff").unwrap();
+    assert_eq!(ids(&path), ["0000000000000001"]);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    // concurrent records from many threads: none lost (read-modify-write under the flock)
+    let handles: Vec<_> = (0..16)
+        .map(|i| {
+            let (path, mut l) = (path.clone(), lane.clone());
+            std::thread::spawn(move || {
+                l.root = PathBuf::from(format!("/wt/{i}"));
+                l.lease_id = format!("{i:016x}");
+                record_in(&path, &l).unwrap();
+            })
+        })
+        .collect();
+    handles.into_iter().for_each(|h| h.join().unwrap());
+    assert_eq!(read_locks(&path).1.len(), 17);
 }

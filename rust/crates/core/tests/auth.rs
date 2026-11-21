@@ -3,6 +3,15 @@
 //! whose literal topics refuse another agent's sender level, inbox and reply topics; the unix socket works; enforce
 //! refuses anonymous clients and keeps credentialed ones. Needs Docker: cargo test -p agent-bridge-core -- --ignored.
 
+#![allow(
+    clippy::let_underscore_must_use,
+    reason = "best-effort cleanup: killing, waiting for and removing what the test started"
+)]
+#![expect(clippy::disallowed_methods, reason = "the test checks the credential files directly")]
+
+#[path = "common/bins.rs"]
+mod bins;
+
 use agent_bridge::broker::{self, Ignore};
 use agent_bridge::bus::Bus;
 use agent_bridge::config::{self, Auth, Credentials};
@@ -11,7 +20,7 @@ use agent_bridge::{presence, provision, rooms};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct World {
@@ -70,6 +79,29 @@ impl World {
     }
 }
 
+/// A child process killed when the test ends, failed assertions included.
+struct Killed(std::process::Child);
+
+impl Killed {
+    fn wait_with_output_stderr(&mut self) -> String {
+        let mut text = String::new();
+        if let Some(mut err) = self.0.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut err, &mut text);
+        }
+        text
+    }
+}
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Both tests here set the process environment: one at a time.
+static ENV: Mutex<()> = Mutex::new(());
+
 fn world() -> World {
     let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).expect("a free port").port();
     let name = format!("agent-bridge-core-auth-{}", std::process::id());
@@ -108,6 +140,7 @@ fn subscribe(creds: Option<&Credentials>, topic: &str) -> agent_bridge::Result<(
 #[test]
 #[ignore]
 fn warn_provision_refusals_socket_then_enforce() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let w = world();
     // an agent from before auth: registered under off, it has no credentials file
     w.up("off");
@@ -305,6 +338,30 @@ fn warn_provision_refusals_socket_then_enforce() {
     subscribe(Some(&ledgerd), "ledger/req/+").expect("ledgerd reads requests");
     publish(Some(&ledgerd), "ledger/resp/al-a1b2c3/x").expect("ledgerd replies");
     assert!(is_refused(&publish(Some(&ledgerd), "room/r").expect_err("ledgerd does not post")));
+    unsafe { std::env::remove_var("AGENT_BRIDGE_CREDENTIALS") };
+
+    // a refused retained read is an error, never an empty answer
+    let refused_read = broker::retained_as(&["inbox/bo-b2c3d4"], Some("al-a1b2c3")).expect_err("another's inbox");
+    assert_eq!(refused_read.0, "not authorized to subscribe to inbox/bo-b2c3d4");
+
+    // historyd logs in with its service file and serves under enforce (0.3.2 dialled anonymously and never connected)
+    let historyd = Command::new(bins::service("agent-bridge-historyd", "AGENT_BRIDGE_HISTORYD"))
+        .env("AGENT_BRIDGE_CREDENTIALS", w.cfg().join("services/historyd.json"))
+        .env("HISTORY_DB", w.dir.join("history.db"))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("historyd starts");
+    let mut historyd = Killed(historyd);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while agent_bridge::history::client::call("ping", Some("al-a1b2c3"), Default::default(), 1.0).is_err() {
+        if Instant::now() > deadline {
+            let _ = historyd.0.kill();
+            let out = historyd.wait_with_output_stderr();
+            panic!("historyd never answered under enforce: {out}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(historyd);
 
     // back to off: today's broker, the mode file gone
     w.up("off");
@@ -316,4 +373,82 @@ fn warn_provision_refusals_socket_then_enforce() {
     assert_eq!(config::auth_mode(), Ok(Auth::Warn));
     assert!(!broker::runs_auth().expect("reachable"), "the broker says otherwise");
     publish(al, "room/r/al-a1b2c3").expect("credentials are still accepted without the plugin");
+}
+
+/// credentials_for over every combination of the real inputs: this process's session, what AGENT_BRIDGE_CREDENTIALS
+/// points at, whether admin.json exists, and whether the agent has a file and which session it binds it to. Admin's
+/// credentials iff the variable points at an existing admin file; never from admin.json found on disk.
+#[test]
+fn credentials_for_over_the_real_environment_and_files() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("agent-bridge-creds-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = dir.join("agent-bridge");
+    for d in [cfg.join("agents"), cfg.join("services")] {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&d).expect("a dir");
+    }
+    let write = |path: &Path, body: String| {
+        std::fs::write(path, body).expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    };
+    let file = |user: &str, session: Option<&str>| {
+        let bound = session.map_or(String::new(), |s| format!(r#", "session": "{s}""#));
+        format!(r#"{{"username": "{user}", "password": "{user}-pw", "client_id": "c"{bound}}}"#)
+    };
+    let (agent, s1, s2) = ("al-a1b2c3", "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222");
+    let (admin_json, ledgerd_json) = (cfg.join("admin.json"), cfg.join("services/ledgerd.json"));
+    let agent_json = cfg.join(format!("agents/{agent}.json"));
+    write(&ledgerd_json, file("ledgerd", None));
+    let set = |name: &str, value: Option<&str>| match value {
+        // SAFETY: under ENV, and no other thread of this test reads the environment
+        Some(v) => unsafe { std::env::set_var(name, v) },
+        None => unsafe { std::env::remove_var(name) },
+    };
+    set("XDG_CONFIG_HOME", Some(dir.to_str().expect("UTF-8")));
+    let mut cases = 0;
+    for session in [None, Some(s1), Some(s2)] {
+        for variable in [None, Some(&admin_json), Some(&ledgerd_json)] {
+            for admin_exists in [false, true] {
+                for agent_file in [None, Some(None), Some(Some(s1))] {
+                    set("CLAUDE_CODE_SESSION_ID", session);
+                    set("AGENT_BRIDGE_CREDENTIALS", variable.map(|p| p.to_str().expect("UTF-8")));
+                    let _ = std::fs::remove_file(&admin_json);
+                    if admin_exists {
+                        write(&admin_json, file("admin", None));
+                    }
+                    let _ = std::fs::remove_file(&agent_json);
+                    if let Some(bound) = agent_file {
+                        write(&agent_json, file(agent, bound));
+                    }
+                    let case = format!(
+                        "session {session:?}, variable {variable:?}, admin.json {admin_exists}, agent file {agent_file:?}"
+                    );
+                    let admin = provision::credentials_for("admin").expect("never an error for admin");
+                    let names_admin = variable == Some(&admin_json) && admin_exists;
+                    assert_eq!(admin.map(|c| c.username), names_admin.then(|| "admin".to_owned()), "admin: {case}");
+                    let got = provision::credentials_for(agent);
+                    let elsewhere = matches!((agent_file, session), (Some(Some(b)), Some(m)) if b != m);
+                    match got {
+                        Err(e) => {
+                            assert!(elsewhere, "{case}: {e}");
+                            assert_eq!(
+                                e.0,
+                                format!("agent-bridge: {agent} is not your agent (bound to another session)")
+                            );
+                        }
+                        Ok(c) => {
+                            assert!(!elsewhere, "{case}");
+                            assert_eq!(c.map(|c| c.username), agent_file.map(|_| agent.to_owned()), "{case}");
+                        }
+                    }
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 3 * 3 * 2 * 3);
+    for name in ["CLAUDE_CODE_SESSION_ID", "AGENT_BRIDGE_CREDENTIALS", "XDG_CONFIG_HOME"] {
+        set(name, None);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

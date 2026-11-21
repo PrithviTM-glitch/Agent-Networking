@@ -13,6 +13,7 @@ static ORIGIN: OnceLock<Map> = OnceLock::new();
 /// Where origin() starts walking up instead of this process's parent; the relay sets it, being detached from its
 /// session's process. Only the first call counts, and only before origin() first runs.
 pub fn set_ancestor(pid: i64) {
+    #[allow(clippy::let_underscore_must_use, reason = "set once: a later call keeps the first ancestor, as intended")]
     let _ = ANCESTOR.set(pid);
 }
 
@@ -60,7 +61,7 @@ pub fn short_hash(text: &str) -> String {
 
 /// The fixed bus address of a session, shared by its MCP server and its relay.
 pub fn session_address(session: &str) -> String {
-    format!("{}-{}", project_name(), short_hash(session))
+    crate::address::Address::session(&project_name(), session).to_string()
 }
 
 #[cfg(test)]

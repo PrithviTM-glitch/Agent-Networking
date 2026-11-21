@@ -1,5 +1,10 @@
 //! A disposable broker for the Docker tests of this crate.
 
+#![allow(
+    clippy::let_underscore_must_use,
+    reason = "best-effort cleanup: killing, waiting for and removing what the test started"
+)]
+
 use agent_bridge::presence;
 use std::path::{Path, PathBuf};
 use std::process::Command;

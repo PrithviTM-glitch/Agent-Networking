@@ -31,6 +31,10 @@ fn main() {
         }
         match args::Cli::try_parse() {
             Ok(cli) => {
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "a session hook never fails its session: errors are reported inside or not at all"
+                )]
                 let _ = commands::run(cli.cmd);
             }
             // asked for by a person, not by Claude Code: the help prints as anywhere else

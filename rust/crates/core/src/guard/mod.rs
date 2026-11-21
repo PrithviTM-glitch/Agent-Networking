@@ -683,6 +683,7 @@ fn live_locks(roots: &[PathBuf], session: &str) -> Locks {
     let asker = me(session).into_iter().next();
     let creds = asker.as_deref().and_then(|a| crate::provision::credentials_for(a).ok().flatten());
     let asker = asker.unwrap_or_else(|| "guard".into());
+    let asked_at = now();
     let asked = match &creds {
         Some(c) => crate::ledger::call_with("worktrees", &asker, Map::new(), Some(LEDGER_TIMEOUT), Some(c)),
         None => crate::ledger::call("worktrees", &asker, Map::new(), Some(LEDGER_TIMEOUT)),
@@ -690,7 +691,7 @@ fn live_locks(roots: &[PathBuf], session: &str) -> Locks {
     match asked {
         Ok(reply) => {
             let held = ledger_locks(&reply);
-            remember(&held);
+            remember(&held, asked_at);
             let stale = reasons
                 .iter()
                 .filter(|(root, id, _)| !held.iter().any(|l| &l.root == root && &l.lease_id == id))
@@ -750,35 +751,115 @@ fn locks_file() -> Option<PathBuf> {
     crate::config::data_path(&["guard-locks.json"]).ok()
 }
 
-/// Keep the last locks ledgerd reported, for when it is unreachable (written atomically, 0600).
-fn remember(locks: &[Lock]) {
-    let Some(path) = locks_file() else { return };
-    let items: Vec<Value> = locks
-        .iter()
-        .map(|l| {
-            json!({"path": l.root.to_string_lossy(), "resource": l.resource, "holder": l.holder,
-                   "lease_id": l.lease_id, "expires_at": l.expires_at})
-        })
-        .collect();
-    let text = dumps(&json!({"as_of": now(), "worktrees": items}));
-    let tmp = path.with_extension("tmp");
+/// guard-locks.json as (as_of, entries): each entry a ledgerd `worktrees` item, plus "added" when an acquire
+/// recorded it.
+fn read_locks(path: &Path) -> (Option<f64>, Vec<Map>) {
+    let Some(Value::Object(m)) = std::fs::read(path).ok().and_then(|b| crate::json::loads(&b)) else {
+        return (None, vec![]);
+    };
+    let items = m.get("worktrees").and_then(Value::as_array).into_iter().flatten();
+    (m.get("as_of").and_then(Value::as_f64), items.filter_map(|v| v.as_object().cloned()).collect())
+}
+
+fn entry(l: &Lock, added: Option<f64>) -> Map {
+    let mut e = json!({"path": l.root.to_string_lossy(), "resource": l.resource, "holder": l.holder,
+                       "lease_id": l.lease_id, "expires_at": l.expires_at});
+    if let Some(t) = added {
+        e["added"] = json!(t);
+    }
+    e.as_object().cloned().unwrap_or_default()
+}
+
+/// Change guard-locks.json under an exclusive flock on guard-locks.json.lock, so the acquires, releases and guard
+/// lookups that update it never lose each other's entries; written atomically, 0600.
+fn update_locks(
+    path: &Path,
+    change: impl FnOnce(Option<f64>, Vec<Map>) -> (Option<f64>, Vec<Map>),
+) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let written = std::fs::OpenOptions::new()
+    let open = |p: &Path| std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(p);
+    let lock = open(&path.with_extension("json.lock"))?;
+    let _held = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusive).map_err(|(_, e)| e)?;
+    let (as_of, items) = read_locks(path);
+    let (as_of, items) = change(as_of, items);
+    let text = dumps(&json!({"as_of": as_of, "worktrees": items}));
+    let tmp = path.with_extension("tmp");
+    std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(&tmp)
-        .and_then(|mut f| f.write_all(text.as_bytes()));
-    if written.is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+        .and_then(|mut f| f.write_all(text.as_bytes()))?;
+    std::fs::rename(&tmp, path)
+}
+
+fn no_data_dir() -> std::io::Error {
+    std::io::Error::other("no data dir for guard-locks.json")
+}
+
+/// Keep the last locks ledgerd reported, for when it is unreachable. ledgerd is authoritative for everything older
+/// than the query (asked_at): an entry an acquire recorded after the query started is kept, since the reply may
+/// predate its grant (specs/worktree/WorktreeLock.tla).
+fn remember(locks: &[Lock], asked_at: f64) {
+    if let Some(path) = locks_file() {
+        // best effort: this lookup's decision stands either way, and the next lookup writes the file again
+        #[allow(clippy::let_underscore_must_use, reason = "a lookup that can't save its reply still decides")]
+        let _ = remember_in(&path, locks, asked_at);
     }
+}
+
+fn remember_in(path: &Path, locks: &[Lock], asked_at: f64) -> std::io::Result<()> {
+    update_locks(path, |_, items| {
+        let mut out: Vec<Map> = locks.iter().map(|l| entry(l, None)).collect();
+        for e in items {
+            let newer = e.get("added").and_then(Value::as_f64).is_some_and(|t| t >= asked_at);
+            let path = e.get("path").and_then(Value::as_str);
+            if newer && !locks.iter().any(|l| Some(l.root.to_string_lossy().as_ref()) == path) {
+                out.push(e);
+            }
+        }
+        (Some(now()), out)
+    })
+}
+
+/// Record a lease an acquire was just granted, so the guard enforces it even if ledgerd goes down before any lookup:
+/// add-only (an entry for the same worktree is replaced, the others kept). An error means the lease is enforced only
+/// while ledgerd answers (and by the git lock, on a linked worktree): the caller should say so.
+pub fn record(lock: &Lock) -> std::io::Result<()> {
+    record_in(&locks_file().ok_or_else(no_data_dir)?, lock)
+}
+
+fn record_in(path: &Path, lock: &Lock) -> std::io::Result<()> {
+    update_locks(path, |as_of, mut items| {
+        let path = lock.root.to_string_lossy();
+        items.retain(|e| e.get("path").and_then(Value::as_str) != Some(path.as_ref()));
+        items.push(entry(lock, Some(now())));
+        (as_of.or(Some(now())), items)
+    })
+}
+
+/// Drop a released lease's entry (after ledgerd released it, so it stays enforced offline until then). An error leaves
+/// the entry: the worktree stays refused to others while ledgerd is down, until a lookup succeeds.
+pub fn forget(lease_id: &str) -> std::io::Result<()> {
+    forget_in(&locks_file().ok_or_else(no_data_dir)?, lease_id)
+}
+
+fn forget_in(path: &Path, lease_id: &str) -> std::io::Result<()> {
+    update_locks(path, |as_of, mut items| {
+        items.retain(|e| e.get("lease_id").and_then(Value::as_str) != Some(lease_id));
+        (as_of, items)
+    })
 }
 
 /// The last locks ledgerd reported, and when.
 fn recalled() -> (Option<f64>, Vec<Lock>) {
-    let Some(text) = locks_file().and_then(|p| std::fs::read_to_string(p).ok()) else { return (None, vec![]) };
+    locks_file().map_or((None, vec![]), |p| recalled_in(&p))
+}
+
+fn recalled_in(path: &Path) -> (Option<f64>, Vec<Lock>) {
+    let Some(text) = std::fs::read_to_string(path).ok() else { return (None, vec![]) };
     let Some(Value::Object(m)) = crate::json::loads(text.as_bytes()) else { return (None, vec![]) };
     let mut locks = ledger_locks(&m);
     for l in &mut locks {

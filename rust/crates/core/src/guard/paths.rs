@@ -12,20 +12,28 @@ pub fn resolve(path: &str, cwd: &Path) -> PathBuf {
     for split in (1..=comps.len()).rev() {
         let head: PathBuf = comps[..split].iter().collect();
         if let Ok(real) = fs::canonicalize(&head) {
-            let mut out = real;
-            for c in &comps[split..] {
-                match c {
-                    Component::ParentDir => {
-                        out.pop();
-                    }
-                    Component::CurDir => {}
-                    other => out.push(other.as_os_str()),
-                }
-            }
-            return out;
+            let rest: PathBuf = comps[split..].iter().collect();
+            return lexical(&real, &rest.to_string_lossy());
         }
     }
     full
+}
+
+/// rest applied to base without the filesystem: `.` dropped, `..` removes one component (never above `/`), the rest
+/// appended. Pure, so it can be proved (Kani): with no `..` in rest, the result starts with base.
+pub fn lexical(base: &Path, rest: &str) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for c in Path::new(rest).components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => out = PathBuf::from("/"),
+            Component::Normal(n) => out.push(n),
+        }
+    }
+    out
 }
 
 /// path made absolute against cwd, `~` expanded; nothing resolved.
@@ -238,6 +246,7 @@ mod tests {
     #[test]
     fn resolves_like_the_kernel() {
         let d = std::env::temp_dir().join(format!("guard-paths-{}", std::process::id()));
+        #[allow(clippy::let_underscore_must_use, reason = "a leftover from an earlier run, usually none")]
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("locked/src")).unwrap();
         fs::create_dir_all(d.join("free")).unwrap();
@@ -247,12 +256,16 @@ mod tests {
         assert_eq!(resolve("via-link/src/new.txt", &free), real.join("locked/src/new.txt"), "symlink, new file");
         assert_eq!(resolve("../locked/./x", &free), real.join("locked/x"));
         assert_eq!(resolve(free.join("nope/../../locked").to_str().unwrap(), &free), real.join("locked"));
+        assert_eq!(lexical(Path::new("/a/b"), "./c/../d"), Path::new("/a/b/d"));
+        assert_eq!(lexical(Path::new("/a"), "../../.."), Path::new("/"), "never above the root");
+        assert_eq!(lexical(Path::new("/a"), "/etc"), Path::new("/etc"), "an absolute rest starts over");
         fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
     fn globs_like_the_shell() {
         let d = std::env::temp_dir().join(format!("guard-glob-{}", std::process::id()));
+        #[allow(clippy::let_underscore_must_use, reason = "a leftover from an earlier run, usually none")]
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("locked/src")).unwrap();
         fs::create_dir_all(d.join("free")).unwrap();

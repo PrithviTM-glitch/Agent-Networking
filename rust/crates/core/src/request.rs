@@ -4,8 +4,8 @@
 //! acks replies at once and never buffers them, so they cannot fill its receive window.
 
 use crate::ledger::random_bytes;
-use crate::mqtt::{Conn, filter};
-use crate::validation::{ID_MAX, is_ident};
+use crate::mqtt::{Acked, Conn, filter};
+use crate::validation::{ID_MAX, is_ident, refused};
 use bytes::Bytes;
 use rumqttc::v5::mqttbytes::v5::PublishProperties;
 use serde_json::Value;
@@ -62,12 +62,18 @@ impl Replies {
     }
 }
 
-/// What became of a request: its reply, none within the timeout, or stopped, with the CorrelationData it went with.
+/// What became of a request: its reply, none within the timeout, stopped (with the CorrelationData it went with), or
+/// refused by the broker's ACL: the reply topic's SUBACK or the request's PUBACK said "not authorized", so no reply
+/// could ever come (the text says which, as validation::refused writes it).
 pub enum Sent {
     Reply(Bytes),
     Timeout,
     Stopped(Vec<u8>),
+    Refused(String),
 }
+
+/// How long a request waits for the broker's SUBACK or PUBACK before going on to wait for the reply anyway.
+const ACK_WAIT: Duration = Duration::from_secs(5);
 
 /// The reply topic of a client: named after its client id, so a persistent session never piles up subscriptions.
 pub fn reply_topic(service: &str, client_id: &str) -> String {
@@ -105,8 +111,15 @@ pub fn send_until(
 ) -> Sent {
     let corr = random_bytes(16);
     replies.expect(&corr);
-    // Resubscribed every call: the broker may have lost the session since; it handles this before the request.
-    let _ = conn.subscribe(vec![filter(reply_topic, true, false)]);
+    let ack_wait = ACK_WAIT.min(Duration::from_secs_f64(timeout.max(0.0)));
+    // Resubscribed every call: the broker may have lost the session since; it handles this before the request. A send
+    // that fails (not connected) is left to the reply wait: the reconnect resubscribes and resends the request.
+    if let Ok(pkid) = conn.subscribe(vec![filter(reply_topic, true, false)])
+        && conn.wait_refused(pkid, ack_wait) == Some(Acked::Refused)
+    {
+        replies.take(&corr);
+        return Sent::Refused(refused("subscribe to", reply_topic).0);
+    }
     let properties = PublishProperties {
         response_topic: Some(reply_topic.to_owned()),
         correlation_data: Some(Bytes::from(corr.clone())),
@@ -119,6 +132,11 @@ pub fn send_until(
         Some(a) => format!("{service}/req/{a}"),
         None => format!("{service}/req"),
     };
-    let _ = conn.publish(&topic, body, true, false, Some(properties), false);
+    if let Ok(pkid) = conn.publish(&topic, body, true, false, Some(properties), true)
+        && conn.wait_refused(pkid, ack_wait) == Some(Acked::Refused)
+    {
+        replies.take(&corr);
+        return Sent::Refused(refused("publish on", &topic).0);
+    }
     replies.wait(&corr, Duration::from_secs_f64(timeout), stop)
 }

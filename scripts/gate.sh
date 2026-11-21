@@ -5,6 +5,18 @@
 # binaries are built into src/agent_bridge.data/scripts, as for any wheel build); the tests never touch the live state.
 set -eu
 
+# Started as a shell background job ("( ... ) &" in a script), the gate inherits SIGINT ignored, and a non-interactive
+# shell can't undo that: Ctrl-C wouldn't stop it, its INT trap below would never fire, and every test child would
+# inherit it too (0.3.2's first gate run failed that way). SIGINT is signal 2, so bit 1 of the SigIgn mask.
+ignored=$(sed -n 's/^SigIgn:[[:space:]]*//p' "/proc/$$/status" 2>/dev/null || true)
+if [ -n "$ignored" ] && [ $(((0x$ignored >> 1) & 1)) -eq 1 ]; then
+    echo "gate: started with SIGINT ignored, as a shell background job is: Ctrl-C couldn't stop the gate, and every" \
+        "test it starts would inherit it. Run it in the foreground, or set GATE_ALLOW_BG=1 to run anyway." >&2
+    [ "${GATE_ALLOW_BG:-}" = 1 ] || exit 2
+fi
+# GATE_CHECK_ONLY=1 checks the launch environment above and stops: what the harness tests use.
+[ "${GATE_CHECK_ONLY:-}" = 1 ] && exit 0
+
 root=$(cd "$(dirname "$0")/.." && pwd)
 runs=${GATE_RUNS:-3}
 python=${GATE_PYTHON:-3.12}  # the floor in requires-python

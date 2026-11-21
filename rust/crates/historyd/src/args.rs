@@ -18,7 +18,9 @@ const HEALTH_TIMEOUT: f64 = 5.0;
 /// A round trip through the broker over a throwaway client, so it fails when historyd is disconnected or wedged, not
 /// just when it exits.
 pub fn health() -> i32 {
-    match call("ping", None, Map::new(), HEALTH_TIMEOUT) {
+    // as historyd when it has credentials, so the check also works under auth enforce
+    let who = agent_bridge::provision::credentials_for("historyd").ok().flatten().map(|_| "historyd");
+    match call("ping", who, Map::new(), HEALTH_TIMEOUT) {
         Ok(_) => 0,
         Err(e) => {
             // worded as ledgerd's; the history client's own "history: " prefix would only repeat the name

@@ -23,7 +23,7 @@ const HEALTH_TIMEOUT: f64 = 5.0;
 pub fn health() -> i32 {
     let creds = match config::get().map(|c| c.auth) {
         Ok(Auth::Off) | Err(_) => None,
-        Ok(_) => config::credentials("ledgerd").ok().flatten(),
+        Ok(_) => agent_bridge::provision::credentials_for("ledgerd").ok().flatten(),
     };
     let who = if creds.is_some() { "ledgerd" } else { "health-0" };
     match ledger::call_with("worktrees", who, Map::new(), Some(HEALTH_TIMEOUT), creds.as_ref()) {

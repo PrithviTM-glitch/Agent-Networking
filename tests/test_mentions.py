@@ -4,12 +4,14 @@ only the mentioned agent, the quiet backlog) is in test_relay.py. The tests are 
 
 import json
 import subprocess
+import time
 import uuid
 from types import SimpleNamespace
 
 import paho.mqtt.client as mqtt
 import pytest
 from conftest import BIN, wait_for
+from waits import wait_until
 
 from agent_bridge import _native, config
 from agent_bridge.errors import BridgeError
@@ -27,9 +29,13 @@ def with_services(ledgerd, historyd):
     """history comes from historyd, and leave drops the ledger and the DMs, each waiting out a timeout if absent."""
 
 
-def heard(bus, wait=3):
-    """The room messages bus receives now, as {mentions, for_me, body} (missing keys left out)."""
-    msgs = bus.recv(wait)
+def heard(bus, wait=30, n=1):
+    """The room messages bus receives, as {mentions, for_me, body} (missing keys left out): at least n of them, waiting
+    up to wait seconds (a ceiling: they come back as soon as they arrive), then any more that follow within 0.5 s, so
+    an extra message still fails the caller's equality."""
+    msgs, end = [], time.monotonic() + wait
+    while sum(m["topic"] == f"room/{ROOM}" for m in msgs) < n and (left := end - time.monotonic()) > 0:
+        msgs += bus.recv(left)
     while more := bus.recv(0.5):
         msgs += more
     keys = ("mentions", "for_me", "body")
@@ -59,7 +65,7 @@ def test_names_addresses_and_all_resolve():
     assert heard(S.carol) == [{"mentions": [S.carol.addr], "for_me": True, "body": f"ping @{S.carol.addr}"}]
     S.alice.say(ROOM, "@all standup now, @bob too")
     S.alice.say(ROOM, "mail me at alice@example.com")
-    assert heard(S.carol) == [{"body": "@all standup now, @bob too"}, {"body": "mail me at alice@example.com"}], (
+    assert heard(S.carol, n=2) == [{"body": "@all standup now, @bob too"}, {"body": "mail me at alice@example.com"}], (
         "@all means no mentions, and a@b is not a mention"
     )
     logged = [
@@ -81,7 +87,7 @@ def test_unknown_mentions_are_sent_as_text():
     assert S.alice.say(ROOM, "@BOB and @Nobody") == {"mentions": bobs, "unresolved": ["Nobody"], "absent": []}
     assert heard(S.bob1)[-1] == {"mentions": bobs, "for_me": True, "body": "@BOB and @Nobody"}
     for b in (S.bob2, S.carol):
-        heard(b, 0.5)
+        heard(b)  # each has that one post: wait for it, or it lands in the next test's equality
     outsider.close()
 
 
@@ -89,23 +95,27 @@ def test_admin_me_and_absent_agents():
     """@admin mentions the admin console, which joins no room; @me mentions nobody and is never reported; an @word
     naming a live agent outside the room comes back in absent as well as unresolved (the CLI says so on stderr)."""
     observer = _native.Observer()
-    assert observer.next(5)[0] == "connected"
-    said = S.alice.say(ROOM, "@admin please look, and ping @me later")
+    assert observer.next(30)[0] == "connected"
+    said_body = "@admin please look, and ping @me later"
+    said = S.alice.say(ROOM, said_body)
     assert said == {"mentions": ["admin"], "unresolved": [], "absent": []}, said
     assert heard(S.carol) == [
         {"mentions": ["admin"], "for_me": False, "body": "@admin please look, and ping @me later"}
     ]
     seen = []
-    while (event := observer.next(5)) and not (event[0] == "message" and event[2]["topic"] == f"room/{ROOM}"):
+    while (event := observer.next(30)) and not (event[0] == "message" and event[2]["topic"] == f"room/{ROOM}"):
         seen.append(event[0])
     observer.close()
     assert event and event[2].get("for_admin") is True, (event, seen)
-    logged = _native.history_call("room", room=ROOM, last=1)["messages"][-1]
+    logged = wait_until(
+        lambda: [m for m in _native.history_call("room", room=ROOM, last=1)["messages"] if m["body"] == said_body],
+        what="historyd to log the @admin post",
+    )[-1]
     assert logged["mentions"] == ["admin"], "the console backfills its mentions from history"
 
     S.carol.part(ROOM)
     left = lambda: f"room/{ROOM}" not in (S.alice.cached_agent(S.carol.addr) or {}).get("topics", [])  # noqa: E731
-    assert wait_for(left, 5), "alice's cache has carol's part"
+    assert wait_for(left, 30), "alice's cache has carol's part"
     gone = S.alice.say(ROOM, f"@carol and @{S.carol.addr.upper()}, still there?")
     assert gone == {
         "mentions": [],
@@ -117,8 +127,9 @@ def test_admin_me_and_absent_agents():
     )
     assert p.returncode == 0 and f"@carol is not in #{ROOM}" in p.stderr, p.stderr
     S.carol.join(ROOM)
-    for b in (S.alice, S.bob1, S.bob2, S.carol):
-        heard(b, 0.5)
+    heard(S.alice, 0.5)
+    for b in (S.bob1, S.bob2):
+        heard(b, n=3)  # the @admin post, the two @carol posts
 
 
 def test_moderation_still_applies():
@@ -129,8 +140,9 @@ def test_moderation_still_applies():
         S.bob1.say(ROOM, f"@{S.alice.addr} may I?")
     S.alice.say(ROOM, "@bob noted")
     S.admin.room_set(ROOM, mode="open")
-    for b in (S.alice, S.bob1, S.bob2, S.carol):
-        heard(b, 1)
+    heard(S.alice, 0.5)
+    for b in (S.bob1, S.bob2, S.carol):
+        heard(b)  # "@bob noted"
 
 
 def test_spoofed_and_malformed_mentions():
@@ -140,7 +152,12 @@ def test_spoofed_and_malformed_mentions():
         raw(f"room/{ROOM}", {**base, "body": f"bad {bad!r}"[:40], "mentions": bad})
     raw(f"inbox/{S.carol.addr}", {**base, "body": "dm", "mentions": [S.carol.addr]})
     assert heard(S.bob1) == [{"mentions": [S.bob1.addr], "for_me": True, "body": "spoof"}], "a spoof is just a mention"
-    got = S.carol.recv(3) + S.carol.recv(0.5)
+    got = []
+    wait_until(
+        lambda: got.extend(S.carol.recv(0.5)) or {"spoof", "dm"} <= {m["body"] for m in got},
+        what="carol's spoof and DM",
+    )
+    got += S.carol.recv(0.5)
     rooms = [m for m in got if m["topic"] == f"room/{ROOM}"]
     dms = [m for m in got if m["topic"].startswith("inbox/")]
     assert [(m["body"], m["for_me"]) for m in rooms] == [("spoof", False)], "malformed mentions drop the message"

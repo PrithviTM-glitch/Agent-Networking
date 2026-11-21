@@ -1,5 +1,10 @@
 //! The command line without a broker: help texts, the hooks' silence and the relay's session errors.
 
+#![allow(
+    clippy::let_underscore_must_use,
+    reason = "best-effort cleanup: killing, waiting for and removing what the test started"
+)]
+
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 

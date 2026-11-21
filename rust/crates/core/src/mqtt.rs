@@ -85,6 +85,7 @@ impl Stream {
     }
 
     fn shutdown(&self) {
+        #[allow(clippy::let_underscore_must_use, reason = "shutting down a socket that's already closed is fine")]
         let _ = match self {
             Stream::Tcp(s) => s.shutdown(Shutdown::Both),
             Stream::Unix(s) => s.shutdown(Shutdown::Both),
@@ -92,6 +93,10 @@ impl Stream {
     }
 
     fn set_timeouts(&self, read: Duration, write: Duration) {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "without timeouts the reader still sees EOF; only keep-alive timing changes"
+        )]
         let _ = match self {
             Stream::Tcp(s) => s.set_read_timeout(Some(read)).and(s.set_write_timeout(Some(write))),
             Stream::Unix(s) => s.set_read_timeout(Some(read)).and(s.set_write_timeout(Some(write))),
@@ -332,6 +337,10 @@ impl Conn {
     pub fn ack(&self, ack: Ack) {
         let st = lock(&self.0.state);
         if ack.pkid != 0 && st.attached && st.generation == ack.generation {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "an ack that can't be sent is redelivered by the broker on the next connection"
+            )]
             let _ = self.send(&Packet::PubAck(PubAck::new(ack.pkid, None)));
         }
     }
@@ -347,6 +356,10 @@ impl Conn {
         }
         let handle = lock(&self.0.reader).take();
         if let Some(h) = handle.filter(|h| h.thread().id() != thread::current().id()) {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "the reader thread is ending; a panic in it has already been reported"
+            )]
             let _ = h.join();
         }
     }
@@ -522,6 +535,10 @@ impl Conn {
         }
         if st.ping_sent.is_none() && lock(&self.0.writer).last_sent.elapsed() >= period / 2 {
             st.ping_sent = Some(Instant::now());
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a ping that can't be sent is caught by keep_alive's timeout"
+            )]
             let _ = self.send(&Packet::PingReq(PingReq));
         }
         true
@@ -611,6 +628,10 @@ fn short_disconnect(buf: &[u8]) -> Option<u8> {
 fn disconnect(stream: &Stream) {
     let mut buf = BytesMut::new();
     if Packet::Disconnect(Disconnect::new(DisconnectReasonCode::NormalDisconnection)).write(&mut buf, None).is_ok() {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a best-effort clean DISCONNECT; the shutdown right after closes the socket anyway"
+        )]
         let _ = (&*stream).write_all(&buf);
     }
     stream.shutdown();
@@ -649,6 +670,7 @@ fn dial_tcp(host: &str, port: u16) -> io::Result<Stream> {
         match TcpStream::connect_timeout(&addr, TIMEOUT) {
             Ok(s) => {
                 // Without it every request/response round trip waits on Nagle plus delayed ACK (~40 ms each way).
+                #[allow(clippy::let_underscore_must_use, reason = "only latency: Nagle stays on")]
                 let _ = s.set_nodelay(true);
                 return Ok(Stream::Tcp(s));
             }

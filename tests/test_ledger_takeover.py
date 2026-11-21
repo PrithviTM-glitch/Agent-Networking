@@ -4,9 +4,9 @@ one would take the session from test_ledger's service. Runs whichever ledgerd AG
 """
 
 import os
-import time
 
 from conftest import start_ledgerd, wait_for
+from waits import holds_for
 
 from agent_bridge import _native
 
@@ -21,8 +21,11 @@ def test_the_first_ledgerd_steps_aside(fresh_broker, state_dir):
             "the first ledgerd kept the session: " + open(logs[0]).read()
         )
         assert first.returncode != 0
-        time.sleep(3)  # the redial delay: a second takeover would come in this window
-        assert second.poll() is None, open(logs[1]).read()
+        # the redial delay: a second takeover would come in this window
+        try:
+            holds_for(lambda: second.poll() is None, 3, "the second ledgerd running through the redial delay")
+        except AssertionError as e:
+            raise AssertionError(open(logs[1]).read()) from e
         assert _native.ledger_call("init", "after-takeover-a1", timeout=2)["created"] is True, "the one left serves"
     finally:
         for proc in (first, second):

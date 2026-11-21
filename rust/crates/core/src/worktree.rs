@@ -111,6 +111,10 @@ fn git_lock(t: &Tree, lease_id: &str, addr: &str) -> std::result::Result<String,
     match t.lock() {
         Some(r) if r == reason => return Ok(reason),
         Some(r) if parse_reason(&r).is_some() => {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "if the old lock stays, the lock below fails and says why"
+            )]
             let _ = run(git(&t.root, &["worktree", "unlock", &t.root.to_string_lossy()]));
         }
         Some(r) => return Err(format!("git lock left as it is: already locked ({r})")),
@@ -195,6 +199,7 @@ pub fn snapshot(t: &Tree, lease_id: &str) -> Result<Option<String>> {
         }
         Ok(Some(name))
     })();
+    #[allow(clippy::let_underscore_must_use, reason = "a scratch index already gone is what we want")]
     let _ = std::fs::remove_file(&index);
     result
 }
@@ -231,6 +236,7 @@ pub fn registered(session: &str) -> Vec<Lease> {
 fn save(session: &str, leases: &[Lease]) -> Result<()> {
     let path = leases_path(session)?;
     if leases.is_empty() {
+        #[allow(clippy::let_underscore_must_use, reason = "a leases file already gone is what we want")]
         let _ = std::fs::remove_file(&path);
         return Ok(());
     }
@@ -255,6 +261,10 @@ fn unregister(session: &str, lease_id: &str) {
     let before = all.len();
     all.retain(|l| l.lease_id != lease_id);
     if all.len() != before {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a lease left registered fails its next renewal and is dropped then"
+        )]
         let _ = save(session, &all);
     }
 }
@@ -285,7 +295,27 @@ pub fn acquire_with(addr: &str, path: &str, ttl: Option<f64>, wait: Option<f64>,
     reply.remove("ok");
     let lease_id = reply.get("lease").and_then(|l| l.get("lease_id")).and_then(Value::as_str).unwrap_or_default();
     let lease_id = lease_id.to_owned();
+    // Into the guard's last-known locks at once, so the lease holds offline even if ledgerd goes away before any guard
+    // lookup: the main worktree has no git lock to fall back on (specs/worktree, the record step).
+    let expires_at = reply.get("lease").and_then(|l| l.get("expires_at")).and_then(Value::as_f64);
     let mut warnings = Vec::new();
+    let recorded = crate::guard::record(&crate::guard::Lock {
+        root: t.root.clone(),
+        resource: ledger::worktree_resource(root),
+        holder: addr.to_owned(),
+        lease_id: lease_id.clone(),
+        expires_at,
+        source: crate::guard::Source::Ledger,
+    });
+    // a lease the guard can't see offline would let others write there while ledgerd is down: give it back
+    if let Err(e) = recorded {
+        let fields = obj(json!({"lease_id": lease_id}));
+        let undone = match ledger::call("release", addr, fields, Some(LEDGER_TIMEOUT)) {
+            Ok(_) => "released it".to_owned(),
+            Err(r) => format!("and releasing it failed too ({r}); it lapses at its ttl"),
+        };
+        return Err(Error(format!("cannot record lease {lease_id} for the guard ({e}); {undone}")));
+    }
     let lock = git_lock(&t, &lease_id, addr).map_err(|w| warnings.push(w)).ok();
     reply.insert("resource".into(), ledger::worktree_resource(root).into());
     reply.insert("lease_id".into(), lease_id.clone().into());
@@ -349,6 +379,11 @@ fn release_lease(addr: &str, t: &Tree, lease_id: &str) -> Result<Map> {
             return Err(ledger_err(e));
         }
         warnings.push(e.to_string());
+    }
+    // only once ledgerd has let go, so the lock stays visible offline until then
+    if let Err(e) = crate::guard::forget(lease_id) {
+        // over-locking only, until the next successful guard lookup rewrites the file
+        warnings.push(format!("guard-locks.json still lists the lease: {e}"));
     }
     let mut reply = obj(json!({
         "released": lease_id,
@@ -468,6 +503,7 @@ pub fn release_session(session: &str) -> Vec<String> {
         said.push(line);
     }
     if let Ok(path) = leases_path(session) {
+        #[allow(clippy::let_underscore_must_use, reason = "a leases file already gone is what we want")]
         let _ = std::fs::remove_file(path);
     }
     said
@@ -480,6 +516,7 @@ pub fn session_agent() -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::let_underscore_must_use, reason = "best-effort cleanup of temp files")]
 mod tests {
     use super::*;
 

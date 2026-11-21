@@ -9,10 +9,12 @@ use agent_bridge::presence;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// f returns well before the 30 s the other thread's recv blocks for: a call stuck behind it would take all of that,
+/// so a loaded machine never reaches the ceiling while the bug always does.
 fn quick(what: &str, f: impl FnOnce() -> agent_bridge::Result<()>) {
     let t = Instant::now();
     f().unwrap_or_else(|e| panic!("{what}: {e}"));
-    assert!(t.elapsed() < Duration::from_secs(1), "{what} took {:?} while another thread waited", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(10), "{what} took {:?} while another thread waited", t.elapsed());
 }
 
 fn bodies(msgs: &[Map]) -> Vec<String> {
@@ -83,7 +85,8 @@ fn one_bus_many_threads() {
     a.close();
     let t = Instant::now();
     assert_eq!(a.wait_arrival(Duration::from_secs(5), seq).unwrap_err().0, "not connected to the broker");
-    assert!(t.elapsed() < Duration::from_secs(1), "a closed Bus fails at once");
+    // under the 5 s it would wait if it didn't fail at once
+    assert!(t.elapsed() < Duration::from_secs(3), "a closed Bus fails at once");
 
     // A Bus closed while it waits to redial never comes back to kick the session's new owner.
     let old = Bus::register("redial", &[], false, None, false, true).expect("an agent");

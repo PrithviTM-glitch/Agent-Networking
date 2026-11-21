@@ -263,7 +263,10 @@ impl Ledger {
         self.db.execute_batch("BEGIN")?;
         let result = f(self).and_then(|r| Ok(self.db.execute_batch("COMMIT").map(|_| r)?));
         if result.is_err() {
-            let _ = self.db.execute_batch("ROLLBACK");
+            // A failed rollback leaves the transaction open, so every later BEGIN fails: say so.
+            if let Err(e) = self.db.execute_batch("ROLLBACK") {
+                log(&format!("rollback failed {e}"));
+            }
             self.out.clear();
             return result;
         }
@@ -1390,6 +1393,7 @@ mod tests {
 
     impl Drop for Dir {
         fn drop(&mut self) {
+            #[allow(clippy::let_underscore_must_use, reason = "a test dir's cleanup is best effort")]
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }

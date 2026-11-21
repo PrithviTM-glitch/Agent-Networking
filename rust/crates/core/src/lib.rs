@@ -1,6 +1,7 @@
 //! agent-bridge in Rust: the wire protocol, validation, history log, MQTT session layer and the Bus, wire-compatible
 //! with the Python package, so agents of both kinds share one broker.
 
+pub mod address;
 pub mod broker;
 pub mod bus;
 pub mod claude;
@@ -14,6 +15,8 @@ pub mod ledger;
 pub mod mqtt;
 pub mod observer;
 pub mod presence;
+#[cfg(kani)]
+mod proofs;
 pub mod protocol;
 pub mod provision;
 pub mod relay;

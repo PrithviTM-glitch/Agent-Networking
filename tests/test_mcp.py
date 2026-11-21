@@ -16,6 +16,7 @@ import pytest
 from conftest import BIN
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from waits import aholds_for
 
 import agent_bridge
 from agent_bridge import _native
@@ -161,8 +162,7 @@ async def sessions():
 
             async with anyio.create_task_group() as tg:
                 tg.start_soon(queued)
-                await anyio.sleep(1)
-                assert "lease" not in got, "blocked while a holds the write lease"
+                await aholds_for(lambda: "lease" not in got, 1, "b blocked while a holds the write lease")
                 released = time.monotonic()
                 await call(a, "release", lease_id=first["lease_id"])
             assert got["lease"]["token"] > first["token"] and got["at"] >= released
@@ -232,6 +232,7 @@ async def sessions():
                     asked = (await call(a, "grants"))["asked"]
                     pending = [r["id"] for r in asked if r["status"] == "pending" and r["resource"].endswith("/vault")]
                 await call(a, "remove", name="vault")
+            # ceiling: the wait was 30 s; a request that waited it out would take 30 s
             assert answer["r"]["request"]["status"] == "gone" and answer["took"] < 15, answer
             assert answer["r"]["error"] == f"request {pending[0]} is gone: the resource was removed or its owner left"
             await ledgerd_notice(a)

@@ -284,10 +284,18 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Cmd::Doctor { json } => crate::doctor::run(json),
         Cmd::Hook { which: Hook::Guard, .. } => {
             let mut input = String::new();
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "unreadable input stays empty, which the guard refuses: it fails closed"
+            )]
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
             let out = agent_bridge::guard::run(&input);
             print!("{}", out.stdout);
             eprint!("{}", out.stderr);
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "the exit code carries the decision; a flush failure has nowhere to go"
+            )]
             let _ = std::io::stdout().flush();
             std::process::exit(out.code)
         }

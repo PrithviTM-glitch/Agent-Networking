@@ -9,6 +9,54 @@ workflow publishes the section as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-20
+
+### Added
+- TLA+ specs, checked by TLC: ledgerd's lease protocol (at most one write lease, fencing tokens only grow, each request
+  applied at most once across redelivery and restart, leases only to a listener; the two 0.2.1 bugs are configurations
+  that must fail, and the spec's untimed behaviours are replayed against the real ledgerd), the worktree lock (a held
+  lease is refused to others with ledgerd up or down), and relay delivery (no accepted message lost, acked only after
+  the inbox write).
+- Fuzz targets for the guard (shell lexer, quoting equivalence, paths), topics, JSON envelopes and ledgerd's request
+  decode.
+- Kani proofs (`scripts/verify-kani.sh`): the credentials rule's decision and the address shape are verified; three
+  more harnesses wait for byte-level seams. Addresses now have one type, `core::address::Address`, checked by
+  proptests.
+- `verify.yml` runs the formal checks: TLC (with `tla2tools.jar` v1.7.4 pinned by sha256), a fuzz smoke run and Kani
+  proofs, each only when its spec, script or checked code changed anywhere in the push, and all of them weekly and on
+  demand. `scripts/verify.sh <job>` runs any of them locally the same way.
+- Two clippy rules: credentials are picked only by `provision::credentials_for` (`rust/clippy.toml`), and
+  `let_underscore_must_use` workspace-wide, so a dropped `Result` is handled or allowed with a reason (it found the
+  silent refusals and the lost lock record under Fixed).
+- Tests that guard the rest: `tests/test_docs_contract.py` holds the docs to the code (CLI subcommands, the MCP tool
+  count, quoted refusal texts, internal links, a README row per test file); `tests/test_timing_guard.py` refuses
+  timing asserts in the tests, with `tests/waits.py` for bounded waits; and `tests/test_auth_matrix.py` checks every
+  entry point by identity by auth mode against `docs/AUTH.md`.
+
+### Changed
+- CI reruns failed tests once, Python and Rust alike: green on the rerun passes but is logged as a `FLAKE` line in the
+  job summary and an uploaded `flakes.txt`; red on the rerun fails. `cargo test` runs with `--no-fail-fast` so one
+  failing binary can't hide another.
+- ledgerd reads its own credentials through the shared rule, `provision::credentials_for` (same file, same
+  behaviour).
+- `scripts/gate.sh` refuses to start with SIGINT ignored (as a shell background job would), since Ctrl-C couldn't stop
+  it and its tests would inherit it; `GATE_ALLOW_BG=1` runs it anyway.
+
+### Fixed
+- historyd logs in under auth with its own credentials, as ledgerd does; in 0.3.2 it connected anonymously, so under
+  `enforce` history stopped. Its `--health` pings as historyd, and a refused subscription to `#` stops it with a
+  message.
+- A refused subscription or publish is an error, not an empty answer or a wait. A retained read (`agents`, `rooms`,
+  `room info`) the broker refuses fails with `not authorized to subscribe to <topics>`; a refused ledger or history
+  call fails at once, naming the topic, instead of timing out; `watch` exits 1 with `subscription refused:
+  room/<room>`; and the Observer (`Observer.degraded`) names a refused subscription (the console shows it in a later
+  release).
+- `worktree acquire` fails, releasing the lease, when it can't record the lease for the guard, since an unrecorded
+  lease could go unenforced while ledgerd is down.
+- Test flakes under load: every assert on time, or on "has it happened yet" after a fixed sleep, is now a bounded wait.
+- A worktree lease is enforced while ledgerd is down even when no guard lookup has happened since the acquire (the main
+  worktree has no git lock to fall back on), and a guard lookup can no longer drop a lease recorded while it was asking.
+
 ## [0.3.2] - 2026-11-18
 
 ### Added
@@ -278,7 +326,8 @@ First release.
 - A Rust core with Python bindings, and Rust ports of the CLI, relay, ledgerd and historyd, kept in parity with the
   Python reference by conformance tests.
 
-[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.2.3...v0.3.0

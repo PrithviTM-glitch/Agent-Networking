@@ -3,7 +3,7 @@ members = ["crates/core", "crates/cli", "crates/historyd", "crates/ledgerd", "cr
 resolver = "3"
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/PrithviTM-glitch/Agent-Networking"
@@ -26,3 +26,12 @@ sha2 = "=0.11.1"
 lto = true
 codegen-units = 1
 strip = true
+
+[workspace.lints.rust]
+# the Kani harnesses (scripts/verify-kani.sh) build only under cfg(kani)
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[workspace.lints.clippy]
+# a dropped Result hid refused SUBACKs (watch, the observer, retained reads, historyd) and a failed guard-locks.json
+# write; handle it, or say why with #[allow(clippy::let_underscore_must_use, reason = "...")]
+let_underscore_must_use = "warn"

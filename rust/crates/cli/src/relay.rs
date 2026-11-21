@@ -105,6 +105,7 @@ pub fn frame(msgs: &[&Map], quiet: &[&Map]) -> String {
 /// One relay.log line, which every session's relay shares: who is the relay's address, or its session before that.
 fn log(who: &str, text: &str) {
     let mut out = std::io::stdout().lock();
+    #[allow(clippy::let_underscore_must_use, reason = "a relay log line that can't be written has nowhere else to go")]
     let _ = writeln!(out, "{} {who}: {text}", stamp()).and_then(|_| out.flush());
 }
 
@@ -263,6 +264,10 @@ pub fn run(claude_pid: i64, claude_start: u64) -> Result<()> {
             save_backlog(&saved, &backlog.borrow());
             log(&me, &format!("binary replaced, restarting on {} ({version})", exe.display()));
             let e = reexec(&exe, &lock, claude_pid, claude_start);
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "without CLOEXEC the lock fd only leaks into a child; the lock itself still holds"
+            )]
             let _ = nix::fcntl::fcntl(&lock, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC));
             let mut kept = restore_backlog(&saved);
             backlog.borrow_mut().append(&mut kept);
@@ -342,6 +347,10 @@ fn inherited_lock(path: &std::path::Path) -> Option<std::fs::File> {
     }
     // SAFETY: fd is open (/proc names it) and is the lock file; nothing else in this process owns it.
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "without CLOEXEC the lock fd only leaks into a child; the lock itself still holds"
+    )]
     let _ = nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC));
     Some(file)
 }
@@ -432,7 +441,12 @@ fn installed(path: &std::path::Path) -> std::result::Result<String, String> {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             _ => {
+                #[allow(clippy::let_underscore_must_use, reason = "the version probe is being abandoned anyway")]
                 let _ = child.kill();
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "reaps the abandoned version probe; nothing to do if that fails"
+                )]
                 let _ = child.wait();
                 return Err(format!("{p} --version did not answer within 5 s"));
             }
@@ -440,6 +454,10 @@ fn installed(path: &std::path::Path) -> std::result::Result<String, String> {
     };
     let mut out = String::new();
     if let Some(mut stdout) = child.stdout.take() {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "an unreadable probe leaves the output empty, which reads as no version"
+        )]
         let _ = std::io::Read::read_to_string(&mut stdout, &mut out);
     }
     let version = out
@@ -462,6 +480,10 @@ fn save_backlog(path: &Option<std::path::PathBuf>, backlog: &VecDeque<Map>) {
     let Some(path) = path.as_ref().filter(|_| !backlog.is_empty()) else { return };
     let lines: String = backlog.iter().map(|m| dumps_map(m) + "\n").collect();
     let written = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path);
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the backlog only bridges a re-exec; history keeps those messages anyway"
+    )]
     let _ = written.and_then(|mut f| f.write_all(lines.as_bytes()));
 }
 
@@ -469,6 +491,7 @@ fn save_backlog(path: &Option<std::path::PathBuf>, backlog: &VecDeque<Map>) {
 fn restore_backlog(path: &Option<std::path::PathBuf>) -> VecDeque<Map> {
     let Some(path) = path else { return VecDeque::new() };
     let text = std::fs::read_to_string(path).unwrap_or_default();
+    #[allow(clippy::let_underscore_must_use, reason = "a backlog file already gone is what we want")]
     let _ = std::fs::remove_file(path);
     let mut kept: VecDeque<Map> = text.lines().filter_map(|l| serde_json::from_str::<Map>(l).ok()).collect();
     while kept.len() > BACKLOG {
@@ -484,6 +507,10 @@ pub fn start() {
         let session = origin.get("session").and_then(Value::as_str).unwrap_or("?");
         let log = config::data_path(&["relay", "relay.log"]);
         if let Some(mut f) = log.ok().and_then(|p| OpenOptions::new().append(true).create(true).open(p).ok()) {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a start-failure log line that can't be written has nowhere else to go"
+            )]
             let _ = writeln!(f, "{} session {}: relay not started: {e}", stamp(), session);
         }
     }

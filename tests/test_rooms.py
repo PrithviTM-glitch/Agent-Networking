@@ -16,6 +16,7 @@ import pytest
 from conftest import BIN, wait_for
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from waits import await_until
 
 from agent_bridge import _native, config
 from agent_bridge.errors import BridgeError
@@ -256,7 +257,7 @@ def test_pins():
     heard_in = lambda: [b for f, b in heard_room(S.watch, room)]  # noqa: E731
     heard_in()
     observer = _native.Observer()
-    assert observer.next(5)[0] == "connected"
+    assert observer.next(30)[0] == "connected"
     refused(S.bob.pin, room, "mine now", match="only admin or a moderator")
     refused(S.alice.pin, room, "  ", match="text is empty")
     refused(S.alice.pin, room, "x" * 65537, match="65537 bytes")
@@ -267,7 +268,7 @@ def test_pins():
     assert json.loads(cli("room", "info", room))["pin"] == pin
     assert heard_in() == [f"pin set by {S.alice.addr}"]
     events = []
-    while (event := observer.next(5)) and event[:2] != ("pin", room):
+    while (event := observer.next(30)) and event[:2] != ("pin", room):
         events.append(event[0])
     assert event and event[2] == pin, (event, events)
     assert "pin" not in (S.watch.cached_room(room) or {}), "never cached: one level below rooms/+"
@@ -276,7 +277,7 @@ def test_pins():
     refused(S.bob.unpin, room, match="only admin or a moderator")
     S.alice.unpin(room)
     assert _native.rooms_info(room)["pin"] is None
-    while (event := observer.next(5)) and event != ("pin", room, None):
+    while (event := observer.next(30)) and event != ("pin", room, None):
         pass
     observer.close()
     assert event == ("pin", room, None), "a cleared pin"
@@ -339,8 +340,15 @@ async def _mcp():
             assert "only moderators" in await call("say", ok=False, room=ROOM, text="x")
             assert "only admin or a moderator" in await call("mute", ok=False, room=ROOM, addr=S.alice.addr)
             await anyio.to_thread.run_sync(S.admin.mod, ROOM, "add", me)
-            await anyio.sleep(0.5)  # the record reaches the server's Bus over its rooms/+ subscription
-            assert (await call("mute", room=ROOM, addr=S.carol.addr))["muted"] == sorted([S.bob.addr, S.carol.addr])
+
+            async def muted():
+                """mute's result once the room record reached the server's Bus (rooms/+), None while it refuses."""
+                res = await s.call_tool("mute", {"room": ROOM, "addr": S.carol.addr})
+                text = res.content[0].text
+                return not res.isError and json.loads(text.split("\n", 1)[1] if text.startswith("UNTRUSTED") else text)
+
+            got = await await_until(muted, 30, "the moderator record to reach the server's Bus")
+            assert got["muted"] == sorted([S.bob.addr, S.carol.addr])
             assert (await call("room_set", room=ROOM, mode="open"))["mode"] == "open"
             assert (await call("unmute", room=ROOM, addr=S.carol.addr))["muted"] == [S.bob.addr]
             assert (await call("ban", room=ROOM, addr=S.carol.addr))["banned"] == sorted([S.bob.addr, S.carol.addr])

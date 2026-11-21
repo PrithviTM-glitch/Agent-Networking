@@ -2,6 +2,7 @@
 //! messages still arrive), they come back on ledger/resp/<address>, the console can act as an owner, and a call that
 //! waits stalls nothing else on the Bus. Needs Docker, so it is ignored by default:
 //! cargo test -p agent-bridge-ledgerd -- --ignored
+#![allow(clippy::let_underscore_must_use, reason = "cleanup of the test broker, ledgerd and dirs is best effort")]
 
 use agent_bridge::bus::Bus;
 use agent_bridge::json::Map;
@@ -76,10 +77,12 @@ fn fields(v: Value) -> Map {
     v.as_object().cloned().unwrap_or_default()
 }
 
+/// f returns well before the 20 s the other calls wait for: one stuck behind them would take all of that, so a loaded
+/// machine never reaches the ceiling while the bug always does.
 fn quick<T>(what: &str, f: impl FnOnce() -> T) -> T {
     let t = Instant::now();
     let out = f();
-    assert!(t.elapsed() < Duration::from_secs(1), "{what} took {:?} while other calls waited", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(10), "{what} took {:?} while other calls waited", t.elapsed());
     out
 }
 
@@ -97,7 +100,7 @@ fn ledger_over_the_bus() {
         reconnect: None,
     };
     let watcher = Conn::open("127.0.0.1", port, opts, watch.clone()).ok().expect("a raw watcher");
-    let _ = watcher.subscribe(vec![filter("ledger/resp/#", true, false)]);
+    watcher.subscribe(vec![filter("ledger/resp/#", true, false)]).expect("the watcher subscribes");
 
     let a = Arc::new(Bus::register("over-a", &[], false, None, false, true).expect("a registers"));
     let b = Bus::register("over-b", &[], false, None, false, true).expect("b registers");

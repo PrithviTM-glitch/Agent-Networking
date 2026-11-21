@@ -27,6 +27,10 @@ const EVENTS: [&str; 2] = ["UserPromptSubmit", "SessionStart"];
 pub fn broadcast() {
     if let Some(text) = show_broadcasts() {
         let mut out = std::io::stdout().lock();
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a hook must never fail its session; a line it can't print has nowhere to go"
+        )]
         let _ = writeln!(out, "{text}").and_then(|_| out.flush());
     }
 }

@@ -107,12 +107,26 @@ pub fn auth_mode() -> crate::Result<Auth> {
 /// addr's credentials: the AGENT_BRIDGE_CREDENTIALS file (a service's, mounted into its container) when its username
 /// is addr, else agents/<addr>.json in the config dir, or admin.json for "admin". None when there is no file; a file
 /// that is unreadable, malformed, or readable by anyone but its owner is an error naming it.
+#[expect(clippy::disallowed_methods, reason = "credentials is the variable's file, else credentials_file")]
 pub fn credentials(addr: &str) -> crate::Result<Option<Credentials>> {
     if let Some(path) = env::var_os("AGENT_BRIDGE_CREDENTIALS").filter(|v| !v.is_empty())
         && let Some(c) = read_credentials(Path::new(&path))?.filter(|c| c.username == addr)
     {
         return Ok(Some(c));
     }
+    credentials_file(addr)
+}
+
+/// The AGENT_BRIDGE_CREDENTIALS file's credentials, whoever they name; None when it is unset.
+pub fn explicit_credentials() -> crate::Result<Option<Credentials>> {
+    match env::var_os("AGENT_BRIDGE_CREDENTIALS").filter(|v| !v.is_empty()) {
+        Some(path) => read_credentials(Path::new(&path)),
+        None => Ok(None),
+    }
+}
+
+/// addr's own credentials file only (agents/<addr>.json, or admin.json for "admin"), never AGENT_BRIDGE_CREDENTIALS.
+pub fn credentials_file(addr: &str) -> crate::Result<Option<Credentials>> {
     let path = if addr == "admin" {
         config_dir().join("admin.json")
     } else {
@@ -236,6 +250,7 @@ fn denied(path: &Path, dir: &Path, owner: u32, me: u32) -> Error {
 }
 
 #[cfg(test)]
+#[allow(clippy::let_underscore_must_use, reason = "best-effort cleanup of temp files")]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

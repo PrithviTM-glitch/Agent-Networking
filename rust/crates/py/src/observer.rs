@@ -50,6 +50,13 @@ impl Observer {
         self.0.dropped()
     }
 
+    /// "subscription refused: #, $SYS/#" when the broker turned down this view's subscriptions (it then misses what
+    /// they cover), else None. Set one round trip after the "connected" event it belongs to.
+    #[getter]
+    fn degraded(&self) -> Option<String> {
+        self.0.degraded()
+    }
+
     fn close(&self, py: Python<'_>) {
         let o = self.0.clone();
         py.detach(move || o.close());

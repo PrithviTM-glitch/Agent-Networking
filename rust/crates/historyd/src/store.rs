@@ -118,6 +118,7 @@ impl History {
     pub fn open(path: &Path, stale_s: u64) -> Result<History, Open> {
         let failed = |e: rusqlite::Error| Open::Failed(e.to_string());
         if let Some(dir) = abspath(path).parent() {
+            #[allow(clippy::let_underscore_must_use, reason = "History::open reports the directory if this failed")]
             let _ = std::fs::create_dir_all(dir);
         }
         let db = Connection::open(path).map_err(failed)?;
@@ -430,6 +431,7 @@ fn messages<P: Params>(db: &Connection, filter: &str, args: P, seq: bool) -> rus
 }
 
 #[cfg(test)]
+#[allow(clippy::let_underscore_must_use, reason = "best-effort cleanup of temp files")]
 mod tests {
     use super::*;
 

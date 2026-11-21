@@ -82,6 +82,7 @@ pub fn set_wake(session: &str, room: &str, mode: &str) -> Result<Map> {
     let tmp = path.with_extension(format!("wake.{}", std::process::id()));
     let body = crate::json::dumps(&serde_json::json!({ "rooms": rooms }));
     std::fs::write(&tmp, body + "\n").and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| {
+        #[allow(clippy::let_underscore_must_use, reason = "a temp file already gone is what we want")]
         let _ = std::fs::remove_file(&tmp);
         config::data_error(&e, &path)
     })?;

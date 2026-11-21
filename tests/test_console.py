@@ -24,6 +24,7 @@ import uuid
 import paho.mqtt.client as mqtt
 import pytest
 from conftest import BIN, free_port
+from waits import holds_for, wait_until
 
 from agent_bridge import _native, config
 
@@ -35,6 +36,15 @@ TMP = HOME = FAKE_BIN = DATA = LOG = PROJ = REG = WEB = ORIGIN = HOST = None
 procs = []
 loose = []  # pids of double-forked test processes, which are nobody's child
 state = {"token": None, "mon": None, "c": None}
+
+
+def raw_subscribe(c, *topics):
+    """Subscribe a raw client and return once the broker acknowledged every subscription (its SUBACKs), so a message
+    published right after is never missed."""
+    acked = set()
+    c.on_subscribe = lambda _c, _u, mid, *_: acked.add(mid)
+    mids = {c.subscribe(t, qos=1)[1] for t in topics}
+    wait_until(lambda: mids <= acked, 10, f"the broker's SUBACK for {', '.join(topics)}")
 
 
 def raw_client():
@@ -437,7 +447,8 @@ def test_hooks():
     assert hook(session=S3, event="Stop") is None
     t0 = time.monotonic()
     hook(session=str(uuid.uuid4()))
-    assert time.monotonic() - t0 < 2
+    # ceiling: a hook that blocked on the broker would hang until Claude Code's own hook timeout, never return in 10 s
+    assert time.monotonic() - t0 < 10
     t0 = time.monotonic()
     down = subprocess.run(
         [HOOK],
@@ -447,7 +458,8 @@ def test_hooks():
         env={**os.environ, "AGENT_BRIDGE_PORT": str(free_port())},
     )
     assert down.returncode == 0 and not down.stdout and not down.stderr, down
-    assert time.monotonic() - t0 < 2, "with no broker the hook shows nothing and returns at once"
+    # ceiling: a hook that waited for an absent broker would hang until Claude Code's own hook timeout
+    assert time.monotonic() - t0 < 10, "with no broker the hook shows nothing and returns at once"
     bad = subprocess.run([HOOK], input="garbage", capture_output=True, text=True)
     assert bad.returncode == 0 and not bad.stdout and not bad.stderr
     print("hook ok")
@@ -506,8 +518,7 @@ def test_agents():
     refused("/api/signal", {"addr": "plain-1", "signal": "kill"}, "not a claude session")
     refused("/api/signal", {"addr": "bob-1", "signal": "kill"}, "not a claude session")
     refused("/api/signal", {"addr": "cli-1", "signal": "hup"}, "signal must be")
-    time.sleep(0.2)
-    assert other.poll() is None and plain.poll() is None, "a refused signal reached a process"
+    holds_for(lambda: other.poll() is None and plain.poll() is None, 0.2, "no process signalled by a refused request")
     refused("/api/restart/terminal", {"addr": "cli-1"}, "is alive")
     refused("/api/restart/resume", {"addr": "cli-1", "text": "hi"}, "is alive")
 
@@ -690,8 +701,7 @@ def test_registry():
     refused("/api/signal", {"session": "x", "signal": "kill"}, "session must be")
     refused("/api/restart/terminal", {"session": S4}, "is alive")
     refused("/api/restart/terminal", {"session": S8}, "reopen it in the Claude Desktop app")
-    time.sleep(0.2)
-    assert other.poll() is None
+    holds_for(lambda: other.poll() is None, 0.2, "no process signalled by a refused request")
     ok("/api/restart/terminal", {"session": S5})
     args = wait_for(lambda: (x := open(f"{TMP}/terminal-args").read().splitlines())[-1:] == [S5] and x)
     assert args and args[0] == f"--working-directory={p3}", args
@@ -845,8 +855,7 @@ def test_room_kill():
     assert post("/api/room/kill", body, token="wrong")[0] == 401
     refused("/api/room/kill", {**body, "confirm": "RED"}, "type the room name")
     refused("/api/room/kill", {**body, "kill_sessions": "yes"}, "true or false")
-    time.sleep(0.2)
-    assert claude.poll() is None and not any(map(dead, kids)), "a refused kill touched a process"
+    holds_for(lambda: claude.poll() is None and not any(map(dead, kids)), 0.2, "no process touched by a refused kill")
 
     j = ok("/api/room/kill", body)
     got = {t["addr"]: t for t in j["targets"]}
@@ -857,8 +866,7 @@ def test_room_kill():
     assert got["ghost-k"]["result"] == "unverifiable: wiped the agent", got
     assert got["sess-k"]["result"].startswith("session: skip: would end the WHOLE session"), got
     assert wait_for(lambda: all(dead(by[a]) for a in ("sub-k", "mark-k", "twin-k")))
-    time.sleep(0.3)
-    assert claude.poll() is None, "killing the room's subagents must leave the session's claude running"
+    holds_for(lambda: claude.poll() is None, 0.3, "the session's claude running after its room's subagents stopped")
     assert not dead(by["sub-2"]) and not dead(by["other-x"]) and not dead(dm_pid), "only the room's agents stop"
     assert wait_for(lambda: not any(agent(a) for a in ("sub-k", "mark-k", "twin-k", "ghost-k")))
     assert agent("sess-k") and agent("claim-k") and agent("bystander-1")
@@ -866,8 +874,7 @@ def test_room_kill():
     j = ok("/api/room/kill", {"room": "red2", "confirm": "red2"})
     assert j["targets"][0]["result"].startswith("subagent stopped: signalled"), j
     assert wait_for(lambda: dead(by["sub-2"]))
-    time.sleep(0.3)
-    assert claude.poll() is None, "killing a room with only a subagent leaves its parent claude running"
+    holds_for(lambda: claude.poll() is None, 0.3, "the parent claude running after its room's only subagent stopped")
 
     j = ok("/api/room/kill", {"room": "red", "confirm": "red", "signal": "kill", "kill_sessions": True})
     assert {t["addr"]: t["result"] for t in j["targets"]} == {
@@ -1170,7 +1177,12 @@ def test_capacity():
     spinner = next(r for r in row["tree"] if "while True" in r["cmd"])
     assert spinner["cpu"] > 30 and any(r["pid"] == claude.pid for r in row["tree"]), row["tree"]
     assert c["machine"]["cpus"] >= 1 and c["machine"]["mem_total"] > 0 and len(c["machine"]["load"]) == 3, c
-    assert any(t["pid"] == spinner["pid"] and t["session"] == sc for t in c["top"]), c["top"]
+    # The machine-wide top list holds the busiest processes: under load others may crowd the spinner out, so it must be
+    # there unless the list is full of processes at least as busy. Whatever of the session's is there names it.
+    ours = {r["pid"] for r in row["tree"]}
+    assert all(t["session"] == sc for t in c["top"] if t["pid"] in ours), c["top"]
+    full = len(c["top"]) == 15 and min(t["cpu"] for t in c["top"]) >= spinner["cpu"]
+    assert full or any(t["pid"] == spinner["pid"] for t in c["top"]), c["top"]
     assert req("GET", "/api/capacity", token=None)[0] == 401
     kill_tree(claude.pid)
 
@@ -1272,8 +1284,11 @@ def test_targeted_kill():
     assert wait_for(lambda: dead(by["pick-b"]) and not agent("pick-b"))
     j = ok("/api/agent/stop", {"addr": "sess-s", "confirm": "sess-s"})
     assert j["result"].startswith("session: skip: would end the WHOLE session"), j
-    time.sleep(0.3)
-    assert claude.poll() is None and not dead(by["sess-s"]), "stopping without whole sessions leaves the session"
+    holds_for(
+        lambda: claude.poll() is None and not dead(by["sess-s"]),
+        0.3,
+        "the session left alone by a stop without sessions",
+    )
     kill_tree(claude.pid)
 
 
@@ -1483,13 +1498,11 @@ def test_admin_cli():
     seen = []
     w = raw_client()
     w.on_message = lambda _c, _u, m: seen.append((m.topic, json.loads(m.payload)))
-    w.subscribe("room/cli-room", qos=1)
-    w.subscribe("broadcast", qos=1)
+    raw_subscribe(w, "room/cli-room", "broadcast")
     presence("cli-mod-a1b2c3", topics=["room/cli-room"])
     claude, start, by, _ = fake_session(("cli-sub",))
     presence("cli-sub", topics=["room/cli-room"], pid=claude.pid, pid_start=start)
     assert wait_for(lambda: agent("cli-mod-a1b2c3") and agent("cli-sub"))
-    time.sleep(0.3)
     assert cli_ok("say", "cli-room", "hello from the cli") == [{"ok": True, "result": "sent"}]
     cli_ok("broadcast", "cli broadcast")
     assert wait_for(
@@ -1777,6 +1790,7 @@ def test_message_markup():
     assert big["cols50"]["tree"][0][:2] == ["div", "mdtable"] and big["rows500"]["tree"][0][:2] == ["div", "mdtable"]
     for name, r in big.items():
         assert r["scanned"] <= r["lines"], f"{name}: each line is looked ahead at most once ({r['scanned']} scanned)"
+        # ceiling: MARKUP_BACKSTOP_MS, a runaway guard only; the counts above are the real checks
         assert r["ms"] < MARKUP_BACKSTOP_MS, (name, r["ms"])
     for name in ("cols51", "rows501", "amplify", "fences"):
         assert [n[0] for n in big[name]["tree"]] == ["#text"], f"{name} stays plain text"

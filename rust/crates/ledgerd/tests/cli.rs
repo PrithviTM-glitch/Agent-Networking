@@ -1,6 +1,8 @@
 //! The command line: only no arguments starts the service, and --health answers from a running ledgerd. The broker
 //! test needs Docker, so it is ignored by default: cargo test -p agent-bridge-ledgerd -- --ignored
 
+#![allow(clippy::let_underscore_must_use, reason = "cleanup of test containers, dirs and children is best effort")]
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};

@@ -1,6 +1,11 @@
 //! Which framework a process runs under decides whether it can relay: the generic host has no inbox, Claude Code's
 //! needs the session variable and the inbox socket.
 
+#![allow(
+    clippy::let_underscore_must_use,
+    reason = "best-effort cleanup: killing, waiting for and removing what the test started"
+)]
+
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};

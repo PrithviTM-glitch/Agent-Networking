@@ -1,0 +1,10 @@
+# Lints for bug classes this code has had. Each entry names the bug it guards against; a call site that really
+# needs the method says why with #[expect(clippy::disallowed_methods, reason = "...")].
+
+disallowed-methods = [
+    # 0.3.2: credentials picked by hand. A Bus, the history client, the guard's lookup and presence::wipe each read
+    # <addr>'s file directly, so "admin" read admin.json from disk (env -u CLAUDE_CODE_SESSION_ID acted as admin under
+    # auth enforce) and another session's agent file was used without the own-session check. One function decides.
+    { path = "agent_bridge::config::credentials", reason = "pick credentials with provision::credentials_for (admin only when AGENT_BRIDGE_CREDENTIALS names it; an agent's file only from its own session)" },
+    { path = "agent_bridge::config::credentials_file", reason = "pick credentials with provision::credentials_for; reading a credentials file directly skips the admin and own-session rules" },
+]

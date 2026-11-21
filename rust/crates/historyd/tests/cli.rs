@@ -1,6 +1,11 @@
 //! The command line: only no arguments starts the service, and --health answers from a running historyd. The broker
 //! test needs Docker, so it is ignored by default: cargo test -p agent-bridge-historyd -- --ignored
 
+#![allow(
+    clippy::let_underscore_must_use,
+    reason = "best-effort cleanup: killing, waiting for and removing what the test started"
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};

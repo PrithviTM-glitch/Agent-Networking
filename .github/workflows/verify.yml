@@ -1,0 +1,74 @@
+name: verify
+# The formal-methods jobs: TLC on the TLA+ specs, a fuzz smoke run and Kani proofs. On a push or pull request each job
+# runs only when its spec, its script or the code it checks changed anywhere in the push or pull request (a plain git
+# diff of the whole range, scripts/verify-changes.sh); weekly and on demand everything runs, so a path filter can't
+# hide rot. Each job runs scripts/verify.sh <job>, the same command as locally.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 1"  # Mondays 05:23 UTC
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      tlc-ledger: ${{ steps.paths.outputs.tlc-ledger }}
+      tlc-worktree: ${{ steps.paths.outputs.tlc-worktree }}
+      tlc-relay: ${{ steps.paths.outputs.tlc-relay }}
+      fuzz-smoke: ${{ steps.paths.outputs.fuzz-smoke }}
+      kani: ${{ steps.paths.outputs.kani }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # the whole history, so the diff can span every commit of the push
+      # The whole push or pull request, not only its last commit; a range that can't be diffed (a new branch, a force
+      # push) runs everything, and so do the weekly and manual runs.
+      - id: paths
+        run: |
+          case "${{ github.event_name }}" in
+            push) scripts/verify-changes.sh "${{ github.event.before }}" "${{ github.sha }}" ;;
+            pull_request)
+              scripts/verify-changes.sh "${{ github.event.pull_request.base.sha }}" \
+                "${{ github.event.pull_request.head.sha }}" ;;
+            *) scripts/verify-paths.sh --all ;;
+          esac >> "$GITHUB_OUTPUT"
+  tlc:
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [tlc-ledger, tlc-worktree, tlc-relay]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.changes.outputs[matrix.job] == 'true'
+      # TLC v1.7.4, pinned by sha256 in scripts/tla2tools.sh; the runner's Java 17 runs it.
+      - if: needs.changes.outputs[matrix.job] == 'true'
+        run: |
+          jar=$(scripts/tla2tools.sh "$RUNNER_TEMP/tla")
+          TLA2TOOLS_JAR="$jar" TLA2TOOLS="$jar" scripts/verify.sh ${{ matrix.job }}
+  fuzz-smoke:
+    needs: changes
+    if: needs.changes.outputs.fuzz-smoke == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: scripts/verify.sh fuzz-smoke  # 60 s per target
+  kani:
+    needs: changes
+    if: needs.changes.outputs.kani == 'true'
+    runs-on: ubuntu-24.04
+    # install + setup (a from-source compile and the CBMC download, a few minutes) + 2 x 900 s, verify-kani's per-harness
+    # cap (KANI_TIMEOUT): the job limit must never fire before that cap's own clear failure. Raise both together.
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo install kani-verifier --version 0.68.0 --locked && cargo kani setup
+      - run: scripts/verify.sh kani

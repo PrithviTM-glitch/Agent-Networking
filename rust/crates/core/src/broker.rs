@@ -132,10 +132,16 @@ pub fn retained(patterns: &[&str]) -> Result<Vec<(String, Bytes)>> {
 pub fn retained_as(patterns: &[&str], addr: Option<&str>) -> Result<Vec<(String, Bytes)>> {
     let found = Arc::new(Collect::default());
     let c = one_shot_as("", addr, found.clone())?;
-    let _ = c.subscribe(patterns.iter().map(|p| filter(p, false, false)).collect());
+    let sub = c
+        .subscribe(patterns.iter().map(|p| filter(p, false, false)).collect())
+        .map_err(|e| Error(format!("cannot subscribe: {}", os_text(&e))))?;
     let barrier = c.unsubscribe(patterns.iter().map(|p| p.to_string()).collect()).ok();
     if barrier.and_then(|pkid| c.wait_ack(pkid, TIMEOUT)).is_none() {
         return Err(Error("the broker did not finish sending retained records".into()));
+    }
+    // the SUBACK came before that UNSUBACK: a refused read is an error, never an empty answer
+    if c.wait_refused(sub, Duration::ZERO) == Some(Acked::Refused) {
+        return Err(crate::validation::refused("subscribe to", &patterns.join(", ")));
     }
     drop(c);
     Ok(std::mem::take(&mut *found.0.lock().unwrap_or_else(|e| e.into_inner())))

@@ -147,6 +147,7 @@ pub fn call_over(
             return Err(LedgerError::new(format!("no reply from ledgerd within {}s, is it running?", fmt_g(timeout))));
         }
         Sent::Stopped(corr) => cancel(conn, replies, reply_topic, as_.as_ref(), &corr),
+        Sent::Refused(text) => return Err(LedgerError::new(text)),
     };
     match crate::json::loads(&payload) {
         Some(Value::Object(reply)) if reply.get("ok") == Some(&Value::Bool(true)) => Ok(reply),
@@ -524,7 +525,9 @@ pub fn exec_held(addr: &str, lease: &Map, ttl: f64, resource: &str, level: &str,
     let lease = Value::Object(lease.clone());
     let lease_id = text_of(&lease, "/lease_id").to_owned();
     let release = || {
-        let _ = call("release", addr, map(&[("lease_id", lease_id.clone().into())]), Some(5.0));
+        if let Err(e) = call("release", addr, map(&[("lease_id", lease_id.clone().into())]), Some(5.0)) {
+            eprintln!("ledger: could not release lease {lease_id} ({e}); it lapses at its ttl");
+        }
     };
     let got = FORWARD.load(Ordering::SeqCst);
     if got != 0 {
@@ -597,8 +600,14 @@ fn lost(child: &mut std::process::Child, pid: libc::pid_t, why: &str, resource: 
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "the command outlived its grace: killing and reaping it is best effort"
+    )]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     EXEC_NO_LEASE
 }
 

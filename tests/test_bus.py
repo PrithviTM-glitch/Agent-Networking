@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import paho.mqtt.client as mqtt
 import pytest
 from conftest import BIN
+from waits import wait_until
 
 from agent_bridge import _native, config
 from agent_bridge.errors import BridgeError
@@ -280,8 +281,14 @@ def test_broker_restart(s, fresh_broker):
     fresh = run("register", "fresh")
     run("dm", a, fresh, "survives restart")
     subprocess.run(["docker", "restart", fresh_broker.name], check=True, capture_output=True)
-    time.sleep(1)
-    assert bodies("recv", fresh) == ["survives restart"], "sessions and queues persist across a broker restart"
+
+    def queued():
+        """The DMs recv returns once the broker is back; None while it is still restarting."""
+        p = subprocess.run([BRIDGE, "recv", fresh], env=env(), capture_output=True, text=True)
+        return p.returncode == 0 and [json.loads(x)["body"] for x in p.stdout.splitlines() if x.strip()]
+
+    got = wait_until(queued, 30, "the restarted broker to hand back the queued DM")
+    assert got == ["survives restart"], "sessions and queues persist across a broker restart"
     run("leave", fresh)
     run("dm", a, lib.addr, "after broker restart")
     assert [m["body"] for m in lib.recv(20)] == ["after broker restart"], (
@@ -322,8 +329,8 @@ def test_idle_expiry(s):
     short = {"AGENT_BRIDGE_STALE_DAYS": str(2 / 86400)}
     brief = run("register", "brief", env_extra=short)
     s.durable = durable = run("register", "durable", "--keep", env_extra=short)
-    time.sleep(3.5)
-    assert brief not in agents() and durable in agents(), "idle agents expire, kept ones stay"
+    wait_until(lambda: brief not in agents(), 30, "the idle agent to expire")
+    assert durable in agents(), "idle agents expire, kept ones stay"
 
 
 def test_hostile_messages(s):
@@ -870,7 +877,7 @@ def test_message_ids_and_replies(s):
         pass
     lines("recv", b)
     observer = _native.Observer()
-    assert observer.next(5)[0] == "connected"
+    assert observer.next(30)[0] == "connected"
     topic, old_ts = f"room/{room}", 1794518700.0857205
     run("say", a, room, "parent from a 0.3.1 CLI")
     evil = raw_client()
@@ -889,9 +896,9 @@ def test_message_ids_and_replies(s):
         return got
 
     paths = {
-        "cli recv": gather(lambda: lines("recv", b, "--wait", "5")),
-        "bus recv": gather(lambda: lib.recv(5)),
-        "observer": gather(lambda: observed(observer.next(5))),
+        "cli recv": gather(lambda: lines("recv", b, "--wait", "30")),
+        "bus recv": gather(lambda: lib.recv(30)),
+        "observer": gather(lambda: observed(observer.next(30))),
         "cli history": {m["body"]: m for m in lines("history", room)},
     }
     raw = {m["body"]: m for m in _native.history_call("room", room=room, last=10)["messages"]}
@@ -913,7 +920,7 @@ def test_message_ids_and_replies(s):
         got.update({m["body"]: m for m in batch})
     assert {got[r].get("reply_to") for r in replies} == {parent}, got
     obs = {}
-    while not replies <= set(obs) and (event := observer.next(5)):
+    while not replies <= set(obs) and (event := observer.next(30)):
         if event[0] == "message":
             obs[event[2]["body"]] = event[2]
     observer.close()

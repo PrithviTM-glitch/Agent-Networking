@@ -11,11 +11,11 @@ mod args;
 mod request;
 mod store;
 
-use agent_bridge::config;
-use agent_bridge::mqtt::{Conn, Handler, Message, Options, SESSION_TAKEN_OVER, filter};
+use agent_bridge::config::{self, Auth};
+use agent_bridge::mqtt::{Acked, Conn, Handler, Message, Options, SESSION_TAKEN_OVER, filter};
 use agent_bridge::protocol::NEVER;
 use agent_bridge::service::{Mode, mode, version_line};
-use rumqttc::v5::mqttbytes::v5::{PublishProperties, RetainForwardRule};
+use rumqttc::v5::mqttbytes::v5::{Login, PublishProperties, RetainForwardRule};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -38,6 +38,8 @@ struct Service {
     tx: Mutex<Sender<Item>>,
     queued: AtomicUsize,
     subscribed: (Mutex<bool>, Condvar),
+    /// The pkid of the latest subscription to #, so main can tell a refusal from an ack.
+    subscription: Mutex<Option<u16>>,
     db: String,
     broker: String,
 }
@@ -48,7 +50,10 @@ impl Handler for Service {
         // history.
         let mut everything = filter("#", true, true);
         everything.retain_forward_rule = RetainForwardRule::Never;
-        let _ = conn.subscribe(vec![everything]);
+        match conn.subscribe(vec![everything]) {
+            Ok(pkid) => *self.subscription.lock().unwrap_or_else(|e| e.into_inner()) = Some(pkid),
+            Err(e) => log(&format!("cannot subscribe to #: {e}")),
+        }
         log(&format!("connected to {}, db {}", self.broker, self.db));
     }
 
@@ -56,6 +61,7 @@ impl Handler for Service {
         log(&format!("disconnected {}", reason.map_or("(connection lost)".into(), |r| format!("reason {r}"))));
         // another historyd connected: stepping aside keeps a single writer
         if reason == Some(SESSION_TAKEN_OVER) {
+            #[allow(clippy::let_underscore_must_use, reason = "a closed channel means main has already stopped")]
             let _ = self.tx.lock().unwrap_or_else(|e| e.into_inner()).send(None);
         }
     }
@@ -118,18 +124,20 @@ fn main() {
         tx: Mutex::new(tx),
         queued: AtomicUsize::new(0),
         subscribed: (Mutex::new(false), Condvar::new()),
+        subscription: Mutex::new(None),
         db: db.display().to_string(),
         broker: format!("{}:{}", cfg.host, cfg.port),
     });
+    let (client_id, login) = login_or_exit(cfg.auth);
     let opts = Options {
-        client_id: "historyd".into(),
+        client_id,
         clean_start: false,
         expiry: NEVER,
         receive_max: Some(INFLIGHT),
         manual_ack: true,
         reconnect: Some(RECONNECT_MAX),
     };
-    let conn = Conn::start(&cfg.host, cfg.port, opts, service.clone()).unwrap_or_else(|e| {
+    let conn = Conn::start_as(&cfg.host, cfg.port, opts, login, service.clone()).unwrap_or_else(|e| {
         eprintln!("cannot start the MQTT client: {e}");
         std::process::exit(1);
     });
@@ -137,13 +145,49 @@ fn main() {
     {
         let (flag, cv) = &service.subscribed;
         let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+        #[allow(clippy::let_underscore_must_use, reason = "the wait only bounds how long the import is held back")]
         let _ = cv.wait_timeout_while(guard, IMPORT_WAIT, |done| !*done);
+    }
+    // a broker that refuses # would leave historyd connected and recording nothing: say so and stop
+    let subscription = *service.subscription.lock().unwrap_or_else(|e| e.into_inner());
+    if subscription.is_some_and(|pkid| conn.wait_refused(pkid, Duration::ZERO) == Some(Acked::Refused)) {
+        eprintln!(
+            "historyd: the broker refused its subscription to #; check its credentials (AGENT_BRIDGE_CREDENTIALS)"
+        );
+        std::process::exit(1);
     }
     if let Err(e) = history.migrate(&import) {
         eprintln!("cannot import {}: {e}", import.display());
         std::process::exit(1);
     }
     serve(&mut history, &conn, &service, &rx);
+}
+
+/// The client id and login historyd connects with: "historyd" and none when auth is off; under warn or enforce, the
+/// secret client id and login of its credentials (AGENT_BRIDGE_CREDENTIALS, username historyd). Two historyds with
+/// the same credentials still share an id, so the newer one takes over and the older steps aside.
+fn login_or_exit(auth: Auth) -> (String, Option<Login>) {
+    if auth == Auth::Off {
+        return ("historyd".into(), None);
+    }
+    match agent_bridge::provision::credentials_for("historyd") {
+        Ok(Some(c)) => {
+            log(&format!("auth {}: logging in as {}", auth.as_str(), c.username));
+            (c.client_id, Some(Login::new(c.username, c.password)))
+        }
+        Ok(None) if auth == Auth::Warn => {
+            log("auth warn: no credentials for historyd (AGENT_BRIDGE_CREDENTIALS), connecting anonymously");
+            ("historyd".into(), None)
+        }
+        Ok(None) => {
+            eprintln!("auth enforce: historyd needs its credentials file in AGENT_BRIDGE_CREDENTIALS");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// The settings, read once: a bad one ends historyd with its one-line message.

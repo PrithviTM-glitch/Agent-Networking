@@ -10,7 +10,7 @@ mod request;
 mod store;
 
 use agent_bridge::config;
-use agent_bridge::mqtt::{Ack, Conn, Handler, Message, Options, SESSION_TAKEN_OVER, filter};
+use agent_bridge::mqtt::{Ack, Acked, Conn, Handler, Message, Options, SESSION_TAKEN_OVER, filter};
 use agent_bridge::protocol::NEVER;
 use agent_bridge::service::{Mode, mode, version_line};
 use request::is_addr;
@@ -27,6 +27,7 @@ const INFLIGHT: u16 = 32;
 const QUEUE_QOS0: usize = 1000;
 const REPLY_EXPIRY: u32 = 300;
 const RECONNECT_MAX: Duration = Duration::from_secs(10);
+const SUBACK_WAIT: Duration = Duration::from_secs(10);
 
 /// One message for the main thread, or None when another ledgerd took the session over.
 type Item = Option<Message>;
@@ -41,7 +42,24 @@ struct Service {
 impl Handler for Service {
     fn connected(&self, conn: &Conn, _session_present: bool) {
         let topics = ["ledger/req", "ledger/req/+", "agents/+", "rooms/+"];
-        let _ = conn.subscribe(topics.iter().map(|t| filter(t, true, false)).collect());
+        // A refused subscription would leave ledgerd connected and silent (under auth, its role lacking a topic), so
+        // the SUBACK is checked off the reader thread and any refusal logged; a lost send is retried by the reconnect.
+        match conn.subscribe(topics.iter().map(|t| filter(t, true, false)).collect()) {
+            Ok(pkid) => {
+                let conn = conn.clone();
+                std::thread::spawn(move || match conn.wait_refused(pkid, SUBACK_WAIT) {
+                    Some(Acked::Yes) => {}
+                    Some(Acked::Refused) => log(&format!(
+                        "subscription refused (not authorized) for {}: ledgerd can't serve what it can't read; check \
+                         its role",
+                        topics.join(", ")
+                    )),
+                    Some(Acked::No) => log(&format!("subscription failed for {}", topics.join(", "))),
+                    None => log(&format!("no SUBACK within {} s for {}", SUBACK_WAIT.as_secs(), topics.join(", "))),
+                });
+            }
+            Err(e) => log(&format!("subscribe failed {e}")),
+        }
         log(&format!("connected to {}, db {}", self.broker, self.db));
     }
 
@@ -49,6 +67,10 @@ impl Handler for Service {
         log(&format!("disconnected {}", reason.map_or("(connection lost)".into(), |r| format!("reason {r}"))));
         // another ledgerd connected: stepping aside keeps a single writer
         if reason == Some(SESSION_TAKEN_OVER) {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "the main loop is gone only when ledgerd is exiting anyway"
+            )]
             let _ = self.tx.lock().unwrap_or_else(|e| e.into_inner()).send(None);
         }
     }
@@ -133,7 +155,7 @@ fn login_or_exit(auth: Auth) -> (String, Option<Login>) {
     if auth == Auth::Off {
         return ("ledgerd".into(), None);
     }
-    match config::credentials("ledgerd") {
+    match agent_bridge::provision::credentials_for("ledgerd") {
         Ok(Some(c)) => {
             log(&format!(
                 "auth {}: logging in as {}; identity from ledger/req/<addr>, rate limit on",

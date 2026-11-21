@@ -76,10 +76,18 @@ pub fn call_over(
         req.insert("as".into(), a);
     }
     let body = dumps(&Value::Object(req));
+    // a refused SUBACK or PUBACK (auth: the broker's ACL) names its topic at once instead of waiting out the timeout
     let payload =
-        request::send(conn, replies, reply_topic, "history", as_.as_ref(), body, timeout).ok_or_else(|| {
-            HistoryError::new(format!("no reply from historyd within {}s, is it running?", fmt_g(timeout)))
-        })?;
+        match request::send_until(conn, replies, reply_topic, "history", as_.as_ref(), body, timeout, &|| false) {
+            request::Sent::Reply(p) => p,
+            request::Sent::Refused(text) => return Err(HistoryError::new(text)),
+            request::Sent::Timeout | request::Sent::Stopped(_) => {
+                return Err(HistoryError::new(format!(
+                    "no reply from historyd within {}s, is it running?",
+                    fmt_g(timeout)
+                )));
+            }
+        };
     match crate::json::loads(&payload) {
         Some(Value::Object(reply)) if reply.get("ok") == Some(&Value::Bool(true)) => Ok(reply),
         Some(Value::Object(reply)) => Err(HistoryError { reply }),

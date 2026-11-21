@@ -142,7 +142,7 @@ fn py_repr_value(value: &Value) -> String {
     }
 }
 
-fn is_ident_char(c: char) -> bool {
+pub(crate) fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 

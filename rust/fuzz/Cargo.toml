@@ -1,0 +1,61 @@
+# The parser fuzz targets (cargo-fuzz, nightly). Its own workspace, outside rust/Cargo.toml's members, so the main
+# build and its lockfile never see libfuzzer. Run through scripts/verify-fuzz.sh.
+[package]
+name = "agent-bridge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+agent-bridge-core = { path = "../crates/core" }
+arbitrary = { version = "=1.4.2", features = ["derive"] }
+libfuzzer-sys = "=0.4.10"
+serde_json = { version = "=1.0.154", features = ["preserve_order", "float_roundtrip"] }
+
+[[bin]]
+name = "guard-shell"
+path = "fuzz_targets/guard_shell.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "guard-equivalence"
+path = "fuzz_targets/guard_equivalence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "guard-paths"
+path = "fuzz_targets/guard_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "topics"
+path = "fuzz_targets/topics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ledger-request"
+path = "fuzz_targets/ledger_request.rs"
+test = false
+doc = false
+bench = false

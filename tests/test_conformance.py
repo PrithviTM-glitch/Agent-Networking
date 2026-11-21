@@ -25,6 +25,7 @@ import pytest
 from conftest import start_ledgerd, wait_for
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
+from waits import holds_for, wait_until
 
 from agent_bridge import _native, config
 from agent_bridge.errors import BridgeError, LedgerError
@@ -113,13 +114,13 @@ def test_no_call_waits_behind_a_blocked_one(api):
 
     queued = in_thread(a.ledger, "acquire", resource=busy, level="write", ttl=30, wait=20)
     waiting = in_thread(a.recv, 30)
-    time.sleep(0.5)
-    assert queued["thread"].is_alive() and waiting["thread"].is_alive(), "both calls are blocked"
+    holds_for(lambda: queued["thread"].is_alive() and waiting["thread"].is_alive(), 0.5, "both calls blocked")
     started = time.monotonic()
     a.say(room, "while blocked")
     a.ledger("release", lease_id=own["lease_id"])
     elapsed = time.monotonic() - started
-    assert elapsed < 1, f"say and release waited {elapsed:.2f} s behind blocked calls"
+    # ceiling: the blocked calls hold for 20-30 s, so say or release waiting behind them still fails it
+    assert elapsed < 10, f"say and release waited {elapsed:.2f} s behind blocked calls"
     assert queued["thread"].is_alive() and waiting["thread"].is_alive()
 
     peer.dm(a.addr, "wake")  # a Bus never receives its own messages, so the DM comes from another agent
@@ -205,7 +206,7 @@ def test_wait_arrival_fires_once_per_new_arrival(api):
         peer.dm(a.addr, f"burst {i}")
     pending, seq = a.wait_arrival(5, seq)
     assert pending >= 1
-    time.sleep(0.5)
+    wait_until(lambda: a.wait_arrival(0, 0)[0] == 3, 30, "the 3 burst messages buffered")
     pending, seq = a.wait_arrival(0, seq)
     started = time.monotonic()
     again, same = a.wait_arrival(0.5, seq)
@@ -261,7 +262,8 @@ def test_leave_completes_with_ledgerd_down(api, ledgerd, state_dir):
         agents.remove(gone)
         started = time.monotonic()
         warning = gone.leave()
-        assert warning and "ledger" in warning and time.monotonic() - started < 6, warning
+        # ceiling: leave's ledger budget is 3 s; without it, leave would wait the ledger's 10 s default
+        assert warning and "ledger" in warning and time.monotonic() - started < 9, warning
         assert gone.addr not in {x["addr"] for x in api.agents()}
     finally:
         restarted.append(start_ledgerd(os.path.join(state_dir, "ledger.db"), os.path.join(state_dir, "ledgerd.log")))

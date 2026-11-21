@@ -131,7 +131,9 @@ and the opt-in `compose.auth.yaml` (see [Broker authentication](#broker-authenti
   another session is refused (`<addr> is not your agent (bound to another session)`), and one bound to no session is
   allowed, as for a plain CLI agent. For a read with no address of its own, the agent bound to this process's session.
   Otherwise anonymous, which `enforce` refuses with `this broker requires credentials (auth enforce)`. So leaving a
-  session (unsetting `CLAUDE_CODE_SESSION_ID`) never turns a command into admin's.
+  session (unsetting `CLAUDE_CODE_SESSION_ID`) never turns a command into admin's. `rust/clippy.toml` makes the rule a
+  lint: `config::credentials` and `config::credentials_file` are disallowed outside it, and each remaining direct read
+  carries an `#[expect]` with its reason.
 - **Retained reads.** A one-off lookup (`agents`, `rooms`, `find`, room `info`) subscribes at QoS 0, then unsubscribes
   at once: the broker sends every retained record straight after the SUBACK, outside the inflight window, so the
   UNSUBACK marks the moment all of them are in. There is no fixed wait, so a lookup costs one round trip instead of a
@@ -431,7 +433,8 @@ the same schema, row digests and replies, so either can take over the other's `h
 Every agent has a ledger of the resources it manages: a database, a dev server, a file tree, a deploy slot, anything.
 ledgerd is the one place that state lives. It applies every request, lease expiry and presence update one at a
 time, each in its own SQLite transaction. That serialization is the concurrency guarantee: there is no
-compare-and-set over MQTT and no second writer.
+compare-and-set over MQTT and no second writer. The lease protocol is specified in `specs/ledger/Ledger.tla`, checked
+by TLC, and `specs/ledger/replay.py` checks ledgerd against the spec's untimed behaviours.
 
 **Model**
 
@@ -784,7 +787,9 @@ the mode.
   ACLs deny send, receive and subscribe; admin's role has `#` for all three. If the dynamic-security store exists but
   `admin.json` is gone, it refuses and names the file to restore or the command that starts over. Its healthcheck
   reports ready once the config and the service files exist; ledgerd and historyd wait for it and get
-  `AGENT_BRIDGE_AUTH` and `AGENT_BRIDGE_CREDENTIALS`.
+  `AGENT_BRIDGE_AUTH` and `AGENT_BRIDGE_CREDENTIALS`. historyd logs in like ledgerd (its `AGENT_BRIDGE_CREDENTIALS`
+  file, username `historyd`), its `--health` pings as historyd when it has credentials, and a refused subscription to
+  `#` ends it with a message saying to check its credentials.
 - **Credential files**: `admin.json`, `services/{ledgerd,historyd}.json` and `agents/<addr>.json` under
   `~/.config/agent-bridge`, JSON `{username, password, client_id}` (agents also `session`), 0600 in 0700 directories. A
   file others can read is refused: `credentials <path> are readable by others (mode 640); fix it with: chmod 600
@@ -796,7 +801,8 @@ the mode.
   skipped) is the one use of `admin.json` from disk, and only to create a new agent: `createClient` goes alone first and
   never resets an existing client (`<addr> already has credentials elsewhere; ask admin to reissue` when its file is
   gone); then only `role-<addr>` is made and given to it; and only register-made `<name>-<6 hex>` addresses and session
-  addresses `<project>-<8 hex>` (the relay's and the MCP server's) qualify. An address of any other shape (`register
+  addresses `<project>-<8 hex>` (the relay's and the MCP server's) qualify: one shape, `core::address::Address`, which
+  `register`, the session address and provisioning all parse the same way. An address of any other shape (`register
   --addr myname`; `--addr alpha-000001` qualifies, since the shape decides) gets no credentials and carries on
   anonymously, which `enforce` refuses and `doctor` lists; `admin` is a hard error (`address 'admin' is reserved for the
   admin console`), and so are `already has credentials elsewhere` and `not your agent`. The agent's file gets a secret
@@ -810,9 +816,10 @@ the mode.
 - **Refusals.** A refused password: `broker did not accept the login of <user>`. A publish or subscribe the ACL refuses
   is an error, `not authorized to publish on <topic>` or `not authorized to subscribe to <topic>`, which the Bus words
   as `you may not post as ...` and `you may not read ...`; before 0.3.2 the broker's refusal was silently taken as
-  success. Every `MY_ADDR` command refuses an agent whose file binds it to another session (`agent-bridge: <addr> is not
-  your agent (bound to another session)`); calls from outside a session and agents without a file pass. Which
-  credentials a connection uses is the rule under [Addresses, topics and payloads](#addresses-topics-and-payloads).
+  success. A retained read (`agents`, `rooms`, `room info`) the broker refuses is an error too, not an empty list. Every
+  `MY_ADDR` command refuses an agent whose file binds it to another session (`agent-bridge: <addr> is not your agent
+  (bound to another session)`); calls from outside a session and agents without a file pass. Which credentials a
+  connection uses is the rule under [Addresses, topics and payloads](#addresses-topics-and-payloads).
 
 
 ## Worktree locks and the guard
@@ -823,24 +830,31 @@ enforced locally by two hooks that share one lock lookup, so they never disagree
 
 - **`agent-bridge worktree`** (`core::worktree`; `_native.worktree_acquire`, `worktree_release`, `worktree_status`).
   `acquire` resolves the realpath, acquires the write lease with `path` and `git_common_dir` (ledgerd creates the
-  resource on demand), and runs `git worktree lock --reason "agent-bridge lease <id> held by <addr>"`, with no expiry in
-  it, so renewals never rewrite it. The main worktree can't be git-locked: a warning, and the lease and the hooks still
-  hold it. It prints the lease plus `resource`, `lease_id`, `path`, `git_lock`, `lock` (the reason), `renewed_by`
-  (`relay` or `none`) and `warnings`. With this session's relay running, the relay renews the lease every ttl/3 (default
-  ttl 600 s) and releases it when the session ends (`relay/<session>.leases`); without one it lapses at its ttl.
-  `--exec` holds the lease and the git lock while the command runs, renewing every ttl/3, then releases as `release`
-  does, with `acquire --exec`'s exit status. `release` first saves uncommitted changes, untracked files included, as a
-  commit on top of HEAD under `refs/agent-bridge/released/<lease id>` through a scratch index, so the files and the real
-  index are untouched; then it removes the git lock if it is this lease's, and releases. It prints `released`, `path`,
-  `snapshot` (the ref or null) and `unlocked`. `status` needs no ledger for the git side and prints `path`, `resource`,
-  `git_common_dir`, `main`, `lock`, `stale` (an agent-bridge lock no live lease is behind), and `holder`, `lease_id`,
-  `expires_at` while leased, or `ledger_error` when ledgerd can't say.
+  resource on demand), records the lease in `guard-locks.json` right after the grant (if it can't, it releases the lease
+  and fails with `cannot record lease <id> for the guard (<error>); released it`, or, if that release fails too, says
+  the lease lapses at its ttl), and runs `git worktree lock --reason "agent-bridge lease <id> held by <addr>"`, with no
+  expiry in it, so renewals never rewrite it. The main worktree can't be git-locked: a warning, and the lease and the
+  hooks still hold it. It prints the lease plus `resource`, `lease_id`, `path`, `git_lock`, `lock` (the reason),
+  `renewed_by` (`relay` or `none`) and `warnings`. With this session's relay running, the relay renews the lease every
+  ttl/3 (default ttl 600 s) and releases it when the session ends (`relay/<session>.leases`); without one it lapses at
+  its ttl. `--exec` holds the lease and the git lock while the command runs, renewing every ttl/3, then releases as
+  `release` does, with `acquire --exec`'s exit status. `release` first saves uncommitted changes, untracked files
+  included, as a commit on top of HEAD under `refs/agent-bridge/released/<lease id>` through a scratch index, so the
+  files and the real index are untouched; then it removes the git lock if it is this lease's, releases, and forgets the
+  lease in `guard-locks.json`. It prints `released`, `path`, `snapshot` (the ref or null) and `unlocked`. `status` needs
+  no ledger for the git side and prints `path`, `resource`, `git_common_dir`, `main`, `lock`, `stale` (an agent-bridge
+  lock no live lease is behind), and `holder`, `lease_id`, `expires_at` while leased, or `ledger_error` when ledgerd
+  can't say.
 - **The lock lookup** (`core::guard`). A worktree is locked only while an agent other than this session's (or its
   subagents') holds its lease. ledgerd's `worktrees` op is authoritative, asked on every call (2 s timeout), logged in
   as the session's agent when it has credentials. A git lock reason never allows anything on its own: a lock with no
   live lease is stale, allowed with a warning. If ledgerd is unreachable or older than 0.3.2, the lookup falls back to
   the union of `<data dir>/guard-locks.json` (the last successful lookup, written 0600 atomically) and the git lock
   reasons, and fails closed; the main worktree can't be git-locked, which is why the last-known file is part of it.
+  `guard-locks.json` is written by `acquire` (right after the grant), by `release` (after ledgerd lets go) and by every
+  successful lookup (ledgerd's list, plus any entry recorded after the lookup asked), each a read-modify-write under an
+  exclusive flock on `guard-locks.json.lock`, so a lookup never drops a lease recorded while it was asking.
+  `specs/worktree/WorktreeLock.tla` checks that a held lease is refused to others with ledgerd up or down.
 - **`agent-bridge hook guard`**, a Claude Code `PreToolUse` hook. It reads the hook event on stdin. Inside a worktree
   another agent holds, without the lease, it refuses `Edit`, `Write`, `NotebookEdit` and the MCP filesystem write tools
   by resolved path (symlinks, `..`, new files, hard links); shell writes: mutators' paths, redirections, `sed -i`, `perl

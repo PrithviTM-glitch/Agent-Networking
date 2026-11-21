@@ -1,14 +1,19 @@
 //! A read-only view of every topic, for the admin console: presence records, room records, messages and the
 //! broker's $SYS statistics, parsed as hostile input like everything else and queued for whoever reads them. No
 //! callbacks: the reader thread only queues, so no caller's code ever runs on it.
+//!
+//! It logs in as provision::helper_credentials picks (the console sets AGENT_BRIDGE_CREDENTIALS to admin.json, so
+//! there it is admin), and when the broker refuses its subscriptions it says so in `degraded` instead of quietly
+//! showing less.
 
 use crate::config;
 use crate::json::{Map, now};
 use crate::ledger::random_hex;
-use crate::mqtt::{Conn, Handler, Message, Options, filter};
+use crate::mqtt::{Acked, Conn, Handler, Message, Options, filter};
 use crate::protocol::{parse_message, parse_presence};
 use crate::rooms::{parse_pin, parse_room};
 use crate::validation::{ADMIN, ID_MAX, Result, SERVICES, is_ident, os_error};
+use rumqttc::v5::mqttbytes::v5::Login;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -40,7 +45,14 @@ pub enum Event {
 struct Queue {
     events: VecDeque<Event>,
     dropped: u64,
+    /// the latest connection's SUBSCRIBE, and once its SUBACK came, that pkid to check
+    pkid: Option<u16>,
+    answered: Option<u16>,
+    /// "subscription refused: ..." from the latest SUBACK checked, None when it was granted (or none came yet)
+    degraded: Option<String>,
 }
+
+const FILTERS: [&str; 2] = ["#", "$SYS/#"];
 
 #[derive(Default)]
 struct Shared {
@@ -94,8 +106,18 @@ fn parse(topic: &str, payload: &[u8]) -> Option<Event> {
 impl Handler for Shared {
     fn connected(&self, conn: &Conn, _session_present: bool) {
         self.push(Event::Connected);
-        // "#" never matches $SYS topics, so the broker's statistics need a subscription of their own.
-        let _ = conn.subscribe(vec![filter("#", false, false), filter("$SYS/#", false, false)]);
+        // "#" never matches $SYS topics, so the broker's statistics need a subscription of their own. Err only when
+        // this connection is already gone; the next one subscribes again.
+        if let Ok(pkid) = conn.subscribe(FILTERS.iter().map(|f| filter(f, false, false)).collect()) {
+            self.lock().pkid = Some(pkid);
+        }
+    }
+
+    fn acked(&self, pkid: u16) {
+        let mut q = self.lock();
+        if q.pkid == Some(pkid) {
+            q.answered = Some(pkid);
+        }
     }
 
     fn message(&self, _conn: &Conn, m: Message) {
@@ -123,12 +145,20 @@ impl Observer {
             manual_ack: false,
             reconnect: Some(RECONNECT_MAX),
         };
-        let conn = Conn::start(&cfg.host, cfg.port, opts, shared.clone()).map_err(|e| os_error(&e, None))?;
+        let creds = crate::provision::helper_credentials(None)?;
+        let login = creds.as_ref().map(|c| Login::new(c.username.as_str(), c.password.as_str()));
+        let opts = match creds {
+            // a logged-in client's id is the broker's to assign (AUTH.md 4.3): its username may be bound to another id
+            Some(_) => Options { client_id: String::new(), ..opts },
+            None => opts,
+        };
+        let conn = Conn::start_as(&cfg.host, cfg.port, opts, login, shared.clone()).map_err(|e| os_error(&e, None))?;
         Ok(Observer { conn, shared })
     }
 
     /// The next event, waiting up to timeout for one.
     pub fn next(&self, timeout: Duration) -> Option<Event> {
+        self.check_suback();
         let q = self.shared.lock();
         let (mut q, _) =
             self.shared.cv.wait_timeout_while(q, timeout, |q| q.events.is_empty()).unwrap_or_else(|e| e.into_inner());
@@ -138,6 +168,26 @@ impl Observer {
     /// Events lost to a full queue since the start.
     pub fn dropped(&self) -> u64 {
         self.shared.lock().dropped
+    }
+
+    /// "subscription refused: #, $SYS/#" (or "subscription failed: ...") when the broker turned down the latest
+    /// connection's subscriptions, so this view is missing what they cover; None when they were granted. It follows
+    /// each SUBACK, one round trip after the Connected event it belongs to: until then it still describes the previous
+    /// connection (None before the first).
+    pub fn degraded(&self) -> Option<String> {
+        self.check_suback();
+        self.shared.lock().degraded.clone()
+    }
+
+    /// Settle degraded from the latest SUBACK, once it came (never on the reader thread, never under the queue lock).
+    fn check_suback(&self) {
+        let Some(pkid) = self.shared.lock().answered.take() else { return };
+        let degraded = match self.conn.wait_refused(pkid, Duration::ZERO) {
+            Some(Acked::Refused) => Some(format!("subscription refused: {}", FILTERS.join(", "))),
+            Some(Acked::No) => Some(format!("subscription failed: {}", FILTERS.join(", "))),
+            _ => None,
+        };
+        self.shared.lock().degraded = degraded;
     }
 
     pub fn close(&self) {

@@ -88,7 +88,8 @@ fn unwrap(mut cmd: Cmd, depth: usize, out: &mut Vec<Cmd>) -> Result<(), String> 
         {
             match cmd.words.get(i + 1) {
                 Some(script) if script.dynamic => {
-                    cmd.words = vec![Word { text: prog, dynamic: false, glob: false }, script.clone()]; // judged as unknowable
+                    // judged as unknowable
+                    cmd.words = vec![Word { text: prog, dynamic: false, glob: false }, script.clone()];
                     out.push(cmd);
                 }
                 Some(script) => {

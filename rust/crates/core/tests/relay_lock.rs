@@ -1,6 +1,11 @@
 //! What a relay's lock file tells others: live while flocked, the address it holds, and stop by SIGTERM. A shell
 //! stands in for the relay, holding the lock through `flock` as a relay does.
 
+#![allow(
+    clippy::let_underscore_must_use,
+    reason = "best-effort cleanup: killing, waiting for and removing what the test started"
+)]
+
 use agent_bridge::relay::{held, live, lock_path, stop};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};

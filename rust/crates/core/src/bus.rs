@@ -342,7 +342,7 @@ impl Bus {
         let given = addr.is_some();
         let addr = match addr {
             Some(a) => a.to_owned(),
-            None => format!("{name}-{}", ledger::random_hex(3)),
+            None => crate::address::Address::new_agent(name)?.to_string(),
         };
         // Under auth warn or enforce (the broker's admin credentials exist), the agent gets its own broker client, role
         // and credentials file now, so Bus::open below logs in with them; under auth off this does nothing.
@@ -636,6 +636,10 @@ impl Bus {
         }
         for topic in topics_of(&self.current()?) {
             if let Some(room) = topic.strip_prefix("room/") {
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "the part succeeded; a lost or refused notice changes nothing"
+                )]
                 let _ = self.announce(room, "left");
             }
         }

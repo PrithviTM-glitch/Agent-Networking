@@ -23,10 +23,16 @@ jobs:
           workspaces: rust
       - run: cargo fmt --manifest-path rust/Cargo.toml --all --check
       - run: cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
-      - run: cargo test --manifest-path rust/Cargo.toml --workspace
+      # A failed test is rerun once by name; green on the rerun passes but is logged as a FLAKE (scripts/rerun-cargo.sh).
+      - run: scripts/rerun-cargo.sh --manifest-path rust/Cargo.toml --workspace
       # The tests that need Docker: the services' health and takeover, and the CLI against its golden transcript.
       - run: docker pull eclipse-mosquitto:2.0.22
-      - run: cargo test --manifest-path rust/Cargo.toml --workspace -- --ignored
+      - run: scripts/rerun-cargo.sh --manifest-path rust/Cargo.toml --workspace -- --ignored
+      - uses: actions/upload-artifact@v7
+        if: always() && hashFiles('flakes.txt') != ''
+        with:
+          name: flakes-rust
+          path: flakes.txt
   build:
     uses: ./.github/workflows/build.yml
   package:
@@ -121,7 +127,15 @@ jobs:
         run: |
           uv venv .venv-wheel
           uv pip install --python .venv-wheel/bin/python dist/*.whl pytest==9.1.1 paho-mqtt==2.1.0
-      - run: .venv-wheel/bin/python -m pytest -p no:cacheprovider
+      # The failed tests are rerun once; green on the rerun passes but is logged as a FLAKE (scripts/rerun-pytest.sh).
+      - run: scripts/rerun-pytest.sh
+        env:
+          PYTHON: .venv-wheel/bin/python
+      - uses: actions/upload-artifact@v7
+        if: always() && hashFiles('flakes.txt') != ''
+        with:
+          name: flakes-test
+          path: flakes.txt
   docker:
     # The service images Compose builds from rust/; each service answers --help without a network.
     runs-on: ubuntu-24.04

@@ -12,3 +12,6 @@ clap.workspace = true
 libc.workspace = true
 nix.workspace = true
 serde_json.workspace = true
+
+[lints]
+workspace = true

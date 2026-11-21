@@ -4,9 +4,9 @@ one would take the session from test_history's service. Runs whichever historyd 
 """
 
 import os
-import time
 
 from conftest import start_historyd, wait_for
+from waits import holds_for
 
 from agent_bridge import _native
 
@@ -21,8 +21,11 @@ def test_the_first_historyd_steps_aside(fresh_broker, state_dir):
             "the first historyd kept the session: " + open(logs[0]).read()
         )
         assert first.returncode != 0
-        time.sleep(3)  # the redial delay: a second takeover would come in this window
-        assert second.poll() is None, open(logs[1]).read()
+        # the redial delay: a second takeover would come in this window
+        try:
+            holds_for(lambda: second.poll() is None, 3, "the second historyd running through the redial delay")
+        except AssertionError as e:
+            raise AssertionError(open(logs[1]).read()) from e
         assert _native.history_call("ping", timeout=2) == {"ok": True}, "the one left answers"
     finally:
         for proc in (first, second):
