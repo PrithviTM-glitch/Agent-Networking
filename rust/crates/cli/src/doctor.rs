@@ -285,6 +285,14 @@ fn relays(dir: &Path) -> Check {
     let current = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
     let Ok(entries) = std::fs::read_dir(dir) else { return check("relays", Status::Ok, "no relay has run yet") };
     let (mut fine, mut leftover, mut stale) = (0, 0, Vec::new());
+    // read once for every relay: which agent each should follow (relay::choose)
+    let agents = agent_bridge::presence::agents(None).ok();
+    let should = |session: &str| {
+        let held = agent_bridge::relay::held(session)?;
+        let default = agent_bridge::identity::session_address(session);
+        let want = agent_bridge::relay::choose(agents.as_deref()?, session, &default, Some(&held)).0?;
+        (want != held).then(|| format!("it relays for {held}, but {want} is its session's agent"))
+    };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(session) = name.strip_suffix(".lock") else { continue };
@@ -303,7 +311,7 @@ fn relays(dir: &Path) -> Check {
         } else {
             None
         };
-        match why {
+        match why.map(str::to_owned).or_else(|| should(session)) {
             None => fine += 1,
             Some(why) => stale.push(json!({"session": session, "pid": pid, "binary": exe, "why": why})),
         }

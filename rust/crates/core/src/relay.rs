@@ -148,17 +148,73 @@ pub fn stop(session: &str, timeout: Duration) -> Result<bool> {
     Ok(true)
 }
 
-/// The most recently seen live agent registered from this session (e.g. through the CLI), or None. Never a
-/// subagent's agent: that one belongs to the subagent, not to the session.
+/// The live agent a relay for session follows, or None: see choose. A live relay's own address counts as current.
 pub fn session_agent(session: &str) -> Result<Option<String>> {
-    Ok(presence::agents(None)?
-        .into_iter()
-        .find(|a| {
-            a.get("session").and_then(Value::as_str).unwrap_or("").to_lowercase() == session.to_lowercase()
+    Ok(session_choice(session, held(session).as_deref())?.0)
+}
+
+/// session_agent with the relay's current address given, and whether the choice was a guess between equals.
+pub fn session_choice(session: &str, current: Option<&str>) -> Result<(Option<String>, bool)> {
+    let default = crate::identity::session_address(session);
+    Ok(choose(&presence::agents(None)?, session, &default, current))
+}
+
+/// Which of the agents registered from session its relay follows. Never a subagent's agent (that one belongs to the
+/// subagent). A named agent beats the session's default address, and one holding rooms or topics beats one holding
+/// none. current stays chosen while it ties for best, so a relay never flaps between equals; otherwise the lowest
+/// address wins, and the bool says it was a guess. Presence order ("seen") never decides: a relay keeps its own
+/// record fresh.
+pub fn choose(agents: &[Map], session: &str, default: &str, current: Option<&str>) -> (Option<String>, bool) {
+    let rank = |a: &Map| {
+        let addr = a.get("addr").and_then(Value::as_str).unwrap_or("");
+        let named = addr != default;
+        let busy = a.get("topics").and_then(Value::as_array).is_some_and(|t| !t.is_empty());
+        (named, busy)
+    };
+    let mine: Vec<&Map> = agents
+        .iter()
+        .filter(|a| {
+            a.get("session").and_then(Value::as_str).is_some_and(|s| s.eq_ignore_ascii_case(session))
                 && !a.contains_key("parent")
                 && a.get("kind").is_none_or(|k| k != "subagent")
+                && a.get("addr").and_then(Value::as_str).is_some_and(|x| is_ident(x, ID_MAX))
         })
-        .and_then(|a| a["addr"].as_str().map(str::to_owned)))
+        .collect();
+    let Some(best) = mine.iter().map(|a| rank(a)).max() else {
+        return (None, false);
+    };
+    let mut top: Vec<&str> =
+        mine.iter().filter(|a| rank(a) == best).filter_map(|a| a.get("addr").and_then(Value::as_str)).collect();
+    top.sort_unstable();
+    top.dedup();
+    if let Some(c) = current.filter(|c| top.contains(c)) {
+        return (Some(c.to_owned()), false);
+    }
+    (top.first().map(|a| (*a).to_owned()), top.len() > 1)
+}
+
+/// Ask session's live relay to look again at which agent it follows (SIGHUP), after an agent of that session was
+/// registered or joined something. Best effort: false when there is no live relay to ask, or it is this process.
+/// Only a relay that recorded a version that handles SIGHUP is signalled: its default action ends the process.
+pub fn nudge(session: &str) -> bool {
+    let Some(p) = pid(session).filter(|p| u32::try_from(*p).ok() != Some(std::process::id())) else {
+        return false;
+    };
+    if !version(session).is_some_and(|v| handles_hup(&v)) {
+        return false;
+    }
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGHUP).is_ok()
+}
+
+/// The first relay version that re-chooses its agent on SIGHUP instead of ending.
+const HUP_SINCE: (u64, u64, u64) = (0, 3, 4);
+
+fn handles_hup(version: &str) -> bool {
+    let mut parts = version.trim().split(['.', '-', '+']).map(|p| p.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten(), parts.next().flatten()) {
+        (Some(a), Some(b), Some(c)) => (a, b, c) >= HUP_SINCE,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +243,68 @@ mod tests {
         assert!(!room("noisy", "bob-1", Some(true)) && room("noisy", "admin", None), "admin: only admin wakes");
         for topic in ["inbox/me-1", "broadcast", "ci/x"] {
             assert!(wakes(&modes, &msg(json!({"topic": topic, "from": "bob-1"}))), "{topic} always wakes");
+        }
+    }
+
+    fn agent(addr: &str, session: &str, topics: &[&str]) -> Map {
+        msg(json!({"addr": addr, "session": session, "topics": topics}))
+    }
+
+    const S: &str = "6e2a9c41-5b7d-4f08-a3c6-9d1e2f4a7b58";
+    const DEFAULT: &str = "proj-6e2a9c41";
+
+    #[test]
+    fn a_named_agent_beats_the_default_address_and_rooms_beat_none() {
+        let only_default = [agent(DEFAULT, S, &[])];
+        assert_eq!(choose(&only_default, S, DEFAULT, None), (Some(DEFAULT.into()), false));
+        // the reported bug: the default is current, a named agent registered later must win
+        let later = [agent(DEFAULT, S, &[]), agent("named-917fab", S, &[])];
+        assert_eq!(choose(&later, S, DEFAULT, Some(DEFAULT)), (Some("named-917fab".into()), false));
+        // a default address that joined rooms still loses to a named agent
+        let busy_default = [agent(DEFAULT, S, &["room/a"]), agent("named-917fab", S, &[])];
+        assert_eq!(choose(&busy_default, S, DEFAULT, Some(DEFAULT)), (Some("named-917fab".into()), false));
+        let two = [agent("quiet-aaaaaa", S, &[]), agent("busy-bbbbbb", S, &["room/a"])];
+        assert_eq!(choose(&two, S, DEFAULT, Some("quiet-aaaaaa")), (Some("busy-bbbbbb".into()), false));
+    }
+
+    #[test]
+    fn equals_keep_the_current_choice_and_a_guess_is_flagged() {
+        let tie = [agent("zed-aaaaaa", S, &["room/a"]), agent("amy-bbbbbb", S, &["room/b"])];
+        assert_eq!(choose(&tie, S, DEFAULT, Some("zed-aaaaaa")), (Some("zed-aaaaaa".into()), false));
+        // presence order never decides: either order gives the lowest address, flagged as a guess
+        let mut flipped = tie.clone();
+        flipped.reverse();
+        for agents in [&tie, &flipped] {
+            assert_eq!(choose(agents, S, DEFAULT, None), (Some("amy-bbbbbb".into()), true));
+        }
+    }
+
+    #[test]
+    fn other_sessions_and_subagents_never_count() {
+        let mut sub = agent("sub-cccccc", S, &["room/a"]);
+        sub.insert("kind".into(), "subagent".into());
+        let mut child = agent("child-dddddd", S, &["room/a"]);
+        child.insert("parent".into(), "named-917fab".into());
+        let others = [agent("else-eeeeee", "11111111-2222-4333-8444-555555555555", &["room/a"]), sub, child];
+        assert_eq!(choose(&others, S, DEFAULT, None), (None, false));
+        let upper = [agent("named-917fab", &S.to_uppercase(), &[])];
+        assert_eq!(choose(&upper, S, DEFAULT, None), (Some("named-917fab".into()), false));
+    }
+
+    #[test]
+    fn only_relays_from_0_3_4_take_a_sighup() {
+        for (v, want) in [
+            ("0.3.4", true),
+            ("0.3.10", true),
+            ("0.4.0", true),
+            ("1.0.0-rc1", true),
+            ("0.3.3", false),
+            ("0.2.9", false),
+            ("", false),
+            ("junk", false),
+            ("0.3", false),
+        ] {
+            assert_eq!(handles_hup(v), want, "{v}");
         }
     }
 }

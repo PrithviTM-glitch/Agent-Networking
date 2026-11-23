@@ -355,7 +355,20 @@ impl Bus {
         }
         let bus = Bus::open(&addr, rec, owner)?;
         bus.touch(&lock(&bus.writing), false)?;
+        // a new agent of this session: its relay may follow this one now (a subagent's never changes that choice)
+        if !subagent {
+            bus.nudge_relay();
+        }
         Ok(bus)
+    }
+
+    /// Ask the relay of the session this agent belongs to to look again at which agent it follows (relay::nudge),
+    /// after this agent was registered or joined a room. Both the CLI and the MCP server come through here. Best
+    /// effort; nudge skips the relay's own process, so the relay's own register never signals itself.
+    fn nudge_relay(&self) {
+        if let Some(session) = self.rec().get("session").and_then(Value::as_str) {
+            crate::relay::nudge(session);
+        }
     }
 
     /// The admin console's agent: name and address admin, kept, no origin fields. Only it may broadcast.
@@ -713,6 +726,7 @@ impl Bus {
         }
         if self.subscribe(&format!("room/{room}"), true)? {
             self.announce(room, "joined")?;
+            self.nudge_relay(); // holding a room can make this the agent the session's relay should follow
         }
         Ok(())
     }

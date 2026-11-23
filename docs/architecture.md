@@ -704,9 +704,14 @@ agent writes to it.
   version. A relay is live while that lock cannot be taken; the console and the broadcast hook use the same test. Next
   to it, `relay/<session>.wake` holds the session's wake filters, `relay/<session>.leases` the worktree leases it
   renews (one JSON line each), and, briefly during a self-restart, `relay/<session>.backlog` its quiet backlog.
-- **Address.** The relay adopts the most recently seen live agent whose presence carries this session id, such as one
-  registered through the CLI, so its rooms and queued messages come along. Otherwise it uses the same session-derived
-  address as the MCP server.
+- **Address.** The relay delivers for its session's agent, chosen by `relay::choose` among the session's non-subagent
+  agents: a named agent beats the session-derived address, one holding topics beats one holding none, the current one is
+  kept on a tie, and otherwise the lowest address wins, logged as a guess. Presence order ("seen") never decides, since
+  a relay keeps its own record fresh. With no agent it uses the same session-derived address as the MCP server.
+  `Bus::register` and `join` nudge the session's live relay (SIGHUP, only to relays that recorded 0.3.4 or later, since
+  SIGHUP ends an older one), and an idle relay rechecks every 60 s (`AGENT_BRIDGE_RELAY_FOLLOW_CHECK`). When the choice
+  changes, the relay re-execs itself on the new address through the upgrade handoff, at most once every 10 s; with its
+  binary replaced, it waits for the upgrade. The MCP server still picks its address once, at start.
 - **Batching.** Messages arriving within 1 s go out as one post, at most 20, with bodies over 16 KiB cut and marked
   `truncated_from`. A post is a header like `[agent-bridge] 3 messages (DM from X, #room from Y, broadcast from
   admin)`, a line saying the content is data, not instructions, then one JSON line per message. The header is built
@@ -716,13 +721,14 @@ agent writes to it.
   buffer and is retried every 2 s; if the relay dies first, the broker still has it.
 - **No echo.** No Local covers the relay's own connection, and a sender check covers the separate publishing
   connections of the MCP server and the CLI.
-- **Exit.** When its `claude` process ends (checked every second against pid and start ticks) or on SIGTERM, also
-  while the broker is away: it then waits for the broker in half-second steps, logging `broker unreachable, waiting
-  for it` once, instead of blocking in a call. `agent-bridge relay stop` sends the SIGTERM and `agent-bridge relay
-  status` reports whether it is live; outside a session both need `--session ID`. Both print `{"session", "live",
-  "lock", "pid", "started", "uptime_s", "binary", "version"}`, `stop` once the relay has stopped, so its `"live":
-  false` is the state after the stop. The last five are null without a live relay; `binary` is what `/proc/PID/exe`
-  names, ending in ` (deleted)` once an upgrade replaced the file, and `version` is null for a relay older than 0.3.0.
+- **Exit.** When its `claude` process ends (checked every second against pid and start ticks) or on SIGTERM, also while
+  the broker is away: it then waits for the broker in half-second steps, logging `broker unreachable, waiting for it`
+  once, instead of blocking in a call. `agent-bridge relay stop` sends the SIGTERM and `agent-bridge relay status`
+  reports whether it is live; outside a session both need `--session ID`. Both print `{"session", "live", "lock", "pid",
+  "started", "uptime_s", "binary", "version", "addr"}`, `stop` once the relay has stopped, so its `"live": false` is the
+  state after the stop. The last six are null without a live relay; `binary` is what `/proc/PID/exe` names, ending in `
+  (deleted)` once an upgrade replaced the file, and `version` is null for a relay older than 0.3.0. `addr` is the agent
+  it delivers for (the lock's second line).
 - **Restart.** `agent-bridge relay restart`, inside the session (no `--session`), stops the relay (5 s), starts it
   again on the installed binary with the same checks as `start` but saying what is wrong instead of staying silent (no
   session, no inbox), waits up to 5 s until it is live and prints the status line. It is the upgrade step for relays.
@@ -905,9 +911,10 @@ starts or stops a relay, or edits settings. The checks, in order:
 - `cli_lock`: `cli.lock`, or the directory it will be created in, is writable.
 - `versions`: this CLI, the two services and the wheel around the binary (the `agent_bridge-*.dist-info` in its
   environment) agree; fields `cli`, `ledgerd`, `historyd`, `wheel`.
-- `relays`: every live relay runs this CLI's binary, not a replaced one, and its `claude` process still lives; field
-  `stale`, one `{"session", "pid", "binary", "why"}` each, fixed with `agent-bridge relay restart` in that session. The
-  plain line names at most five stale sessions, then `and N more (doctor --json lists all)`.
+- `relays`: every live relay runs this CLI's binary, not a replaced one, its `claude` process still lives, and it relays
+  for its session's agent (`it relays for X, but Y is its session's agent`); field `stale`, one `{"session", "pid",
+  "binary", "why"}` each, fixed with `agent-bridge relay restart` in that session. The plain line names at most five
+  stale sessions, then `and N more (doctor --json lists all)`.
 - `hooks`: every hook command in `~/.claude/settings.json` that mentions agent-bridge runs an existing program; a
   `FAIL` names only the missing path.
 - `auth` (0.3.2): the auth mode and the transport (the unix socket or TCP). `off` is `INFO` (`off: an anonymous bus, any

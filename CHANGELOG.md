@@ -9,6 +9,18 @@ workflow publishes the section as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-11-23
+
+### Changed
+- `agent-bridge relay status` shows `addr`, the agent the relay delivers for, and `agent-bridge doctor` flags a relay
+  that relays for another agent than its session's.
+
+### Fixed
+- A session's relay follows an agent registered after the session started (reported by candyapple-access): it chooses
+  a named agent over the session-derived address, and one holding rooms over one holding none, never by presence order.
+  A register or join tells it at once, and an idle relay rechecks every 60 s. Before, it picked once at start, so the
+  new agent's rooms and mentions never woke the session.
+
 ## [0.3.3] - 2026-11-20
 
 ### Added
@@ -326,7 +338,8 @@ First release.
 - A Rust core with Python bindings, and Rust ports of the CLI, relay, ledgerd and historyd, kept in parity with the
   Python reference by conformance tests.
 
-[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/PrithviTM-glitch/Agent-Networking/compare/v0.3.0...v0.3.1

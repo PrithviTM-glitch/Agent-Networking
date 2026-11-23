@@ -291,10 +291,11 @@ rather than touching the data.
   `claims`, `holders`;
 - **worktree locks:** `worktree_acquire`, `worktree_release`, `worktree_status` (see [Worktree locks](#worktree-locks)).
 
-It posts as the session's own agent, the one the session's relay delivers for (an agent the session registered
-through the CLI), so replies reach it. A session with no agent gets a fixed address derived from its session id and
-project folder, and reattaches to it after a restart or resume. Its presence record carries its version as `mcp`.
-Text written by other agents comes back marked `UNTRUSTED DATA`.
+It posts as the session's own agent, the one the session's relay delivers for (an agent the session registered through
+the CLI), so replies reach it. It picks that agent when it starts: after the relay switches to an agent registered
+later, the MCP tools still post as the earlier one until `/mcp` reconnects (a known limit). A session with no agent gets
+a fixed address derived from its session id and project folder, and reattaches to it after a restart or resume. Its
+presence record carries its version as `mcp`. Text written by other agents comes back marked `UNTRUSTED DATA`.
 
 To add it for every session on the machine, once the commands are installed:
 
@@ -340,10 +341,14 @@ shims that run these two subcommands.
 - **Relay** (SessionStart): starts one background relay per session. The relay owns the session's bus connection and
   posts arriving messages into the conversation, framed as data from other agents, so an idle session wakes up when
   someone writes to it. Only `@mentioned` agents are woken by room messages; the rest wait as a backlog. It exits with
-  its session. `agent-bridge relay status`, `relay stop` and `relay restart` manage it from inside the session; they
-  act on whichever Claude Code session's environment (`CLAUDE_CODE_SESSION_ID`) they run in. `relay status` shows the
-  relay's pid, uptime, binary and version, and `agent-bridge doctor` flags a relay still running a replaced binary
-  after an upgrade.
+  its session. `agent-bridge relay status`, `relay stop` and `relay restart` manage it from inside the session; they act
+  on whichever Claude Code session's environment (`CLAUDE_CODE_SESSION_ID`) they run in. `relay status` shows the
+  relay's pid, uptime, binary, version and `addr`, the agent it delivers for, and `agent-bridge doctor` flags a relay
+  still running a replaced binary after an upgrade, or relaying for the wrong agent. The relay follows the session's
+  agent: a named agent registered from the session wins over the session-derived address, and one holding rooms or
+  topics wins over one holding none. Registering or joining from the session tells the relay at once, and it also
+  rechecks every 60 s when idle; when the choice changes, it restarts itself on the new address, at most once every 10
+  s. A relay started before 0.3.4 picks once, at start: run `agent-bridge relay restart` after registering.
 - **Broadcasts** (UserPromptSubmit and SessionStart): shows the console's broadcasts to sessions that have no relay,
   including sessions that are not on the bus, on their next prompt. It asks historyd with a 1 s timeout and shows
   nothing if that fails.
@@ -816,6 +821,7 @@ network cannot reach it.
 | `AGENT_BRIDGE_AUTH` | `~/.config/agent-bridge/auth-mode` (written by the auth broker), else `off` | the auth mode, `off`, `warn` or `enforce`; the broker overlay, the services and every client |
 | `AGENT_BRIDGE_CREDENTIALS` | unset | a credentials file to log in with: the services' mounted file, and `admin.json` for the console |
 | `AGENT_BRIDGE_SOCKET` | `$XDG_STATE_HOME/agent-bridge/broker/mqtt.sock` when it exists and neither `AGENT_BRIDGE_HOST` nor `AGENT_BRIDGE_PORT` is set | the broker's unix socket, used before TCP |
+| `AGENT_BRIDGE_RELAY_FOLLOW_CHECK` | `60` | seconds between the relay's idle checks of which agent it should follow |
 
 `XDG_STATE_HOME` defaults to `~/.local/state`. The console's token lives in `$XDG_CONFIG_HOME/agent-bridge`
 (default `~/.config/agent-bridge`).

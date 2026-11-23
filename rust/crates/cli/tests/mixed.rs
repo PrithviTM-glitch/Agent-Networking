@@ -565,6 +565,45 @@ fn a_wake_filter_holds_plain_posts_until_a_mention() {
     }
 }
 
+/// An agent registered from inside a session after its relay started becomes the one the relay follows, so a post in
+/// a room that agent joined wakes the session.
+#[test]
+#[ignore = "needs Docker"]
+fn a_relay_follows_an_agent_registered_after_it_started() {
+    let w = start();
+    let posts = inbox(&w);
+    let session = "6e2a9c41-5b7d-4f08-a3c6-9d1e2f4a7b58";
+    let (_fake, _) = relayed(&w, session);
+    let lock = w.dir.join("relay").join(format!("{session}.lock"));
+    let held = || std::fs::read_to_string(&lock).ok().and_then(|t| t.lines().nth(1).map(str::to_owned));
+    let first = held().expect("the relay's first address");
+    let in_session = |args: &[&str]| {
+        let out = w.cmd(Path::new(RUST)).args(args).env("CLAUDE_CODE_SESSION_ID", session).output().expect("the CLI");
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let named = in_session(&["register", "named"]);
+    assert_ne!(named, first, "register reused the relay's default address");
+    in_session(&["join", &named, "lane"]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while held().as_deref() != Some(named.as_str()) {
+        assert!(Instant::now() < deadline, "the relay still holds {:?}, not {named}\n{}", held(), relay_log(&w));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let peer = String::from_utf8_lossy(&w.run(&["register", "peer"]).stdout).trim().to_owned();
+    assert!(w.run(&["join", &peer, "lane"]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(w.run(&["say", &peer, "lane", &format!("@{named} are you there")]).status.success());
+        let seen = posts.lock().unwrap_or_else(|e| e.into_inner()).concat();
+        if seen.contains("are you there") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the post never woke the session\n{}", relay_log(&w));
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 /// The 0.3.1 commands from the shell: a pin on a room, a reply by id that history keeps, a mention of someone who left,
 /// and claims, held, refused, listed and released.
 #[test]
